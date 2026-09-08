@@ -793,17 +793,36 @@ SYNTH_POST_TARGETS      ?=
 IMPL_POST_TARGETS       ?=
 BITSTREAM_POST_TARGETS  ?=
 
-export FPGA_FLIST_POST_TARGETS      := $(FLIST_POST_TARGETS)
-export FPGA_PACKAGE_IP_POST_TARGETS := $(PACKAGE_IP_POST_TARGETS)
-export FPGA_BD_POST_TARGETS         := $(BD_POST_TARGETS)
-export FPGA_SYNTH_POST_TARGETS      := $(SYNTH_POST_TARGETS)
-export FPGA_IMPL_POST_TARGETS       := $(IMPL_POST_TARGETS)
-export FPGA_BITSTREAM_POST_TARGETS  := $(BITSTREAM_POST_TARGETS)
+# DEFERRED (`=`), NOT IMMEDIATE (`:=`), AND THAT IS THE WHOLE POINT.
+#
+# These six lines sit ~50 lines above the first `include`, so with `:=` they
+# snapshot the values as they stand BEFORE any fragment has been read. A
+# fragment that appends to a stage's post-target list - which is exactly what
+# mk/deploy.mk does, and what any future optional fragment would do - then
+# reaches the RECIPE, because post_stage_targets expands lazily, but never
+# reaches the EXPORTED copy the Tcl layer reads. The two disagree, and the
+# symptom is a post-stage target that visibly runs while the manifest records
+# that the stage had none.
+#
+# With `=` the value is expanded when make builds the recipe's environment,
+# which is after every include has been read. Found by the deploy tier,
+# 2026-09-08.
+export FPGA_FLIST_POST_TARGETS      = $(FLIST_POST_TARGETS)
+export FPGA_PACKAGE_IP_POST_TARGETS = $(PACKAGE_IP_POST_TARGETS)
+export FPGA_BD_POST_TARGETS         = $(BD_POST_TARGETS)
+export FPGA_SYNTH_POST_TARGETS      = $(SYNTH_POST_TARGETS)
+export FPGA_IMPL_POST_TARGETS       = $(IMPL_POST_TARGETS)
+export FPGA_BITSTREAM_POST_TARGETS  = $(BITSTREAM_POST_TARGETS)
 
 # Names only, sorted. The census exists to catch a name nothing reads, so the
 # NAME is the whole payload - and a name list has no quoting problem, which a
 # value list carrying paths with spaces in it would.
-export FPGA_POST_TARGET_VARS := $(sort $(filter %_POST_TARGETS,$(.VARIABLES)))
+#
+# Deferred for the same reason, and more sharply: `$(.VARIABLES)` evaluated here
+# cannot contain a variable a later fragment defines, so the census that exists
+# to catch a MISSPELT post-target variable was structurally unable to see one
+# defined anywhere but the project's design.mk.
+export FPGA_POST_TARGET_VARS = $(sort $(filter %_POST_TARGETS,$(.VARIABLES)))
 
 # $(call post_stage_targets,<stage>,<targets>). Expanded when the RECIPE runs,
 # so the definition may sit above or below its uses. An empty second argument

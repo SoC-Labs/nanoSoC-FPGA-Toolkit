@@ -140,7 +140,8 @@ HELP_DOC_FILES := \
     $(FPGA_ENGINE_DIR)/mk/flow.mk \
     $(FPGA_ENGINE_DIR)/mk/checks.mk \
     $(FPGA_ENGINE_DIR)/mk/help.mk \
-    $(FPGA_ENGINE_DIR)/mk/hooks.mk
+    $(FPGA_ENGINE_DIR)/mk/hooks.mk \
+    $(FPGA_ENGINE_DIR)/mk/deploy.mk
 
 ## Every target, with its one-line description, generated from the `##` comment
 ## blocks in the make fragments. The FIRST `##` line of a block is the summary

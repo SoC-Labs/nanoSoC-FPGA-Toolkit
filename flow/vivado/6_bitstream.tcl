@@ -102,6 +102,73 @@ proc stage_meas_append {path} {
 }
 
 
+
+# THE VERDICT WRITER, defined here because the refusal path below needs it too.
+# Every section is present even when empty: a reader cannot tell "no budget was
+# exceeded" from "budgets were never checked" if the heading is missing, and
+# ci/assert-stage.sh calls the second one UNVERIFIED for exactly that reason.
+# Bullets are `  - ` and nothing else inside a section starts a line with a
+# capital, because that is what the awk in ci/assert-stage.sh keys on.
+proc write_gate {path stage hard budgets owned notcov paragraph} {
+    global block_name RUN_TAG board_name part_name
+    set fh [open $path w]
+    puts $fh "[string toupper $stage] gate, [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]"
+    puts $fh "design $block_name, run tag $RUN_TAG, board $board_name, part $part_name"
+    puts $fh ""
+    foreach l $paragraph { puts $fh $l }
+    puts $fh ""
+    if {[llength $hard]} {
+        puts $fh "HARD FAILURES: [llength $hard]"
+        foreach h $hard { puts $fh "  - [regsub -all {\s+} $h { }]" }
+    } else {
+        puts $fh "HARD FAILURES: none"
+    }
+    puts $fh ""
+    puts $fh "BUDGETS EXCEEDED"
+    foreach b $budgets { puts $fh "  - [regsub -all {\s+} $b { }]" }
+    puts $fh ""
+    puts $fh "DECLARED ELSEWHERE - MEASURED HERE, OWNED BY SOMEBODY ELSE"
+    foreach o $owned { puts $fh "  - [regsub -all {\s+} $o { }]" }
+    puts $fh ""
+    puts $fh "NOT covered by ANY run of this flow, at any setting:"
+    foreach n $notcov { puts $fh "  - [regsub -all {\s+} $n { }]" }
+    puts $fh ""
+    close $fh
+    return $path
+}
+
+# A REFUSAL THAT LEAVES A RECORD.
+#
+# CONTRACT.md section 12.2.7 asks a stage that writes nothing to leave one, so
+# that ci/assert-stage.sh can tell "switched off" from "died before writing
+# anything" without inferring it from an absence. These three stages have no
+# switched-off state - the contract gives one only to package-ip and bd, and a
+# design with no sources, no checkpoint or no routed database is not a stage
+# somebody turned off, it is a stage whose input is missing. So the record is
+# written and the exit code is 2, NOT 0: nothing was measured, and exit 0 would
+# be the other half of a distinction this record exists to make.
+proc stage_stop {stage reason lines} {
+    global REPORT_DIR
+    stage_meas stage_status "REFUSED: $reason"
+    catch {
+        write_gate [file join $REPORT_DIR ${stage}_gate.txt] $stage [list $reason] {} {} \
+            [list "everything. This stage refused before it ran, so nothing about\
+                   this design was measured at any setting"] \
+            [list \
+                "THIS STAGE REFUSED. It did not run, so every number it would have" \
+                "produced is absent rather than good. The hard failure below is the" \
+                "input it could not read; the run directory holds no artefact from" \
+                "this stage and no later stage can be graded against one."]
+    }
+    catch {
+        set m [prov_manifest $stage]
+        stage_meas_append $m
+        say "record of the refusal: $m"
+    }
+    flow_refuse {*}$lines
+}
+
+
 ################################################################################
 # 3. THE INPUT CHECKPOINT
 #
@@ -573,33 +640,6 @@ lappend NOTCOV "deployment. Programming a board is a post-stage target\
                 (BITSTREAM_POST_TARGETS), and its failure is fatal to the claim, not\
                 to this build"
 
-proc write_gate {path stage hard budgets owned notcov paragraph} {
-    global block_name RUN_TAG board_name part_name
-    set fh [open $path w]
-    puts $fh "[string toupper $stage] gate, [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]"
-    puts $fh "design $block_name, run tag $RUN_TAG, board $board_name, part $part_name"
-    puts $fh ""
-    foreach l $paragraph { puts $fh $l }
-    puts $fh ""
-    if {[llength $hard]} {
-        puts $fh "HARD FAILURES: [llength $hard]"
-        foreach h $hard { puts $fh "  - [regsub -all {\s+} $h { }]" }
-    } else {
-        puts $fh "HARD FAILURES: none"
-    }
-    puts $fh ""
-    puts $fh "BUDGETS EXCEEDED"
-    foreach b $budgets { puts $fh "  - [regsub -all {\s+} $b { }]" }
-    puts $fh ""
-    puts $fh "DECLARED ELSEWHERE - MEASURED HERE, OWNED BY SOMEBODY ELSE"
-    foreach o $owned { puts $fh "  - [regsub -all {\s+} $o { }]" }
-    puts $fh ""
-    puts $fh "NOT covered by ANY run of this flow, at any setting:"
-    foreach n $notcov { puts $fh "  - [regsub -all {\s+} $n { }]" }
-    puts $fh ""
-    close $fh
-    return $path
-}
 
 set GATE [file join $REPORT_DIR bitstream_gate.txt]
 write_gate $GATE bitstream $HARD $BUDGETS $OWNED $NOTCOV [list \
