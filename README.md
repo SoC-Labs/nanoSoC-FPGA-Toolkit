@@ -45,7 +45,18 @@ its maturity costs someone a week.
 | `scripts/` — check, doctor, init, packs, hooks | written and exercised |
 | `ci/` — gates, verdicts, tiers, scanner | written; scanner proven both directions |
 | `test/` — mutation-proof harness | 63 assertions, green, every one mutation-proved |
-| A real bitstream from this flow | **not attempted** |
+| A real bitstream from this flow | **yes, on a fixture design** |
+| A real bitstream for the KR260 eth chiplet | **NO — fails at stage 3** |
+
+**The KR260 parity test failed, and that is the most important line in this
+table.** The toolkit reaches a bitstream on a small fixture, and cannot build
+the design it exists to build: a block-design-based project needs
+`generate_target` (absent), a stage3->stage4 handoff that carries more than a
+bare `.bd`, and the part set on the in-memory design before `read_bd`. Full
+diagnosis and a ten-item fix list in the consuming project's
+`fpga/PARITY_REPORT.md`. Until that passes, `tidelink/fpga` remains the only
+flow that builds this chiplet, and nothing here should be described as
+replacing it.
 
 `test/run.sh` is green, and that is a claim about the contract layer only.
 **No stage has been run against Vivado**, because `flow/vivado/*.tcl` does not
