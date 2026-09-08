@@ -98,11 +98,11 @@ opt SYNTH_IP_REPO_PATHS ""   ;# "" = IP_REPOS plus $SYNTH_OUT_DIR/ip from the pa
 opt SYNTH_WRITE_NETLIST  0   ;# 1 = also write a structural Verilog netlist beside the checkpoint
 
 opt EXPECT_LUT_MAX      [flow_env FPGA_EXPECT_LUT_MAX      -1]  ;# -1 = measure and report, do not gate
-opt EXPECT_FF_MAX       [flow_env FPGA_EXPECT_FF_MAX       -1]
-opt EXPECT_BRAM_MAX     [flow_env FPGA_EXPECT_BRAM_MAX     -1]
-opt EXPECT_DSP_MAX      [flow_env FPGA_EXPECT_DSP_MAX      -1]
+opt EXPECT_FF_MAX       [flow_env FPGA_EXPECT_FF_MAX       -1]  ;# from EXPECT_FF_MAX in design.mk
+opt EXPECT_BRAM_MAX     [flow_env FPGA_EXPECT_BRAM_MAX     -1]  ;# from EXPECT_BRAM_MAX in design.mk
+opt EXPECT_DSP_MAX      [flow_env FPGA_EXPECT_DSP_MAX      -1]  ;# from EXPECT_DSP_MAX in design.mk
 opt EXPECT_BLACKBOX_MAX [flow_env FPGA_EXPECT_BLACKBOX_MAX  0]  ;# a black box costs no LUTs and raises no error
-opt ALLOW_CRITICAL_WARNINGS [flow_env FPGA_ALLOW_CRITICAL_WARNINGS 0]
+opt ALLOW_CRITICAL_WARNINGS [flow_env FPGA_ALLOW_CRITICAL_WARNINGS 0] ;# 1 = report critical warnings, do not gate
 opt MSG_GATE_ALLOWLIST  [flow_env FPGA_MSG_GATE_ALLOWLIST ""]   ;# a TCL LIST of message ids, e.g. {Synth 8-3331}
 
 # Engine plumbing, read through flow_env and NOT registered: these are values
@@ -262,12 +262,17 @@ set have_sources [expr {[file exists $SYNTH_SOURCES_TCL] && [file size $SYNTH_SO
 set have_bd      [expr {$SYNTH_READ_BD && [file exists $BD_FILE]}]
 
 if {!$have_sources && !$have_bd} {
-    flow_assert_input $SYNTH_SOURCES_TCL \
-        "the materialised source list every stage after the flist stage sources\
-         to get the design. 'make flist' writes it; without it synthesis reads an\
-         empty fileset, elaborates a black box, and reports a design that met\
-         every budget because it contains nothing" \
-        RTL_FLIST
+    stage_stop synth "no design to synthesise: neither a materialised source list nor a block design" [list \
+        "there is nothing to synthesise." \
+        "  looked for sources: $SYNTH_SOURCES_TCL" \
+        "  looked for a BD   : $BD_FILE" \
+        "  'make flist' writes the first; the bd stage writes the second." \
+        "  Synthesis with an empty fileset does not fail: it elaborates a black" \
+        "  box, reports a warning, costs no LUTs, and passes every budget in the" \
+        "  contract - so this stops here instead." \
+        "  A record of this refusal is in reports/synth_manifest.txt and" \
+        "  reports/synth_gate.txt: an absent stage and a refused one are" \
+        "  different findings and must not look the same from disk."]
 }
 if {$have_sources} {
     flow_assert_input $SYNTH_SOURCES_TCL "the materialised source list from the flist stage" RTL_FLIST
@@ -550,15 +555,31 @@ say "args: $SYNTH_ARGS"
 
 synth_design -top $TOP -part $PART_STR {*}$SYNTH_ARGS
 
-# THE FIRST ARTEFACT-LEVEL QUESTION, ASKED IMMEDIATELY. synth_design returns 0
-# whether or not it left a design in memory, and `current_design` is the cheapest
-# thing that disagrees with it.
+# THE FIRST FAIL-FAST QUESTION, ASKED IMMEDIATELY - and it is the CELL COUNT,
+# not `current_design`. Measured on this host: `current_design` answers before
+# synth_design has run at all (a pre_synth hook asking gets an answer), so it
+# cannot distinguish a netlist from an empty room. A netlist with zero cells can.
+#
+# This is a fail-fast, NOT the gate. The gate is section 10, and it reads the
+# utilisation report off disk - because a design that elaborated to ALMOST
+# nothing has cells and is still not the design anybody asked for, and only the
+# numbers in a file can say which.
 if {[catch {current_design} __d] || $__d eq ""} {
     die "synth_design returned, and there is no design in memory." \
         "  Vivado exits 0 after a failed synthesis. Find the real error with:" \
         "    grep -nE '^ERROR|CRITICAL WARNING|Failed' \$LOG_DIR/synth.log"
 }
-unset -nocomplain __d
+set __cells 0
+catch { set __cells [llength [get_cells -hier -quiet]] }
+if {$__cells == 0} {
+    die "synth_design returned and the netlist has NO CELLS." \
+        "  The sources were read and nothing was inferred from them - the usual" \
+        "  cause is a TOP that names a module the flist never defined, which" \
+        "  Vivado treats as a black box rather than as an error." \
+        "  TOP is '$TOP'."
+}
+say "netlist: $__cells cell(s)"
+unset -nocomplain __d __cells
 
 
 ################################################################################
@@ -886,12 +907,7 @@ if {[llength $GENERICS]} {
                     it is a PROJECT file - this stage only passes the values on"
 }
 
-# Written with every section present even when empty: a reader cannot tell "no
-# budget was exceeded" from "budgets were never checked" if the heading is
-# missing, and ci/assert-stage.sh calls the second one UNVERIFIED for exactly
-# that reason. Bullets are `  - ` and nothing else in a section starts a line
-# with a capital, because that is what the awk in ci/assert-stage.sh keys on.
-
+# write_gate is defined in section 2, because the refusal path needs it too.
 set GATE [file join $REPORT_DIR synth_gate.txt]
 write_gate $GATE synth $HARD $BUDGETS $OWNED $NOTCOV [list \
     "This gate is about SIZE and RESOLUTION: how much of the device the" \

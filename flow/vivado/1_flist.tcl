@@ -84,7 +84,7 @@ flow_banner flist
 opt FLIST_ASSERT_TOP    1   ;# 1 = require TOP to be declared by a file that was read
 opt FLIST_HASH_SOURCES  1   ;# 1 = sha256 every source into the census. 0 = list them unhashed
 opt FLIST_APPLY         0   ;# 1 = also read the sources into THIS session (see below)
-opt FLIST_TOP_IN_SOURCES 1  ;# 1 = append TOP_HDL and EXTRA_SRCS to sources.tcl
+opt FLIST_TOP_IN_SOURCES 0  ;# 1 = append TOP_HDL and EXTRA_SRCS to sources.tcl. See section 3
 
 
 ################################################################################
@@ -187,6 +187,13 @@ flow_hook pre_flist
 # BEFORE it has claimed to be doing anything. flow_assert_input also
 # distinguishes zero bytes from absent, which is the shape a flist generator
 # leaves when it opened its output and then died.
+# THERE IS NO "NOT CONFIGURED" PATH FOR THIS STAGE, and that is not an omission.
+# CONTRACT.md section 12.2 rule 7 is about a stage a project may legitimately
+# switch off - package-ip and bd, selected by PACKAGE_TCL and BD_TCL. The flist
+# is not optional: RTL_FLIST is a REQUIRED input (section 3.2) and a design with
+# no source list is not a design with a smaller scope, it is no design at all. So
+# an absent flist is a REFUSAL - exit 2, nothing measured - and not a manifest
+# recording that this run built nothing on purpose.
 set RTL_FLIST [flow_env FPGA_RTL_FLIST]
 flow_assert_input $RTL_FLIST \
     "the master RTL filelist. In THIS codebase the filelist IS the\
@@ -261,58 +268,101 @@ if {![file exists $SOURCES_TCL] || ![file size $SOURCES_TCL]} {
 # CONTRACT.md section 3.3: TOP_HDL is "read AFTER the flist - board top goes
 # here", because the board-level top instantiates what the flist defined.
 #
-# THEY GO INTO sources.tcl, WHICH MAKES IT THE WHOLE DESIGN. sources.tcl is
-# documented as "what every later stage sources to get the design"; a board top
-# that was not in it would be a module every later stage had to remember to read
-# separately, and the failure when one forgot is the silent one - TOP elaborates
-# as a black box, Vivado warns, and the design routes and configures and does
-# nothing. One artefact, complete, is the only version of this that cannot be
-# half-done.
+# OFF BY DEFAULT, AND THE DEFAULT IS A MEASUREMENT RATHER THAN A PREFERENCE.
 #
-# THE CONSEQUENCE FOR A LATER STAGE IS STATED IN THE FILE ITSELF, in the banner
-# below: a stage that sources sources.tcl must NOT also read TOP_HDL, or the same
-# file is read twice and the second read is a duplicate module definition.
+# There are exactly two coherent designs here and only one of them can be live:
+#
+#   A  sources.tcl IS THE WHOLE DESIGN. The board top is in it, every stage that
+#      sources it gets a complete design, and no stage can forget the second
+#      half of the read. The failure it prevents is the silent one - TOP
+#      elaborates as a black box, Vivado warns, and the design routes and
+#      configures and does nothing.
+#   B  sources.tcl IS THE FLIST, and each stage that needs the board top reads
+#      TOP_HDL itself.
+#
+# flow/vivado/4_synth.tcl - written against the same CONTRACT.md, committed
+# 2026-09-08 - implements B: it sources sources.tcl and then reads TOP_HDL and
+# EXTRA_SRCS itself, under the same section 3.3 sentence. Running A and B
+# together reads every TOP_HDL file TWICE, which is a duplicate module
+# definition at elaboration.
+#
+# CONTRACT.md 3.3 says only "read AFTER the flist" and does not say by whom, so
+# neither file is wrong and both cannot be on. This one yields: the knob stays,
+# because A is the better design and a project driving its own flow may want it,
+# and the DEFAULT is B, because that is what the stage which actually consumes
+# the result already does. Turning this on requires turning 4_synth.tcl's own
+# read off. Recorded in the handback; the durable fix is one sentence in
+# CONTRACT.md 3.3 naming the owner.
+#
+# THE CONSEQUENCE IS ALSO STATED IN THE GENERATED FILE, in the banner below, so
+# that a reader who turns this on meets the hazard where they will hit it.
 ################################################################################
 
 set TOP_HDL    [flow_env FPGA_TOP_HDL]
 set EXTRA_SRCS [flow_env FPGA_EXTRA_SRCS]
-set appended {}
 
-if {$FLIST_TOP_IN_SOURCES && ($TOP_HDL ne "" || $EXTRA_SRCS ne "")} {
-    step "append TOP_HDL and EXTRA_SRCS to sources.tcl"
-    set sv {}
-    foreach s [split [flow_env FPGA_SV_FILES]] {
-        if {[string trim $s] ne ""} { lappend sv [file normalize [string trim $s]] }
+# THE FILES ARE RESOLVED WHATEVER THE KNOB SAYS, and that is not tidiness.
+#
+# The knob decides who READS these files - this stage, or the synthesis stage.
+# It does not decide whether they are PART OF THE DESIGN: they are, either way.
+# The first version of this file resolved them only inside the append branch, so
+# with the knob off the TOP-declaration check below could not see a board top
+# that lived in TOP_HDL and reported it as declared nowhere. That is a FALSE HARD
+# FAILURE on the commonest configuration there is, and it was found by running
+# both settings rather than by reading the code.
+#
+# Resolving them here also means the "you named it, so it must exist" assertion
+# (CONTRACT.md 3.3) fires on every run, in the stage that exists to find a
+# source-list problem in seconds, instead of forty minutes later.
+set tophdl_files {}
+set sv {}
+foreach x [split [flow_env FPGA_SV_FILES]] {
+    if {[string trim $x] ne ""} { lappend sv [file normalize [string trim $x]] }
+}
+foreach {var val} [list TOP_HDL $TOP_HDL EXTRA_SRCS $EXTRA_SRCS] {
+    foreach f [split $val] {
+        set f [string trim $f]
+        if {$f eq ""} { continue }
+        flow_assert_input $f "a source named by $var, read after the flist" $var
+        set n [file normalize $f]
+        set ext [string tolower [file extension $n]]
+        if {$ext eq ".vhd" || $ext eq ".vhdl"} {
+            set cmd "read_vhdl [list $n]"
+        } elseif {$ext eq ".sv" || $ext eq ".svh" || [lsearch -exact $sv $n] >= 0} {
+            set cmd "read_verilog -sv [list $n]"
+        } else {
+            set cmd "read_verilog [list $n]"
+        }
+        lappend tophdl_files [list $var $n $cmd]
     }
+}
+
+set appended {}
+if {$FLIST_TOP_IN_SOURCES && [llength $tophdl_files]} {
+    step "append TOP_HDL and EXTRA_SRCS to sources.tcl"
     set fh [open $SOURCES_TCL a]
     puts $fh ""
     puts $fh "################################################################################"
-    puts $fh "# TOP_HDL and EXTRA_SRCS, appended by flow/vivado/1_flist.tcl."
+    puts $fh "# TOP_HDL and EXTRA_SRCS, appended by flow/vivado/1_flist.tcl"
+    puts $fh "# because FLIST_TOP_IN_SOURCES=1."
     puts $fh "#"
     puts $fh "# A STAGE THAT SOURCES THIS FILE MUST NOT ALSO READ TOP_HDL OR EXTRA_SRCS."
     puts $fh "# They are here, so reading them again is the same file read twice and a"
-    puts $fh "# duplicate module definition at elaboration."
+    puts $fh "# duplicate module definition at elaboration. flow/vivado/4_synth.tcl"
+    puts $fh "# READS THEM ITSELF, so turning this knob on means turning that read off."
     puts $fh "################################################################################"
-    foreach {var val} [list TOP_HDL $TOP_HDL EXTRA_SRCS $EXTRA_SRCS] {
-        foreach f [split $val] {
-            set f [string trim $f]
-            if {$f eq ""} { continue }
-            flow_assert_input $f "a source named by $var, read after the flist" $var
-            set n [file normalize $f]
-            set ext [string tolower [file extension $n]]
-            if {$ext eq ".vhd" || $ext eq ".vhdl"} {
-                set cmd "read_vhdl [list $n]"
-            } elseif {$ext eq ".sv" || $ext eq ".svh" || [lsearch -exact $sv $n] >= 0} {
-                set cmd "read_verilog -sv [list $n]"
-            } else {
-                set cmd "read_verilog [list $n]"
-            }
-            puts $fh $cmd
-            lappend appended $n
-            say "  $var: $cmd"
-        }
+    foreach t $tophdl_files {
+        foreach {var n cmd} $t break
+        puts $fh $cmd
+        lappend appended $n
+        say "  $var: $cmd"
     }
     close $fh
+} elseif {[llength $tophdl_files]} {
+    say "[llength $tophdl_files] TOP_HDL/EXTRA_SRCS file(s) resolved and NOT appended"
+    say "  to sources.tcl (FLIST_TOP_IN_SOURCES=0). flow/vivado/4_synth.tcl reads"
+    say "  them itself; they are still checked for TOP below and recorded in the"
+    say "  manifest, because they are part of the design either way."
 }
 
 
@@ -345,7 +395,9 @@ if {$FLIST_ASSERT_TOP && $TOP ne ""} {
     step "is TOP='$TOP' declared by a file this flist reads?"
     set pat_v "^\[ \t\]*(module|macromodule)\[ \t\]+$TOP\[ \t\]*(\[#(;\]|$)"
     set pat_h "^\[ \t\]*(entity|architecture)\[ \t\]+$TOP\[ \t\]"
-    foreach f [concat $::flist_files_read $appended] {
+    set top_candidates $::flist_files_read
+    foreach t $tophdl_files { lappend top_candidates [lindex $t 1] }
+    foreach f $top_candidates {
         if {[catch {open $f r} fh]} { continue }
         set body [read $fh]
         close $fh
@@ -362,7 +414,7 @@ if {$FLIST_ASSERT_TOP && $TOP ne ""} {
     } else {
         lappend hard "TOP='$TOP' is declared by NONE of the [llength $::flist_files_read]\
                       source file(s) this flist reads, and none of the\
-                      [llength $appended] file(s) named by TOP_HDL/EXTRA_SRCS.\
+                      [llength $tophdl_files] file(s) named by TOP_HDL/EXTRA_SRCS.\
                       Vivado's answer to a missing top is to pick one by its own\
                       heuristic and warn, so the run would produce a complete set\
                       of numbers about a different design. Either TOP names the\
@@ -511,7 +563,20 @@ say "census: $census ([llength $::flist_files_read] file(s), $n_hashed hashed)"
 # recorded in hooks_run, and have no effect.
 #
 # So the hook may append to $SOURCES_TCL, or set ::FLIST_EXTRA_CMDS to a list of
-# read commands, and section 6.2 below writes them.
+# read commands, and the block below writes them.
+#
+# HONEST QUALIFICATION, BECAUSE THIS STAGE IS THE ONE PLACE THE RULE IS NOT
+# LITERALLY SATISFIED. read_flist.tcl writes sources.tcl AT SOURCE TIME - that is
+# its documented interface and a deliberate one, so that a stage cannot read a
+# filelist and then forget to record it. The file therefore exists before this
+# seam fires, and no reordering available to this file changes that.
+#
+# What matters is preserved, and it is the property the rule exists for: the
+# artefact is still OPEN when the hook runs, the hook can change what the next
+# stage will read, and the gate below is computed afterwards. A hook here is not
+# editing a file that has already been handed on. If read_flist.tcl ever grows a
+# 'parse but do not write' mode, this stage should use it and write once, after
+# the seam.
 ################################################################################
 
 flow_hook post_flist
@@ -633,7 +698,7 @@ stage_fields $manifest [list \
     top             [expr {$TOP eq "" ? "UNVERIFIED:TOP-unset" : $TOP}] \
     top_declared_in [expr {$top_in eq "" ? ($FLIST_ASSERT_TOP ? "UNVERIFIED:not-declared-by-any-file-read" : "unmeasured") : [prov_site_path $top_in]}] \
     top_hdl_in_sources [expr {[llength $appended] ? "yes" : "no"}] \
-    top_hdl_files   [llength $appended] \
+    top_hdl_files   [llength $tophdl_files] \
     rtl_flist_gen   [expr {$RTL_FLIST_GEN eq "" ? "(none)" : $RTL_FLIST_GEN}] \
     hard_failures   [llength $hard] ]
 

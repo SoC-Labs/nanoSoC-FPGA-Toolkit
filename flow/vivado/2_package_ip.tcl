@@ -474,9 +474,26 @@ if {[llength $inbody_defs]} {
     file mkdir $INBODY_DIR
 
     # --- 5.1 the design files -------------------------------------------------
+    # `format %s`, NOT a bare [file normalize]. MEASURED HERE, 2026-09-08, and the
+    # symptom was a record that named the wrong file:
+    #
+    #     original    <run>/work/null
+    #     sha256      UNVERIFIED:missing-file
+    #
+    # get_files returns Vivado DESIGN OBJECTS, not strings. Their text form is
+    # generated on demand from the live object, and `file normalize` hands back
+    # the same object unchanged when the path is already absolute and normalised.
+    # So the list below held object handles - and the swap further down calls
+    # remove_files on them, after which their text form regenerates as "null".
+    # The materialised COPY was correct (its header is written before the
+    # removal); the RECORD of where it came from was not, and the record is the
+    # only thing that can ever answer what is inside the packaged IP.
+    #
+    # `format %s` builds a real string there and then, so nothing later can
+    # change what this list says.
     set candidates {}
     if {[flow_have get_files]} {
-        foreach f [get_files -quiet] { lappend candidates [file normalize $f] }
+        foreach f [get_files -quiet] { lappend candidates [format %s [file normalize $f]] }
     }
     if {![llength $candidates] && [info exists ::flist_files_read]} {
         set candidates $::flist_files_read
@@ -744,6 +761,14 @@ foreach n $params_missing {
 # map - and have it survive. Fire it after ipx::save_core and the component.xml
 # on disk predates the edit, every consumer reads that file, and the hook would
 # appear in hooks_run having changed nothing.
+#
+# ipx::package_project HAS ALREADY WRITTEN ONE component.xml by the time this
+# runs - it writes as it packages, inside PACKAGE_TCL, and nothing here can defer
+# that. The ipx::save_core below is therefore the write that counts: it rewrites
+# the file from the in-memory core, hook edits included. That is why the save is
+# unconditional rather than skipped when nothing looks changed - a skipped save
+# would leave the pre-hook file standing and the hook's effect would vanish
+# exactly as section 6.1.3 describes.
 ################################################################################
 
 flow_hook post_package_ip

@@ -556,8 +556,12 @@ MSG_GATE_ALLOWLIST    ?=
 # ═══════════════════════════════════════════════════════════════════════════
 FPGAHUB_BOARD   ?=
 FPGAHUB_TARGET  ?=
-FPGAHUB_TOML    ?= $(FPGA_DIR)/fpgahub.toml
-
+# DISCOVERED, not asserted - note the $(wildcard). CONTRACT.md 3.3's corollary:
+# a default naming a CONVENTIONAL path must discover, or `make check` treats
+# the engine's own convenience default as a file the project asked for, and a
+# project with no deploy configured cannot pass until it creates an empty
+# fpgahub.toml it never wanted.
+FPGAHUB_TOML    ?= $(wildcard $(FPGA_DIR)/fpgahub.toml)
 # ═══════════════════════════════════════════════════════════════════════════
 # TRAP: BIN_STYLE IS NOT COSMETIC.
 #

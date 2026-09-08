@@ -828,17 +828,33 @@ export FPGA_POST_TARGET_VARS = $(sort $(filter %_POST_TARGETS,$(.VARIABLES)))
 # so the definition may sit above or below its uses. An empty second argument
 # expands to `:` - a shell no-op - and NOT to an empty command line, which make
 # would reject with a syntax error from the shell.
+# THE CONDITIONAL IS IN THE SHELL, NOT IN $(if), AND IT HAS TO BE.
+#
+# This was written with `$(if $(strip $(2)),<run them>,:)` and was broken for
+# EVERY stage on EVERY run, empty list or not. `$(if)` splits its arguments on
+# commas, and the message below contains one - "been evidenced, published or
+# deployed". So make ended the then-part in the middle of an `echo`, leaving an
+# unbalanced double quote, and handed the remainder to the shell as the
+# else-part. Both branches emitted a fragment of a sentence and `/bin/sh: line
+# 0: unexpected EOF while looking for matching '"'`, so a completely correct
+# stage still exited non-zero. Found 2026-09-08 by the first stage scripts to
+# run under real Vivado - until then no stage existed to reach this line.
+#
+# Moving the test into the shell makes commas ordinary text again. The lesson
+# generalises: prose inside a `$(if)` is a latent syntax error, and the only
+# safe place for a sentence is inside the recipe.
 define post_stage_targets
-$(if $(strip $(2)),\
-  $(MAKE) --no-print-directory $(strip $(2)) \
+_pt='$(strip $(2))'; \
+if [ -n "$$_pt" ]; then \
+  $(MAKE) --no-print-directory $$_pt \
     || { echo ""; \
-         echo "WARNING: post-$(1) target(s) '$(strip $(2))' FAILED."; \
+         echo "WARNING: post-$(1) target(s) '$$_pt' FAILED."; \
          echo "         The build is intact. The CLAIM is not: nothing here has"; \
          echo "         been evidenced, published or deployed. Do not quote this"; \
          echo "         run as complete until the post-stage targets have been"; \
          echo "         re-run - re-running them is safe and does not rebuild."; \
-         echo ""; },\
-  :)
+         echo ""; }; \
+fi
 endef
 
 #-----------------------------------------------------------------------------

@@ -769,7 +769,7 @@ flow_hook pre_<stage>                      ;# seam
 flow_hook post_<stage>                     ;# seam, BEFORE the writes (§6.1.3)
 ... write artefacts ...
 <stage>_gate                               ;# the verdict, AFTER the seam
-prov_write_manifest                        ;# last
+prov_manifest <stage>                      ;# last
 ```
 
 ### 12.2 Rules

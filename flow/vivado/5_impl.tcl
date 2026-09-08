@@ -74,14 +74,14 @@ opt IMPL_SYNTH_DCP        ""   ;# "" = $SYNTH_OUT_DIR/$BLOCK_synth.dcp from the 
 opt IMPL_WRITE_NETLIST     0   ;# 1 = also write a post-route structural netlist
 opt IMPL_WRITE_SDF         0   ;# 1 = also write post-route SDF beside the netlist
 
-opt EXPECT_WNS_MIN        [flow_env FPGA_EXPECT_WNS_MIN        -1]  ;# -1 = measure and report, do not gate
-opt EXPECT_WHS_MIN        [flow_env FPGA_EXPECT_WHS_MIN        -1]
-opt EXPECT_LUT_MAX        [flow_env FPGA_EXPECT_LUT_MAX        -1]
-opt EXPECT_FF_MAX         [flow_env FPGA_EXPECT_FF_MAX         -1]
-opt EXPECT_BRAM_MAX       [flow_env FPGA_EXPECT_BRAM_MAX       -1]
-opt EXPECT_DSP_MAX        [flow_env FPGA_EXPECT_DSP_MAX        -1]
-opt EXPECT_UNROUTED_MAX   [flow_env FPGA_EXPECT_UNROUTED_MAX    0]
-opt ALLOW_CRITICAL_WARNINGS [flow_env FPGA_ALLOW_CRITICAL_WARNINGS 0]
+opt EXPECT_WNS_MIN        [flow_env FPGA_EXPECT_WNS_MIN        -1]  ;# -1 = measure and report, do not gate. NOTE: -1 is the sentinel, so a budget of exactly -1 ns is inexpressible
+opt EXPECT_WHS_MIN        [flow_env FPGA_EXPECT_WHS_MIN        -1]  ;# hold slack floor, ns
+opt EXPECT_LUT_MAX        [flow_env FPGA_EXPECT_LUT_MAX        -1]  ;# graded POST-ROUTE here - the number that ships
+opt EXPECT_FF_MAX         [flow_env FPGA_EXPECT_FF_MAX         -1]  ;# graded post-route
+opt EXPECT_BRAM_MAX       [flow_env FPGA_EXPECT_BRAM_MAX       -1]  ;# graded post-route
+opt EXPECT_DSP_MAX        [flow_env FPGA_EXPECT_DSP_MAX        -1]  ;# graded post-route
+opt EXPECT_UNROUTED_MAX   [flow_env FPGA_EXPECT_UNROUTED_MAX    0]  ;# route_design returns 0 with unrouted nets, so this is armed by default
+opt ALLOW_CRITICAL_WARNINGS [flow_env FPGA_ALLOW_CRITICAL_WARNINGS 0] ;# 1 = report critical warnings, do not gate
 opt MSG_GATE_ALLOWLIST    [flow_env FPGA_MSG_GATE_ALLOWLIST ""]     ;# a TCL LIST of message ids
 
 set TOP      [flow_env FPGA_TOP]
@@ -206,6 +206,17 @@ step "inputs"
 
 if {$IMPL_SYNTH_DCP eq ""} {
     set IMPL_SYNTH_DCP [file join $SYNTH_OUT_DIR ${block_name}_synth.dcp]
+}
+if {![file exists $IMPL_SYNTH_DCP] || ![file size $IMPL_SYNTH_DCP]} {
+    stage_stop impl "no synthesised checkpoint to implement" [list \
+        "there is no checkpoint to implement." \
+        "  looked for: $IMPL_SYNTH_DCP" \
+        "  'make synth' writes it. Vivado exits 0 after a failed synth_design, so" \
+        "  a missing checkpoint here is often the first hard evidence of that:" \
+        "    grep -nE '^ERROR|CRITICAL WARNING|Failed' \$LOG_DIR/synth.log" \
+        "  SYNTH_RUN_TAG selects which run's outputs this stage reads." \
+        "  A record of this refusal is in reports/impl_manifest.txt and" \
+        "  reports/impl_gate.txt."]
 }
 flow_assert_input $IMPL_SYNTH_DCP \
     "the synthesised checkpoint this stage implements. 'make synth' writes it;\

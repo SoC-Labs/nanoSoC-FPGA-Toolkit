@@ -525,7 +525,11 @@ if {![llength $hard] && [flow_have get_files]} {
     set f [get_files -quiet "$DESIGN_NAME.bd"]
     if {[llength $f]} {
         set bd_obj [lindex $f 0]
-        set bd_file [file normalize $bd_obj]
+        # format %s: get_files returns a design OBJECT whose text form is
+        # generated from the live object, and this path is recorded and
+        # compared long after. See the note in 2_package_ip.tcl - the same
+        # class cost that stage a record naming <run>/work/null.
+        set bd_file [format %s [file normalize $bd_obj]]
         if {$BD_GLOBAL_SYNTH == 1} {
             set_property synth_checkpoint_mode None $bd_obj
             say "BD_GLOBAL_SYNTH=1: synth_checkpoint_mode None (one global synthesis pass)"
@@ -558,7 +562,7 @@ if {![llength $hard]} {
     save_bd_design
     if {$bd_file eq "" && [flow_have get_files]} {
         set f [get_files -quiet "$DESIGN_NAME.bd"]
-        if {[llength $f]} { set bd_file [file normalize [lindex $f 0]] }
+        if {[llength $f]} { set bd_file [format %s [file normalize [lindex $f 0]]] }
     }
 
     # THE CONTRACT PATH IS A COPY. See the header for why the original cannot be
@@ -586,7 +590,7 @@ if {![llength $hard]} {
                           unresolved instance - which Vivado reports as a black box and a\
                           warning."
         } else {
-            set wrapper [lindex $wrapper 0]
+            set wrapper [format %s [lindex $wrapper 0]]
             say "wrapper: $wrapper"
         }
     }

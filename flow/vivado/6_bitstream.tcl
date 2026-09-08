@@ -62,7 +62,7 @@ opt BITSTREAM_ROUTED_DCP ""   ;# "" = the routed checkpoint from this run (or IN
 opt BITSTREAM_WRITE_XSA   1   ;# 1 = write the .xsa hardware handoff
 opt BITSTREAM_WRITE_HWH   1   ;# 1 = publish the .hwh beside it when the design has one
 opt BITSTREAM_WRITE_LTX   1   ;# 1 = write the .ltx probe file when the image has debug cores
-opt ALLOW_CRITICAL_WARNINGS [flow_env FPGA_ALLOW_CRITICAL_WARNINGS 0]
+opt ALLOW_CRITICAL_WARNINGS [flow_env FPGA_ALLOW_CRITICAL_WARNINGS 0] ;# 1 = report critical warnings, do not gate
 opt MSG_GATE_ALLOWLIST   [flow_env FPGA_MSG_GATE_ALLOWLIST ""]  ;# a TCL LIST of message ids
 
 set DESIGN_NAME [flow_env FPGA_DESIGN_NAME $block_name]
@@ -195,6 +195,16 @@ if {$BITSTREAM_ROUTED_DCP eq ""} {
     unset __dir
 }
 
+if {![file exists $BITSTREAM_ROUTED_DCP] || ![file size $BITSTREAM_ROUTED_DCP]} {
+    stage_stop bitstream "no routed checkpoint to write a bitstream from" [list \
+        "there is no routed checkpoint." \
+        "  looked for: $BITSTREAM_ROUTED_DCP" \
+        "  'make impl' writes it. route_design returns 0 on a route it did not" \
+        "  finish, so an absent checkpoint here is often the first hard evidence:" \
+        "    grep -nE '^ERROR|Placer could not|Router' \$LOG_DIR/impl.log" \
+        "  A record of this refusal is in reports/bitstream_manifest.txt and" \
+        "  reports/bitstream_gate.txt."]
+}
 flow_assert_input $BITSTREAM_ROUTED_DCP \
     "the routed checkpoint this stage writes a bitstream from. 'make impl' writes\
      it; route_design returns 0 on a route it did not finish, so a checkpoint that\
