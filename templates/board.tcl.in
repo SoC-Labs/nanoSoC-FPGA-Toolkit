@@ -1,0 +1,228 @@
+################################################################################
+# fpga/board/@BOARD@/board.tcl  --  THE BOARD PACK for @BOARD@
+#
+# Scaffolded into @PROJECT@ by `fpga-flow-init` on @DATE@.
+#
+# A BOARD PACK HOLDS PCB FACTS. NOTHING ELSE.
+# ------------------------------------------
+# Which device is soldered down, what the oscillator runs at, which IO bank sits
+# at which voltage, how a .bin has to be formatted for this family's boot ROM.
+# Facts you could read off the schematic and that are true of this board no
+# matter what anyone builds for it.
+#
+# NOT in here, ever:
+#   - anything about YOUR DESIGN. Clock names, port names, module names, pin
+#     ASSIGNMENTS. A pin assignment is a fact about a design meeting a board,
+#     which is why it lives in fpga/targets/<target>/ with the other collateral
+#     that changes when the design changes.
+#   - a build setting. Run tags, job counts, expectations.
+#   - a SITE PATH written as a literal. See "site paths" below.
+#
+# The test is simple and worth applying to every line: WOULD THIS STILL BE TRUE
+# FOR A COMPLETELY DIFFERENT DESIGN ON THIS BOARD? If yes it belongs here. If
+# no, it belongs in design.mk or in the target directory.
+#
+# WHY THIS FILE IS IN THE PROJECT AND NOT IN THE TOOLKIT
+# ------------------------------------------------------
+# Because a board is not a fact about a flow. A part pack -- how many LUTs a
+# device has, whether it carries an IDELAY primitive, how many SLRs -- ships
+# WITH the toolkit, because every project on that device wants the same answer.
+# A board pack ships with the PROJECT, because a lab bench is not a shared
+# truth. If you ever find yourself wanting to add a board to the toolkit, that
+# is the signal that the split is wrong somewhere; raise it, do not add the
+# file.
+#
+# HOW IT IS READ
+# --------------
+# This file is `source`d as plain Tcl. It is not parsed, so it may compute,
+# glob, and read vendor files at load time -- and then it is VALIDATED against
+# a schema. Five rules, each of which exists because its absence caused a
+# measured failure:
+#
+#   * an UNKNOWN KEY is an error, with a nearest-match suggestion. Never a
+#     silent default: a key nothing reads is an expectation nothing checks.
+#   * setting a key TWICE is an error. That is copy-paste damage, not intent.
+#   * a MISSING REQUIRED KEY errors listing EVERY problem at once, with each
+#     key's description. One-at-a-time is where people give up and guess.
+#   * reading an UNSET OPTIONAL key errors rather than returning "". An empty
+#     primitive name silently instantiates nothing.
+#   * NO SITE PATH IS EVER DEFAULTED. See below.
+#
+# `make board-probe` loads and validates this file and prints every key it
+# resolved. It launches no tool and takes no licence. Run it after every edit.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+################################################################################
+
+#### 1. REQUIRED ###############################################################
+#
+# All five, or the pack does not load. The error names every one you missed
+# together with what it is for, so one run tells you the whole story.
+
+# The board's name as this project spells it. It must match the directory this
+# file is in, which is what BOARD in design.mk selects.
+board_set board_name "@BOARD@"
+
+# THE DEVICE. The full Vivado part string -- device, package and speed grade,
+# not just the device. A part string missing its speed grade resolves to a
+# different device or to none, and "none" is reported as an elaboration failure
+# several minutes in.
+#
+# This is the normal place for the part to be stated: a project override in
+# design.mk wins over it, and exists for the case of one board shipping in more
+# than one device variant.
+board_set part "@PART@"
+
+# What runs on the board once it is programmed. Must agree with PLATFORM in
+# design.mk; `make check` compares them.
+#   bare   a bitstream and the firmware you built
+#   pynq   a Linux image whose overlay is this bitstream plus its .hwh
+board_set platform bare
+
+# THE SYSTEM CLOCK, in Hz, as an integer.
+#
+# NOT the oscillator -- see oscillator_hz in section 3. This is the clock the
+# design is closed at, which is usually the oscillator through an MMCM, and it
+# is compiled into the firmware as well as constraining the fabric. A build
+# where the two disagree boots and gets every baud rate and timer wrong. That
+# is the whole reason this is a REQUIRED key rather than something a design
+# states in passing.
+board_set sys_clk_freq_hz "<<FILL IN: integer Hz, e.g. 50000000>>"
+
+# HOW A .bin IS MADE FOR THIS BOARD'S FAMILY. zynq7 | zynqmp
+#
+#   zynq7   the .bit payload needs a BYTE SWAP
+#   zynqmp  the .bit header must be STRIPPED
+#
+# THEY ARE NOT INTERCHANGEABLE AND THE WRONG ONE CORRUPTS THE LOAD. The
+# conversion succeeds either way. The file is the right size either way. The
+# loader accepts it either way. The device does not come up, and nothing
+# anywhere in the chain says why. It is a required key because there is no
+# defensible default: guessing from the part string is exactly the kind of
+# inference that is right until the day it is not.
+board_set bin_style "<<FILL IN: zynq7 or zynqmp>>"
+
+
+#### 2. CONDITIONAL ############################################################
+#
+# Nothing here is required on its own. Each becomes required the moment its
+# trigger is set, and the validator enforces the pairing -- because a half-set
+# pair is worse than an unset one: it looks configured.
+
+# ── THE VENDOR BOARD FILE ──────────────────────────────────────────────────
+#
+# If you set board_part you MUST also set board_repo_paths. Without the repo
+# path Vivado resolves the VLNV against whatever board files are installed on
+# THIS MACHINE, and a build that depends on the host's installed board files is
+# a build nobody wrote the dependency down for. It works until CI runs it.
+#
+# board_set board_part       "<<FILL IN: vendor:board:part0:1.0>>"
+# board_set board_repo_paths "<<FILL IN: directory holding the board files>>"
+
+# ── THE BENCH ──────────────────────────────────────────────────────────────
+#
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │ TRAP: fpgahub_board AND fpgahub_target ARE DIFFERENT NAMESPACES.       │
+# │                                                                        │
+# │   fpgahub_board   is the board GROUP  -- the LEASE scope. Leases,      │
+# │                   queues and reservations address this name.           │
+# │   fpgahub_target  is the TARGET       -- the PROGRAM scope. Program,   │
+# │                   reset and actions address this one.                  │
+# │                                                                        │
+# │   THEY DO NOT OVERLAP. Using the board group where a target is         │
+# │   expected returns 404. Using the target where the board group is      │
+# │   expected returns 404. Neither 404 tells you which of the two you     │
+# │   got wrong, and on a board with one FPGA the two names are usually    │
+# │   similar enough to read as typos of each other.                       │
+# │                                                                        │
+# │   Setting fpgahub_board therefore makes fpgahub_target REQUIRED. A     │
+# │   pack that names only the lease scope can lease the board and cannot  │
+# │   program it, and finds that out at the end of a long build.           │
+# └────────────────────────────────────────────────────────────────────────┘
+#
+# board_set fpgahub_board  "<<FILL IN: the board GROUP - lease scope>>"
+# board_set fpgahub_target "<<FILL IN: the TARGET - program scope>>"
+
+
+#### 3. OPTIONAL ###############################################################
+#
+# Set what is true. Do not set a key to a plausible value to make the pack look
+# complete -- reading an unset optional key is an ERROR that names the key,
+# which is a better outcome than reading a guess.
+
+# How this board is normally loaded: jtag, qspi, sd, tftp. Declarative; the
+# deploy phase reads it.
+# board_set deploy_style jtag
+
+# The JTAG cable's serial number, when the bench has more than one board and
+# the tool would otherwise pick whichever enumerated first. That is a real
+# failure mode with a memorable symptom: a bitstream lands on somebody else's
+# board.
+# board_set jtag_serial "<<FILL IN: the cable serial, if the bench has several>>"
+
+# THE OSCILLATOR, in Hz. The crystal or clock generator on the PCB -- the
+# number you read off the schematic. NOT sys_clk_freq_hz, which is what the
+# design runs at after the MMCM. Both are recorded so a reader can see the
+# ratio and check it against the MMCM settings.
+# board_set oscillator_hz "<<FILL IN: integer Hz>>"
+
+# Bank voltages, as a key/value list. The constraints in the target directory
+# state an IOSTANDARD per port; this states what the BOARD can actually supply,
+# so a mismatch is catchable before the bitstream rather than by a scope.
+# board_set io_voltage_by_bank {34 3.3 35 1.8}
+
+# Named connectors and what is wired to them. Free-form and for humans: it is
+# the note that stops the next person tracing a header with a multimeter.
+# board_set connectors {pmod_a "user LEDs" fmc_hpc "unpopulated"}
+
+
+#### 4. SITE PATHS AND DEFERRED VALUES #########################################
+#
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │ NO SITE PATH IS EVER DEFAULTED, AND NONE IS EVER WRITTEN AS A LITERAL. │
+# │                                                                        │
+# │   A fallback to one lab's mount point is a path that works on one      │
+# │   machine and fails silently-looking everywhere else -- and worse, a   │
+# │   pack that records a raw mount point gets pasted into a bug report,   │
+# │   where it is inventory-shaped disclosure. The manifest records site   │
+# │   paths as a sha256: digest for exactly that reason.                   │
+# │                                                                        │
+# │   Vendor roots arrive through `board_env`, which RECORDS EVERY         │
+# │   RESOLUTION ATTEMPT -- resolved or not -- so a missing one is a       │
+# │   named, reported absence rather than an empty string that flows       │
+# │   onward and concatenates into a plausible wrong path.                 │
+# └────────────────────────────────────────────────────────────────────────┘
+#
+# board_env <VAR> <what it is for>
+#
+# set board_files_root [board_env MY_BOARD_FILES "vendor board files for @BOARD@"]
+
+# board_defer <key> <script>
+#
+# For a value that cannot be computed when this file loads -- it needs a
+# vendor tree that may not be mounted, or a file whose absence is legitimate.
+# The script runs when the key is first READ, and if it cannot produce a value
+# the key stays UNSET WITH A RECORDED REASON: `board_has` answers 0 and
+# `board_get` errors naming the file it could not read. It never becomes "".
+#
+# That distinction is the whole point. An empty string propagates: it
+# concatenates into a path, it satisfies a truth test in the wrong direction,
+# and it reaches a tool as an argument that means something else. An unset key
+# with a reason stops at the first thing that asks for it and says what went
+# wrong.
+#
+# board_defer board_repo_paths {
+#     set root [board_env MY_BOARD_FILES "vendor board files for @BOARD@"]
+#     if {![file isdirectory $root]} { error "not a directory: $root" }
+#     return $root
+# }
+
+# board_note <text>
+#
+# Anything a reader of this pack needs and the schema has no key for: a board
+# revision this pack assumes, an errata, a jumper that must be in a particular
+# position. Notes are recorded in the run manifest, so a bitstream built for a
+# board with a hardware quirk carries the note with it.
+#
+# board_note "<<FILL IN: board revision this pack describes, and anything a
+#              reader must know that no key above holds>>"

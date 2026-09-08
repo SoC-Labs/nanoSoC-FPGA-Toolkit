@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+"""fpga-flow-doctor - can THIS MACHINE run the flow?
+
+    fpga-flow-doctor          (no arguments, and it takes none)
+
+Nothing about a design; `fpga-flow-check` does that. This answers the other
+question, the one that is true of a host rather than of a project: are the tools
+here, is there a licence to reach, is there disk, can we write.
+
+WHY THIS EXISTS: on this class of host the modulefiles and the filesystem
+disagree about which Vivado versions exist, and the modulefile is the louder of
+the two. Measured 2026-09-08 on one site: the module tree advertises three
+versions and defaults to the newest, while the version actually on PATH is
+older, one installed version is advertised by no modulefile at all, and the two
+newest live under a DIFFERENT install root on a group-restricted mount - so
+whether they exist is a per-user answer, not a per-host one. `module load` then
+succeeds and the build runs on a version nobody chose. So this script reports
+what is ON THE FILESYSTEM AND REACHABLE BY YOU, enumerated at run time, and
+names every version a modulefile advertises that it cannot find. It never
+believes a modulefile, and it never hardcodes a version list.
+
+It launches NO EDA TOOL. Starting Vivado merely to read its version costs tens
+of seconds, writes a journal file into the current directory, and on a busy site
+can queue behind a licence - so the version is derived from the install path and
+labelled as such. An honest weaker measurement beats a confident slower one.
+
+Exit status:
+    0   every ESSENTIAL item present (advisory items may still be reported)
+    1   an essential item is missing - the flow cannot run on this host
+    2   crash
+    130 interrupted
+
+Copyright (C) 2026, SoC Labs (www.soclabs.org)
+"""
+
+import os
+import re
+import sys
+import glob
+import socket
+import shutil
+import subprocess
+import traceback
+
+WIDTH = 24
+
+# Vivado's own layout: an install root is the directory that contains bin/, and
+# the version is the name of that directory or of its parent. Both shapes are in
+# use on the same site - the classic layout puts bin/ directly under <ver>/, the
+# unified-installer layout puts it under <ver>/Vivado/ - so both are handled and
+# neither is written down as a path.
+BIN_REL = os.path.join("bin", "vivado")
+
+# Where BUILD_DIR might be named, most specific first. No site path is ever
+# defaulted here: if none of these is set the answer is the current directory,
+# and the report SAYS which one it used rather than implying it measured the
+# thing you cared about.
+BUILD_DIR_VARS = ("FPGACHECK_BUILD_DIR", "FPGA_BUILD_DIR", "BUILD_DIR")
+
+# Xilinx tools read these, in this order of specificity. FlexLM also consults
+# LM_LICENSE_FILE, which on a shared site is usually another vendor's.
+LICENCE_VARS = ("XILINXD_LICENSE_FILE", "XILINX_LICENSE_FILE", "LM_LICENSE_FILE")
+
+LICENCE_TIMEOUT = 2.0    # seconds per server. Doctor must stay a few seconds.
+MAX_LICENCE_PROBES = 6
+
+
+def line(status, name, detail=""):
+    print("  %-6s %-*s %s" % (status, WIDTH, name, detail))
+
+
+def note(text):
+    for l in text.strip().splitlines():
+        print("         %s" % l.strip())
+
+
+class Doctor(object):
+    """Two counters, and only one of them can fail the run.
+
+    ESSENTIAL is 'the flow cannot run here'. ADVISORY is 'it can run, and you
+    should still read this'. The split is the whole point: a host with no
+    licence server reachable right now is still a host that can run the flow in
+    ten minutes, and a doctor that exits 1 on it teaches people to ignore it."""
+
+    def __init__(self):
+        self.fatal = 0
+        self.advisory = 0
+
+    def essential(self, name, detail=""):
+        self.fatal += 1
+        line("MISS", name, detail)
+
+    def advise(self, name, detail=""):
+        self.advisory += 1
+        line("WARN", name, detail)
+
+    def tool(self, name, essential, why):
+        path = shutil.which(name)
+        if path:
+            line("ok", name, path)
+            return path
+        if essential:
+            self.essential(name, "not on PATH")
+        else:
+            self.advisory += 1
+            line("--", name, "not on PATH")
+        note(why)
+        return None
+
+
+def run(cmd, timeout=6, stdin_text=None):
+    """Run a small, cheap, non-EDA command. Never raises."""
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             stdin=subprocess.PIPE if stdin_text else None,
+                             universal_newlines=True)
+        out, _ = p.communicate(input=stdin_text, timeout=timeout)
+        return (out or "").strip()
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# modulefiles: what the host ADVERTISES
+#
+# A modulefile is Tcl and could in principle compute anything, but the ones that
+# matter are declarative: a few `set` lines and a `prepend-path PATH .../bin`.
+# Parsing that much is honest and cheap. Anything this parser cannot resolve is
+# reported as unresolved - never guessed, and never quietly dropped, because a
+# silently skipped modulefile is exactly the version that then surprises you.
+# ---------------------------------------------------------------------------
+
+def parse_modulefile(path):
+    """-> (root, reason). root is the directory containing bin/vivado."""
+    try:
+        with open(path, errors="replace") as fh:
+            text = fh.read()
+    except OSError as e:
+        return None, "unreadable (%s)" % e
+    variables = {}
+
+    def expand(value):
+        # Two passes is enough for `set a $b/x` / `set b $c/y` chains without
+        # needing a real Tcl evaluator.
+        for _ in range(4):
+            new = re.sub(r"\$\{(\w+)\}", lambda m: variables.get(m.group(1), m.group(0)), value)
+            new = re.sub(r"\$(\w+)", lambda m: variables.get(m.group(1), m.group(0)), new)
+            if new == value:
+                break
+            value = new
+        return value
+
+    path_entries, setenv_vivado = [], None
+    for raw in text.splitlines():
+        s = raw.strip()
+        if s.startswith("#"):
+            continue
+        m = re.match(r"^set\s+(\w+)\s+(\S+)", s)
+        if m:
+            variables[m.group(1)] = expand(m.group(2))
+            continue
+        m = re.match(r"^(?:prepend-path|append-path)\s+PATH\s+(\S+)", s)
+        if m:
+            path_entries.append(expand(m.group(1)))
+            continue
+        m = re.match(r"^setenv\s+XILINX_VIVADO\s+(\S+)", s)
+        if m:
+            setenv_vivado = expand(m.group(1))
+
+    # PATH is preferred over XILINX_VIVADO on purpose. Measured on this site:
+    # one modulefile sets XILINX_VIVADO to a directory that does not exist while
+    # putting the correct directory on PATH. PATH is what actually decides which
+    # binary runs, so PATH is what this reports.
+    for entry in path_entries:
+        if entry.rstrip("/").endswith("/bin"):
+            return os.path.dirname(entry.rstrip("/")), ""
+    if setenv_vivado:
+        return setenv_vivado, "from XILINX_VIVADO; no PATH entry ended in /bin"
+    return None, "no PATH or XILINX_VIVADO line this parser could resolve"
+
+
+def advertised_versions():
+    """-> list of (version, modulefile, root, reason), from MODULEPATH."""
+    out = []
+    seen = set()
+    for mdir in os.environ.get("MODULEPATH", "").split(":"):
+        mdir = mdir.strip()
+        if not mdir or not os.path.isdir(mdir):
+            continue
+        candidates = []
+        # A tool directory holding one file per version, and the flat
+        # `vivado-<ver>` spelling. Both are in the wild.
+        for entry in sorted(os.listdir(mdir)):
+            full = os.path.join(mdir, entry)
+            if entry.lower() == "vivado" and os.path.isdir(full):
+                for ver in sorted(os.listdir(full)):
+                    if ver.startswith("."):
+                        continue          # .version, .modulerc - not versions
+                    candidates.append((ver, os.path.join(full, ver)))
+            elif re.match(r"^vivado[-_]", entry.lower()) and os.path.isfile(full):
+                candidates.append((entry.split("-", 1)[-1].split("_", 1)[-1], full))
+        for ver, mf in candidates:
+            if mf in seen:
+                continue
+            seen.add(mf)
+            if os.path.islink(mf):
+                # `latest -> 2026.1` is an alias, not a fourth version. Counting
+                # it as one would make the advertised list wrong by inflation.
+                out.append((ver, mf, None, "alias -> %s" % os.readlink(mf)))
+                continue
+            root, reason = parse_modulefile(mf)
+            out.append((ver, mf, root, reason))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# the filesystem: what the host HAS
+# ---------------------------------------------------------------------------
+
+def install_roots(extra):
+    """Every plausible Vivado install root, discovered - never hardcoded.
+
+    Seeds: the binary on PATH, XILINX_VIVADO, and the roots the modulefiles
+    name. For each seed the SIBLINGS of its version directory are scanned too,
+    which is how a version that no modulefile advertises gets found - and one
+    such was measured on this site."""
+    seeds = []
+    onpath = shutil.which("vivado")
+    if onpath:
+        seeds.append(os.path.dirname(os.path.dirname(os.path.realpath(onpath))))
+    if os.environ.get("XILINX_VIVADO"):
+        seeds.append(os.environ["XILINX_VIVADO"])
+    seeds.extend([e for e in extra if e])
+
+    roots = {}
+    for seed in seeds:
+        if not seed:
+            continue
+        for cand in (seed,) + tuple(siblings(seed)):
+            if os.path.isfile(os.path.join(cand, BIN_REL)):
+                roots[os.path.realpath(cand)] = cand
+    return sorted(roots.values())
+
+
+def siblings(root):
+    """Sibling install directories of `root`, both layouts.
+
+    <parent>/<ver>            -> scan <parent>/*
+    <parent>/<ver>/Vivado     -> scan <parent>/*/Vivado
+    """
+    out = []
+    parent = os.path.dirname(root.rstrip("/"))
+    grandparent = os.path.dirname(parent)
+    for pat in (os.path.join(parent, "*"),
+                os.path.join(grandparent, "*", os.path.basename(root.rstrip("/")))):
+        try:
+            out.extend(p for p in glob.glob(pat) if os.path.isdir(p))
+        except OSError:
+            continue
+    return out
+
+
+def version_of(root):
+    """The version, from the install path. NOT from launching the tool.
+
+    Vivado ships no small file that states its version, so the directory name is
+    the evidence, and the report says so. A directory named after a version it
+    does not contain would fool this - the honest weakness of not spending a
+    tool launch, stated rather than hidden."""
+    parts = [p for p in os.path.realpath(root).split(os.sep) if p]
+    for p in reversed(parts):
+        if re.match(r"^\d{4}\.\d+$", p):
+            return p
+    return "unknown"
+
+
+def usable(root):
+    """-> (state, detail). Three states, because two is a lie on a shared site."""
+    exe = os.path.join(root, BIN_REL)
+    if not os.path.isfile(exe):
+        return "absent", "no %s" % BIN_REL
+    if not os.access(exe, os.X_OK):
+        return "blocked", "present but not executable by %s" % (os.environ.get("USER") or "you")
+    # An executable you cannot traverse to is not an executable you can run.
+    probe = os.path.dirname(exe)
+    while probe and probe != os.sep:
+        if not os.access(probe, os.X_OK):
+            return "blocked", "%s is not traversable by you (group/mount permissions)" % probe
+        probe = os.path.dirname(probe)
+    return "ok", exe
+
+
+# ---------------------------------------------------------------------------
+# licences
+# ---------------------------------------------------------------------------
+
+def licence_endpoints(value):
+    """Split a FlexLM variable into (host, port) pairs.
+
+    Accepted forms, all of which appear in the wild:
+        27070@server              port@host
+        27070@a:27070@b           colon-separated list
+        /path/to/licence.dat      a FILE, not a server
+    """
+    out = []
+    for item in value.replace(";", ":").split(":"):
+        item = item.strip()
+        if not item or "@" not in item:
+            continue
+        port, _, host = item.partition("@")
+        try:
+            out.append((host, int(port)))
+        except ValueError:
+            continue
+    return out
+
+
+# ---------------------------------------------------------------------------
+
+def report_vivado(d):
+    print("Vivado - what is ADVERTISED vs what is INSTALLED")
+    adv = advertised_versions()
+    adv_roots = [r for (_, _, r, _) in adv if r]
+
+    roots = install_roots(adv_roots)
+    installed = {}
+    for root in roots:
+        state, detail = usable(root)
+        installed[version_of(root)] = (root, state, detail)
+
+    onpath = shutil.which("vivado")
+    if onpath:
+        real = os.path.realpath(onpath)
+        line("ok", "vivado on PATH", "%s   (version %s, from the install path)"
+             % (onpath, version_of(os.path.dirname(os.path.dirname(real)))))
+    else:
+        d.essential("vivado on PATH", "not found")
+        note("Every stage of this flow is Vivado. Load a module - `module avail`\n"
+             "lists them, and the versions below say which of those are real - or\n"
+             "source the install's settings64.sh.\n"
+             "NOTE: this script deliberately does not launch it, so 'on PATH' is\n"
+             "as far as it can honestly go. A licence failure is a separate line.")
+
+    if not installed:
+        d.essential("installed versions", "none found on this filesystem")
+        note("No directory containing bin/vivado was reachable from the binary on\n"
+             "PATH, from XILINX_VIVADO, or from any root a modulefile names.")
+    else:
+        for ver in sorted(installed):
+            root, state, detail = installed[ver]
+            if state == "ok":
+                line("ok", "installed %s" % ver, root)
+            elif state == "blocked":
+                d.advise("installed %s" % ver, root)
+                note("Present on this filesystem but NOT USABLE BY YOU: %s\n"
+                     "This is the third state a version can be in and the one that\n"
+                     "gets recorded as 'not installed' by whoever hits it first.\n"
+                     "It is a group or mount permission, not a missing install." % detail)
+            else:
+                d.advise("installed %s" % ver, "%s (%s)" % (root, detail))
+
+    # The §9.6 behaviour: name every version a modulefile advertises that is not
+    # on the filesystem. This is measured, never asserted from a list.
+    if not adv:
+        line("--", "modulefiles", "none found on MODULEPATH")
+        note("Nothing to cross-check, so this host's advertised-vs-installed\n"
+             "answer is UNMEASURED rather than clean. If your site uses modules,\n"
+             "MODULEPATH is not set in this shell.")
+        d.advisory += 1
+    else:
+        ghosts, aliases, unresolved = [], [], []
+        for ver, mf, root, reason in adv:
+            if root is None and reason.startswith("alias"):
+                aliases.append((ver, reason))
+                continue
+            if root is None:
+                unresolved.append((ver, mf, reason))
+                continue
+            state, detail = usable(root)
+            if state == "ok":
+                line("ok", "advertised %s" % ver, "installed at %s" % root)
+            else:
+                ghosts.append((ver, mf, root, detail))
+
+        for ver, reason in aliases:
+            line("--", "advertised %s" % ver, reason + "  (an alias, not a version)")
+
+        for ver, mf, reason in unresolved:
+            d.advise("advertised %s" % ver, "modulefile not parseable")
+            note("%s\n%s\nReported rather than skipped: a modulefile this script\n"
+                 "cannot read is precisely the version that surprises you later."
+                 % (mf, reason))
+
+        for ver, mf, root, detail in ghosts:
+            d.advise("ADVERTISED, NOT USABLE: %s" % ver, root)
+            note("The modulefile\n"
+                 "    %s\n"
+                 "puts %s/bin on PATH, and %s.\n"
+                 "`module load vivado/%s` will therefore SUCCEED and leave you with\n"
+                 "a PATH entry that resolves to nothing, or to whichever Vivado was\n"
+                 "already there. The build then runs on a version nobody chose and\n"
+                 "no log says so.\n"
+                 "This is a site packaging fault, not a fault in your project: tell\n"
+                 "whoever owns the module tree, and until then load a version listed\n"
+                 "as installed above." % (mf, root, detail, ver))
+
+        # The mirror-image finding, and the reason this is a two-way comparison:
+        # a version nobody advertises is a version nobody will think to load.
+        adv_vers = set(v for (v, _, r, _) in adv if r)
+        unadvertised = sorted(set(installed) - adv_vers - set(["unknown"]))
+        for ver in unadvertised:
+            root = installed[ver][0]
+            line("--", "installed, not advertised", "%s at %s" % (ver, root))
+            note("Installed and reachable, but no modulefile offers it, so it is\n"
+                 "invisible to `module avail`. Usable by sourcing its own\n"
+                 "settings64.sh or by putting its bin/ on PATH directly.")
+
+    default = os.environ.get("VIVADO_VER", "")
+    if default:
+        state = installed.get(default)
+        if state and state[1] == "ok":
+            line("ok", "VIVADO_VER", "%s  (asserted, and installed)" % default)
+        else:
+            d.advise("VIVADO_VER", "%s  asserted but NOT usable here" % default)
+            note("VIVADO_VER is ASSERTED, not assumed: a project that sets it is\n"
+                 "saying results are only comparable on that version. This host\n"
+                 "cannot honour it.")
+    else:
+        line("--", "VIVADO_VER", "unset - whatever is on PATH will be used")
+    print("")
+
+
+def report_support(d):
+    print("Support tools")
+    d.tool("make", True, "The engine is GNU make.")
+
+    py = shutil.which("python3")
+    line("ok", "python3 (running)", "%s   %d.%d.%d" %
+         (sys.executable, sys.version_info[0], sys.version_info[1], sys.version_info[2]))
+    if py and os.path.realpath(py) != os.path.realpath(sys.executable):
+        ver = run([py, "-V"]) or "version unknown"
+        line("--", "python3 (on PATH)", "%s   %s" % (py, ver))
+        note("A DIFFERENT python3 from the one running this script. make recipes\n"
+             "use the one on PATH, so that is the one whose version matters for\n"
+             "the rest of the flow.")
+    elif not py:
+        d.essential("python3 on PATH", "not found")
+        note("This script is running under %s, but make recipes call `python3`\n"
+             "and will not find one." % sys.executable)
+    if sys.version_info < (3, 6):
+        d.essential("python3 version", "%d.%d is too old" % sys.version_info[:2])
+        note("The toolkit's scripts are stdlib-only Python 3.6+.")
+
+    tcl = d.tool("tclsh", False,
+                 "Not launched by the flow itself - Vivado carries its own Tcl -\n"
+                 "but it is how the toolkit's Tcl is syntax-checked without a\n"
+                 "licence, and how a hook is debugged outside a 90-minute run.")
+    if tcl:
+        ver = run([tcl], stdin_text="puts [info patchlevel]\nexit\n")
+        if ver:
+            line("ok", "  tclsh version", ver.splitlines()[-1])
+
+    git = d.tool("git", False,
+                 "Used only for the provenance lines in each run manifest. Without\n"
+                 "it they read UNVERIFIED and a bitstream cannot be tied to a\n"
+                 "commit - which is the difference between a result and an anecdote.")
+    if git:
+        ver = run([git, "--version"])
+        if ver:
+            line("ok", "  git version", ver)
+    print("")
+
+
+def report_licences(d):
+    print("Licences   (probed by opening a socket - no tool is launched)")
+    seen = False
+    probes = 0
+    for name in LICENCE_VARS:
+        value = os.environ.get(name, "")
+        if not value:
+            continue
+        seen = True
+        line("ok", name, value if len(value) < 88 else value[:85] + "...")
+        endpoints = licence_endpoints(value)
+        if not endpoints:
+            line("--", "  (file-based)", "no port@host entries to probe")
+            continue
+        for host, port in endpoints:
+            if probes >= MAX_LICENCE_PROBES:
+                line("--", "  (not probed)", "server cap reached; the rest are untested")
+                break
+            probes += 1
+            try:
+                s = socket.create_connection((host, port), timeout=LICENCE_TIMEOUT)
+                s.close()
+                line("ok", "  %s:%d" % (host, port), "answers")
+            except OSError as e:
+                d.advise("  %s:%d" % (host, port), "no answer (%s)" % e)
+                note("The variable is set and nothing is listening. A tool launched\n"
+                     "now would do all its startup work and THEN fail its checkout,\n"
+                     "which reads as a tool problem rather than a licence one.\n"
+                     "Advisory, not fatal: a server that is down now is up later,\n"
+                     "and the host is otherwise fine.")
+    if not seen:
+        d.advisory += 1
+        line("--", "licence variables", "none of %s set" % " / ".join(LICENCE_VARS))
+        note("If your site configures licences another way - a modulefile, a\n"
+             "wrapper - this is fine, and loading the module usually sets them.\n"
+             "If it does not, every tool launch fails at checkout.")
+    print("")
+
+
+def report_resources(d):
+    print("Resources")
+    ncpu = os.cpu_count() or 0
+    line("ok", "CPUs", "%d" % ncpu)
+    want = os.environ.get("NUM_JOBS") or os.environ.get("FPGACHECK_NUM_JOBS") or ""
+    if want.isdigit() and int(want) > ncpu:
+        d.advise("NUM_JOBS", "%s > %d available" % (want, ncpu))
+        note("Oversubscribing does not speed an implementation up; it slows it\n"
+             "down and makes runtimes non-comparable between runs, which is what\n"
+             "a run manifest exists to make possible.")
+
+    # Where BUILD_DIR is, and - said out loud - whether we actually know.
+    target, source = os.getcwd(), "current directory (BUILD_DIR not exported)"
+    explicit = False
+    for var in BUILD_DIR_VARS:
+        if os.environ.get(var):
+            target, source, explicit = os.environ[var], var, True
+            break
+
+    probe = target
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+
+    line("--" if not explicit else "ok", "build location", "%s   (from %s)" % (target, source))
+    if not explicit:
+        note("Nothing named a build directory, so disk and writability below are\n"
+             "measured HERE and may not be where the flow will write. Run this\n"
+             "from the project, or via `make doctor`, for the real answer.")
+
+    try:
+        st = os.statvfs(probe)
+        free_gb = st.f_bavail * st.f_frsize / (1024.0 ** 3)
+        detail = "%.0f GB free on %s" % (free_gb, probe)
+        if free_gb < 20:
+            d.advise("disk", detail)
+            note("An implementation run writes checkpoints, reports, a bitstream and\n"
+                 "an .xsa; a project-mode run keeps a full Vivado project as well.\n"
+                 "Running out of space mid-implementation loses the whole run, and\n"
+                 "the error it produces does not say 'disk'.")
+        else:
+            line("ok", "disk", detail)
+    except OSError as e:
+        d.advisory += 1
+        line("--", "disk", "could not measure (%s)" % e)
+        note("Reported as unmeasured rather than as fine. A check that could not\n"
+             "read its input has not passed; it has not run.")
+
+    if probe and os.access(probe, os.W_OK):
+        line("ok", "writable", probe)
+    elif explicit:
+        d.essential("writable", "%s is not writable" % probe)
+        note("Everything a run produces goes under the build directory - the\n"
+             "toolkit never writes into the project's source tree - so this has to\n"
+             "be somewhere you can write. Point BUILD_DIR at scratch space if the\n"
+             "checkout is read-only.")
+    else:
+        d.advise("writable", "%s is not writable" % probe)
+        note("This is the current directory, not a declared build directory, so it\n"
+             "is advisory. It would be fatal if BUILD_DIR pointed here.")
+
+    display = os.environ.get("DISPLAY", "")
+    if not display:
+        line("--", "DISPLAY", "unset - `make gui` will refuse; batch runs are fine")
+    elif not display.startswith(":") and ":" not in display:
+        d.advise("DISPLAY", "%s   (no colon?)" % display)
+        note("A malformed DISPLAY passes a non-empty test and then makes the tool\n"
+             "fall back to batch with a warning, which reads as the GUI simply not\n"
+             "starting. Try:  export DISPLAY=:%s" % display)
+    else:
+        line("ok", "DISPLAY", display)
+    print("")
+
+
+def diagnose():
+    d = Doctor()
+    print("== fpga-flow-doctor: %s ==" % socket.gethostname())
+    print("   No EDA tool is launched by anything below. No licence is checked out.")
+    print("")
+
+    report_vivado(d)
+    report_support(d)
+    report_licences(d)
+    report_resources(d)
+
+    if d.fatal:
+        print("%d ESSENTIAL item(s) missing - the flow cannot run on this host." % d.fatal)
+        if d.advisory:
+            print("%d advisory item(s) as well." % d.advisory)
+        return 1
+    if d.advisory:
+        print("Essentials present. %d advisory item(s) above - read them before a long"
+              % d.advisory)
+        print("run; none of them stops a build.")
+    else:
+        print("This host can run the flow.")
+    print("Next: cd to the project's fpga/ directory and run `make check`.")
+    return 0
+
+
+def main():
+    if len(sys.argv) > 1:
+        if sys.argv[1] in ("-h", "--help"):
+            sys.stdout.write(__doc__)
+            return 0
+        # Taking no arguments is a design decision, not an omission. This script
+        # asks about the HOST; every question about a project belongs to
+        # fpga-flow-check, and an argument here would be an invitation to blur
+        # the two until neither answers cleanly.
+        print("fpga-flow-doctor: takes no arguments (got %s)." % " ".join(sys.argv[1:]),
+              file=sys.stderr)
+        print("  It reports on THIS HOST. For a project's contract, use "
+              "fpga-flow-check.", file=sys.stderr)
+        return 2
+    try:
+        return diagnose()
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        # Never exit 0 on a crash: a doctor that dies quietly is read as a
+        # clean bill of health, which is the one thing it must never be.
+        traceback.print_exc()
+        print("")
+        print("fpga-flow-doctor: CRASHED (traceback above). Exit 2 - this is NOT a pass.")
+        return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)

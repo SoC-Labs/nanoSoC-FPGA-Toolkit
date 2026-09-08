@@ -1,0 +1,445 @@
+#!/bin/sh
+#-----------------------------------------------------------------------------
+# fpga-flow-init - scaffold fpga/ into a project from the toolkit's templates
+#
+# USAGE
+#
+#   fpga-flow-init --block <top> --board <board> [options] <project-dir>
+#
+# Copies templates/ into <project-dir>/fpga/, substituting the design's name,
+# the board, the part and the path back to this toolkit. It NEVER overwrites an
+# existing file unless --force is given, and it never touches anything outside
+# <project-dir>/fpga/.
+#
+# Required
+#   --block <name>   the design's short name. Stem of every artefact the flow
+#                    writes, and of the XDC files created here.
+#   --board <name>   the board pack this project will write. A board pack is a
+#                    PROJECT-side file - facts about a circuit board are not
+#                    facts about this toolkit - so --board is ALWAYS accepted,
+#                    including for a board nobody has described yet. Describing
+#                    it is step 2 of the next-steps list this prints.
+#
+# Options
+#   --part <name>    the device. Normally the BOARD PACK supplies it and this
+#                    flag is unnecessary; pass it to record a project override.
+#   --flow-dir <p>   what design.mk should record as FPGA_FLOW_DIR. Defaults to
+#                    a RELATIVE path from the new fpga/ directory to this
+#                    toolkit, which survives the tree being moved or cloned.
+#   --force          overwrite files that already exist. Off by default: this
+#                    script is safe to re-run on a live project.
+#   -h, --help       this message
+#
+# Example
+#   fpga-flow-init --block my_top --board my_board ~/work/my-design
+#   cd ~/work/my-design/fpga && make check
+#
+# END USAGE
+#
+# WHY THIS EXISTS: a scaffolder is trusted absolutely by the person running it,
+# because they have nothing yet to compare its output against. The reference
+# ASIC toolkit's scaffolder walked its templates with `find ... | while read`,
+# which runs the loop body in a SUBSHELL - so every `made` and `skipped`
+# increment was discarded at the `done`, both counters read 0 downstream, and
+# the command its own README told a new user to type exited 0 having written
+# nothing. The empty directory was discovered by whatever ran next, several
+# steps and one confused reader away from the cause. Every postcondition at the
+# bottom of this file exists because EXIT 0 IS A CLAIM THAT fpga/ EXISTS AND IS
+# USABLE, and a scaffolder that returns success having created nothing is worse
+# than one that fails.
+#
+# POSIX sh: no bash, no python, no pip. This is the first thing a new user runs
+# and it must work on whatever shell the site has.
+#
+# Exit status:
+#   0   fpga/ exists and holds every template, expanded and non-empty
+#   1   a postcondition FAILED - files were written and the tree is not the one
+#       templates/ describes. Read the message; it names the shortfall.
+#   2   refused: bad or missing arguments, or a toolkit checkout with no
+#       templates to install. Nothing was written.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+#-----------------------------------------------------------------------------
+
+set -eu
+
+PROG=$(basename "$0")
+SELF=$(cd "$(dirname "$0")" && pwd)
+FLOW_DIR=$(cd "$SELF/.." && pwd)
+TEMPLATES="$FLOW_DIR/templates"
+
+# --- messages ----------------------------------------------------------------
+#
+# TWO failure verbs, and the difference is the exit code the contract (§10)
+# assigns them. `refuse` is "I will not start": the input is unusable and
+# nothing has been written. `fail` is "I started and the result is not what I
+# promised": files exist and the tree is incomplete. A caller that cannot tell
+# those apart retries the wrong one.
+refuse() { echo "$PROG: $*" >&2; exit 2; }
+fail()   { echo "$PROG: $*" >&2; exit 1; }
+note()   { echo "$PROG: $*" >&2; }
+
+# --- usage -------------------------------------------------------------------
+#
+# Printed by sed-ing THIS FILE'S OWN header, between the USAGE markers, so the
+# help text cannot drift from the file it documents. Line numbers are not used:
+# they drift the first time anyone adds a paragraph, and then the help is a
+# random slice of the header.
+usage() {
+    sed -n '/^# USAGE$/,/^# END USAGE$/p' "$SELF/$PROG" \
+        | sed -e '1d' -e '$d' -e 's/^# \{0,1\}//' -e 's/^#$//'
+    echo "Part packs in this checkout (--part is optional; the board pack normally"
+    echo "supplies the part):"
+    part_packs_listed "  "
+}
+
+# The part packs this checkout carries. DIRECTORIES ONLY. `ls part/` also lists
+# part/pack_api.tcl and part/README.md, so a naive listing offers "README.md" as
+# a device - and a list that names a thing --part cannot take is worse than no
+# list, because the reader tries it.
+part_packs() {
+    ( cd "$FLOW_DIR/part" 2>/dev/null || exit 0
+      for d in */; do [ -d "$d" ] || continue; printf '%s\n' "${d%/}"; done )
+}
+
+## part_packs_listed <indent> - the packs, indented, or an explicit "(none)".
+## Never empty: a blank where a list should be reads as "the question was not
+## asked" rather than "the answer is nothing".
+part_packs_listed() {
+    if part_packs | grep -q .; then
+        part_packs | sed "s|^|$1|"
+    else
+        printf '%s(none - this checkout ships no part pack yet)\n' "$1"
+    fi
+}
+
+# --- arguments ---------------------------------------------------------------
+
+BLOCK=""
+BOARD=""
+PART=""
+DEST=""
+FORCE=0
+FLOW_REF=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --block)    BLOCK=${2:-}; shift 2 ;;
+        --board)    BOARD=${2:-}; shift 2 ;;
+        --part)     PART=${2:-};  shift 2 ;;
+        --flow-dir) FLOW_REF=${2:-}; shift 2 ;;
+        --force)    FORCE=1; shift ;;
+        -h|--help)  usage; exit 0 ;;
+        -*)         echo "$PROG: unknown option '$1'" >&2; usage >&2; exit 2 ;;
+        *)          DEST=$1; shift ;;
+    esac
+done
+
+[ -n "$BLOCK" ] || { usage >&2; refuse "--block is required"; }
+[ -n "$BOARD" ] || { usage >&2; refuse "--board is required"; }
+[ -n "$DEST"  ] || { usage >&2; refuse "a project directory is required"; }
+
+# --- what a name may contain --------------------------------------------------
+#
+# These strings become DIRECTORY NAMES, MAKE VARIABLES and TCL WORDS, and they
+# are pasted into a `sed` replacement below. Three characters are load-bearing
+# there: `&` inserts the whole match, `|` ends the s|| command, and a backslash
+# starts an escape - so a name carrying one produces a file that is subtly not
+# what was asked for, with no error anywhere. A path separator would escape
+# fpga/ entirely. Checked here, by name, rather than discovered as corrupt
+# output.
+#
+# BLOCK is stricter than the rest because it must also be spellable as a Verilog
+# identifier: it is the module the flow elaborates.
+case "$BLOCK" in
+    ''|*[!A-Za-z0-9_]*)
+        refuse "--block '$BLOCK' is not a plain identifier.
+  BLOCK is the top module's name as the RTL spells it and the stem of every
+  artefact the flow writes, so it must be [A-Za-z0-9_] only." ;;
+esac
+case "$BOARD" in
+    *[!A-Za-z0-9_.-]*|*/*)
+        refuse "--board '$BOARD' may contain only letters, digits, '_', '-' and '.'.
+  It becomes the directory fpga/board/<board>/ and a Tcl word in the pack." ;;
+esac
+case "$PART" in
+    *[!A-Za-z0-9_.:-]*|*/*)
+        refuse "--part '$PART' may contain only letters, digits, '_', '-', '.' and ':'." ;;
+esac
+
+# --- templates, before anything is created -----------------------------------
+#
+# Checked BEFORE the destination is made. A run that creates <project>/fpga/ and
+# then discovers it has nothing to put in it has already changed the project.
+[ -d "$TEMPLATES" ] || refuse "no templates directory at $TEMPLATES.
+  This toolkit checkout looks incomplete - if it is a submodule, try
+      git submodule update --init --recursive"
+
+TEMPLATE_LIST=$(find "$TEMPLATES" -type f | sort)
+[ -n "$TEMPLATE_LIST" ] || refuse "no template files under $TEMPLATES, so there is
+  nothing to scaffold. This toolkit checkout looks incomplete - if it is a
+  submodule, try
+      git submodule update --init --recursive"
+
+# --- a part pack that is not here is a WARNING --------------------------------
+#
+# Not an error, and the distinction is deliberate. PART_DIR can point anywhere,
+# so a site pack held outside this checkout is a supported setup; refusing it
+# would make the toolkit the gatekeeper of a list it does not own. There is no
+# equivalent check for --board at all: a board pack is PROJECT-side by design
+# (contract §1), so this repository has no opinion about which boards exist and
+# an unknown board name is simply the normal case on a new project.
+if [ -n "$PART" ] && [ ! -d "$FLOW_DIR/part/$PART" ]; then
+    note "WARNING: no part pack at $FLOW_DIR/part/$PART"
+    note "  design.mk will still say PART := $PART, and PART_DIR can point"
+    note "  anywhere - a site pack outside this checkout is supported."
+    note "  But if you meant one of the packs here, they are:"
+    part_packs_listed "    " >&2
+fi
+
+# --- the destination ----------------------------------------------------------
+
+mkdir -p "$DEST"
+DEST=$(cd "$DEST" && pwd)
+FPGA="$DEST/fpga"
+
+# --- how design.mk should refer back to the toolkit ---------------------------
+#
+# A relative path is the right default: the common case is this toolkit vendored
+# as a submodule of the project, and a relative path survives the whole tree
+# being moved, cloned, or checked out by CI under a different root. An absolute
+# path is a path that works on one machine.
+if [ -z "$FLOW_REF" ]; then
+    case "$FLOW_DIR" in
+        "$DEST"/*)
+            FLOW_REF="\$(FPGA_DIR)/../${FLOW_DIR#"$DEST"/}" ;;
+        *)
+            FLOW_REF="$FLOW_DIR"
+            note "NOTE: this toolkit ($FLOW_DIR) is not inside $DEST, so"
+            note "  design.mk records an ABSOLUTE FPGA_FLOW_DIR. That path is"
+            note "  true on this machine only. Vendor the toolkit into the"
+            note "  project (a submodule is the usual answer) and re-run with"
+            note "  --flow-dir, or edit the one line in design.mk." ;;
+    esac
+fi
+
+# PART is optional. When it is not given the manifest must not quietly claim a
+# device: it carries the same <<FILL IN>> marker as every other undecided value,
+# so `make check` names it in the same list as the rest and exits non-zero.
+if [ -z "$PART" ]; then
+    PART_SUBST="<<FILL IN: the device, or delete this line and let the board pack say>>"
+else
+    PART_SUBST="$PART"
+fi
+
+DATE=$(date +%Y-%m-%d)
+PROJECT=$(basename "$DEST")
+
+# The sed hazard again, this time for values this script computed rather than
+# values the user typed. FLOW_REF can be an arbitrary filesystem path.
+for v in "$FLOW_REF" "$PART_SUBST" "$PROJECT"; do
+    case "$v" in
+        *'|'*|*'&'*|*'\'*)
+            refuse "the value '$v' contains one of | & \\ , which are the three
+  characters that change meaning inside the substitution below. Rename the
+  directory, or pass --flow-dir with a path that has none of them." ;;
+    esac
+done
+
+echo "== scaffolding $FPGA =="
+echo "   block          $BLOCK"
+echo "   board          $BOARD"
+echo "   part           $PART_SUBST"
+echo "   FPGA_FLOW_DIR  $FLOW_REF"
+echo ""
+
+made=0
+skipped=0
+
+# Substitute the six placeholders. Kept to six on purpose: a template full of
+# substitutions stops being readable as an example of what a real file looks
+# like, and these files are meant to be READ - they are the course in what an
+# FPGA build needs, not just the bytes it needs.
+#
+# <<FILL IN>> is NOT in this set and is never substituted. It is the marker a
+# project fills in by hand and `make check` greps for; expanding it here would
+# turn "you have not decided this yet" into a value.
+expand() {
+    sed -e "s|@BLOCK@|$BLOCK|g" \
+        -e "s|@BOARD@|$BOARD|g" \
+        -e "s|@PART@|$PART_SUBST|g" \
+        -e "s|@FPGA_FLOW_DIR@|$FLOW_REF|g" \
+        -e "s|@DATE@|$DATE|g" \
+        -e "s|@PROJECT@|$PROJECT|g" \
+        "$1" > "$2"
+}
+
+install_one() {
+    src=$1
+    dst=$2
+    if [ -e "$dst" ] && [ "$FORCE" -eq 0 ]; then
+        echo "   skip   ${dst#"$DEST"/}   (exists; --force to overwrite)"
+        skipped=$((skipped + 1))
+        return 0
+    fi
+    mkdir -p "$(dirname "$dst")"
+    expand "$src" "$dst"
+    # `write` is a CLAIM, so it is checked before it is printed. No template in
+    # this toolkit is empty, so an empty output means the expansion produced
+    # nothing: a full disk, a read error, a sed that failed silently. Note this
+    # distinguishes ABSENT from ZERO BYTES - a zero-byte file satisfies every
+    # `test -e` in the world and is exactly the shape a tool leaves when it
+    # opened its output and then died.
+    [ -s "$dst" ] || refuse "wrote an empty $dst from $src - nothing was substituted"
+    case "$dst" in
+        *.sh|*/run_*) chmod +x "$dst" ;;
+    esac
+    echo "   write  ${dst#"$DEST"/}"
+    made=$((made + 1))
+}
+
+## dest_for <relative template path> - where that template belongs in fpga/
+##
+## A REWRITE MAP, NOT A WHITELIST. Anything not named here still installs, at
+## its own path under fpga/, with `.in` stripped and a leading `block.` basename
+## rewritten to the design's name. That matters: a whitelist would make a newly
+## added template silently vanish, and while the count postcondition at the
+## bottom would catch it, a comment is cheaper than a bug report.
+##
+## The two rewrites exist because a template TREE cannot express a directory
+## whose name is only known at scaffold time. The contract states the same shape
+## in §1 and §3.3 (BOARD_DIR, TARGET_DIR); if this function and the contract
+## disagree, one of them is a bug - say which, do not silently pick.
+##
+## TARGET defaults to BOARD (§3.3), which is why the target directory is named
+## after the board here. A project that grows a second target for the same board
+## copies the directory and sets TARGET.
+dest_for() {
+    rel=$1                        # path under templates/, e.g. targets/block.pins.xdc.in
+    out=${rel%.in}                # .in stripped
+    d=$(dirname "$out")
+    b=$(basename "$out")
+    case "$b" in
+        block.*) b="$BLOCK.${b#block.}" ;;   # block.pins.xdc -> <BLOCK>.pins.xdc
+    esac
+    case "$out" in
+        board.tcl)   printf '%s\n' "board/$BOARD/board.tcl" ; return 0 ;;
+        targets/block.*) printf '%s\n' "targets/$BOARD/$b"  ; return 0 ;;
+    esac
+    if [ "$d" = "." ]; then printf '%s\n' "$b"; else printf '%s\n' "$d/$b"; fi
+}
+
+# Walk the template tree.
+#
+# The list was collected FIRST, above, and is fed in here from a HERE-DOCUMENT.
+# `find ... | while` runs the loop body in a SUBSHELL, so every `made` and
+# `skipped` increment is discarded at the `done` and both counters read zero for
+# anything downstream - which is why the postcondition below could not have
+# caught anything, and why the reference scaffolder reported success having
+# installed nothing. This is not a style preference.
+while IFS= read -r src; do
+    [ -n "$src" ] || continue
+    rel=${src#"$TEMPLATES"/}
+    install_one "$src" "$FPGA/$(dest_for "$rel")"
+done <<TEMPLATE_LIST_END
+$TEMPLATE_LIST
+TEMPLATE_LIST_END
+
+# The one directory with no template in it. Created empty and explained in the
+# closing text, because an ABSENT directory reads as "this feature does not
+# exist" rather than "you have not used it yet" - and a step override is the
+# seam a project reaches for at exactly the moment it is most convinced the
+# toolkit is wrong about something.
+mkdir -p "$FPGA/overrides"
+
+#--- THE POSTCONDITION --------------------------------------------------------
+#
+# EXIT 0 IS A CLAIM THAT fpga/ EXISTS AND IS USABLE. A scaffolder that returns
+# success having created nothing is worse than one that fails, because the
+# caller believes it. So the closing banner is not printed until every template
+# is accounted for and the two files every project must have are on disk.
+#
+# "Scaffolded nothing" is caught one step EARLIER, at the empty TEMPLATE_LIST
+# check, because a count of zero here would be a symptom and that is the cause.
+
+# Every template ends up written or deliberately left alone. Neither counter can
+# be wrong today - which is the point of asserting it: if a later edit adds a
+# filter to the walk, or dest_for maps two templates onto one path, the file it
+# drops stops being installed and this says so, instead of the project finding
+# out at its first `make`.
+n_templates=$(printf '%s\n' "$TEMPLATE_LIST" | wc -l | tr -d ' ')
+if [ "$((made + skipped))" -ne "$n_templates" ]; then
+    fail "the template walk dropped $((n_templates - made - skipped)) of
+  $n_templates file(s): $made written, $skipped left alone. $FPGA is not the
+  tree $TEMPLATES describes, so this exits 1 rather than hand you a partial
+  scaffold that looks finished."
+fi
+
+missing=""
+for required in Makefile design.mk; do
+    [ -s "$FPGA/$required" ] || missing="$missing $required"
+done
+if [ -n "$missing" ]; then
+    fail "scaffold INCOMPLETE - $FPGA is missing:$missing
+  ($made file(s) written, $skipped left alone.) Every project needs both -
+  Makefile is the three-line entry point and design.mk is the manifest the
+  flow reads first - and $TEMPLATES no longer produces them. Nothing
+  downstream will work, so this exits 1 rather than leaving a half-tree
+  behind a green line."
+fi
+
+printf '\n   %d file(s) written, %d left alone (existing)\n' "$made" "$skipped"
+
+cat <<EOF
+
+Done. Next, in order:
+
+  1.  cd $FPGA
+      make check
+
+      It lists every <<FILL IN>> still standing and exits non-zero. Everything
+      it names is a DESIGN or BOARD decision this toolkit cannot invent: which
+      module is the board-level top, which pin the clock arrives on, how fast
+      it runs.
+
+  2.  Fill in, IN THIS ORDER. Each step is what the next one needs:
+
+        design.mk                          TOP, RTL_FLIST, PART if the board
+                                           pack does not name one. Read the
+                                           boxed warnings - each is a defect
+                                           that was measured, not a caution.
+
+        board/$BOARD/board.tcl
+                                           the PCB's facts: part, platform,
+                                           sys_clk_freq_hz, bin_style. Nothing
+                                           about your design goes in here.
+
+        targets/$BOARD/$BLOCK.pins.xdc
+                                           the pins. Read in synthesis AND in
+                                           implementation.
+
+        targets/$BOARD/$BLOCK.timing.xdc
+                                           clocks and exceptions. Implementation
+                                           only.
+
+        targets/$BOARD/$BLOCK.drc.xdc
+                                           configuration and DRC severity.
+                                           Implementation only.
+
+        hooks/                             two working checks are already here,
+                                           and both REFUSE until you declare
+                                           what they should assert. Read
+                                           hooks/README.md; if a check does not
+                                           apply, DELETE the file - that is the
+                                           honest way to say so.
+
+  3.  make doctor     can this machine run the tools? Reports what is on the
+                      filesystem, never what a modulefile advertises.
+      make check      is the contract complete now? Must exit 0.
+      make flist      the first stage that reads your RTL. No licence.
+
+  The overrides/ directory is empty and optional: a file there REPLACES
+  \$(FPGA_FLOW_DIR)/flow/steps/<name>.tcl wholesale - no merging, no partial
+  override. Read the file you are replacing first, and say in a comment at the
+  top of the replacement why. \`make check\` warns whenever one is active.
+EOF

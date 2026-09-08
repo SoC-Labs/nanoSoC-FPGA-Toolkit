@@ -1,0 +1,1295 @@
+#!/usr/bin/env python3
+"""fpga-flow-check - validate a project's FPGA-flow contract, without launching a tool.
+
+    fpga-flow-check [--quiet] [--var NAME=VALUE]... [--vars-file FILE] [<project fpga dir>]
+
+WHY THIS EXISTS: the reference ASIC toolkit's equivalent checked that every
+configured path EXISTED. A freshly scaffolded file exists from the moment it is
+written, so a project carrying 122 unfilled `<<FILL IN>>` markers across eleven
+files reported ONE missing input and declared the contract complete; the person
+it failed was the newcomer whose synthesis died on a literal `<<FILL IN>>` forty
+minutes and one licence-hour later. Three further measured defects are checked
+here for the same reason: that toolkit hardcodes a FIVE-entry step-override
+whitelist against a SEVEN-file directory, so two real extension points warn
+spuriously and are undocumented (CONTRACT rule 3); the existing FPGA flow
+discovers constraints by the glob `*_<name>*.xdc`, so a differently-named .xdc
+is silently invisible (CONTRACT §3.3); and Vivado drops a constraint file that
+matches nothing WITHOUT an error (CONTRACT §9.3), so "invisible" and "read but
+inert" look identical from the log.
+
+Runs in well under a second, launches no EDA tool, and writes nothing.
+
+Exit status:
+    0   contract complete - every required input resolved
+    1   contract incomplete - one or more required inputs missing or unfilled
+    2   refused: no project Makefile found, unusable arguments, or a crash
+    130 interrupted
+
+Copyright (C) 2026, SoC Labs (www.soclabs.org)
+"""
+
+# ---------------------------------------------------------------------------
+# INTERFACE TO fpga-flow-check
+#
+# DEFINED HERE, NOT FOUND. At the time this file was written `mk/checks.mk` did
+# not exist, so this block is a proposal for its author to reconcile against. If
+# their header block says something different, THEIRS IS THE INTERFACE and this
+# file changes - not the other way round. Nothing below is load-bearing for the
+# checks themselves; it is purely how values arrive.
+#
+#   fpga-flow-check [--quiet] [--var NAME=VALUE]... [--vars-file FILE] [DIR]
+#
+#   --var NAME=VALUE   Repeatable. NAME is the CANONICAL contract name from
+#                      CONTRACT §3 - `TOP`, `RTL_FLIST`, `XDC_PINS`, ... - never
+#                      a prefixed or aliased spelling. VALUE is the value make
+#                      has already resolved. make is the only thing that can
+#                      resolve a `?=` chain against per-invocation overrides, so
+#                      make resolves and this script checks: one implementation
+#                      of the checks, one place the messages live.
+#                      An empty VALUE means "not configured" and is legal - it
+#                      is how an optional gets reported as `--` rather than
+#                      being silently indistinguishable from one make forgot.
+#                      Passing a NAME this script does not know is not an error;
+#                      it is reported, so an interface drift is visible rather
+#                      than silent.
+#
+#   --vars-file FILE   One NAME=VALUE per line, `#` comments and blanks ignored.
+#                      Same semantics as --var. Exists because a full contract
+#                      is ~70 variables and some values are lists; a single make
+#                      command line carrying all of them is close enough to
+#                      ARG_MAX to be a future 20-minute debugging session.
+#
+#   DIR                Optional. The project's fpga/ directory. Used ONLY when
+#                      no variables were supplied at all: this script then finds
+#                      the project Makefile and re-invokes `make -C DIR check`,
+#                      so a human typing the script name by hand gets the same
+#                      answer make would give, from the same resolution.
+#
+#   --quiet            Print the per-variable table only if something is wrong.
+#                      `check-quiet` is a prerequisite of every stage target
+#                      (CONTRACT §4), so its normal output must be nothing.
+#
+#   Environment fallback: FPGACHECK_<NAME>, consulted only when --var did not
+#   supply NAME. Deliberately NOT the bare canonical name - `TOP` and `PART` are
+#   far too generic to read out of a user's shell - and deliberately not an
+#   `FPGA_` prefix, which would collide with the four contract variables that
+#   already start with those letters (FPGA_DIR, FPGA_FLOW_DIR, FPGA_IMAGE_HEX,
+#   FPGAHUB_*). --var always wins.
+# ---------------------------------------------------------------------------
+
+import os
+import re
+import sys
+import difflib
+import subprocess
+import traceback
+
+ENV_PREFIX = "FPGACHECK_"
+
+# Directories never walked when scanning the project: outputs, VCS metadata and
+# tool scratch. A run directory can hold hundreds of thousands of files and this
+# script has a sub-second budget.
+SKIP_DIRS = ("build", ".git", "__pycache__", ".Xil", ".jou", "node_modules")
+
+# A scaffolded decision the toolkit cannot make for you. Same spelling as the
+# reference toolkit's marker so one `fpga-flow-init` template style serves both.
+MARKER = re.compile(r"<<\s*FILL\s+IN")
+
+# Enumerated values. CONTRACT rule 3 forbids hardcoding a list that a DIRECTORY
+# already knows - the hook seams and the step overrides below are read from the
+# filesystem for exactly that reason. These four are different: they are closed
+# sets declared once in CONTRACT §3.3 and §9.5 with no directory behind them, so
+# "a single declared list" (CONTRACT §6) is the correct form. If any of them
+# ever grows a directory, it moves.
+FLOW_MODES = ("project", "direct", "dfx", "protocompiler")   # §3.3 Target
+PLATFORMS = ("bare", "pynq")                                 # §3.3 Target
+FW_HEX_FORMATS = ("byte", "word")                            # §3.3 Firmware
+BIN_STYLES = ("zynq7", "zynqmp")                             # §3.3, §9.5
+
+# CONTRACT §3.5. Assigned `:=` by the flow after the project is read. A project
+# that assigns one of these has its value silently discarded - the reference
+# toolkit's own shipped example does exactly that.
+DERIVED = ("RUN_DIR", "WORK_DIR", "LOG_DIR", "REPORT_DIR", "OUT_DIR",
+           "IN_WORK_DIR", "SYNTH_OUT_DIR")
+
+# Every variable CONTRACT §3 defines, so an unknown --var name can be reported
+# and a near-miss suggested. Not used to reject anything.
+KNOWN_VARS = (
+    "FPGA_FLOW_DIR", "FPGA_DIR", "BLOCK", "BOARD",
+    "TOP", "RTL_FLIST", "XDC_PINS", "PART",
+    "DESIGN_NAME", "PROJECT_ROOT",
+    "BOARD_DIR", "TARGET", "TARGET_DIR", "PART_DIR", "BOARD_PART",
+    "BOARD_REPO_PATHS", "FLOW_MODE", "PLATFORM", "SYS_CLK_FREQ_HZ",
+    "RTL_FLIST_GEN", "RTL_INCDIRS", "RTL_DEFINES", "RTL_DEFINES_INBODY",
+    "RTL_DEFINES_NEVER", "RTL_PARAMS", "TOP_HDL", "EXTRA_SRCS", "SV_FILES",
+    "IP_REPOS", "IP_VENDOR", "IP_CORE_REV", "IP_CACHE_DIR", "PACKAGE_TCL",
+    "BD_TCL", "BD_OVERLAY_TCL", "BD_GLOBAL_SYNTH",
+    "XDC_TIMING", "XDC_DRC", "XDC_EXTRA", "XDC_OPTIONAL", "XDC_POST_ROUTE",
+    "FW_APP", "FW_HEX", "FW_HEX_FORMAT", "FPGA_IMAGE_HEX",
+    "HOOKS_DIR", "OVERRIDES_DIR",
+    "BUILD_DIR", "RUN_TAG", "IN_RUN_TAG", "SYNTH_RUN_TAG",
+    "VIVADO", "VIVADO_VER", "NUM_JOBS", "TCLSH",
+    "EXPECT_WNS_MIN", "EXPECT_WHS_MIN", "EXPECT_LUT_MAX", "EXPECT_FF_MAX",
+    "EXPECT_BRAM_MAX", "EXPECT_DSP_MAX", "EXPECT_UNROUTED_MAX",
+    "EXPECT_BLACKBOX_MAX", "ALLOW_CRITICAL_WARNINGS", "XDC_BASELINE",
+    "MSG_GATE_ALLOWLIST",
+    "FPGAHUB_BOARD", "FPGAHUB_TARGET", "FPGAHUB_TOML", "BIN_STYLE",
+) + DERIVED
+
+
+# ---------------------------------------------------------------------------
+# argument handling
+# ---------------------------------------------------------------------------
+
+class Args(object):
+    def __init__(self):
+        self.quiet = False
+        self.vars = {}
+        self.positional = []
+        self.supplied = False   # did anything at all set a variable?
+
+
+def parse_args(argv):
+    a = Args()
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--quiet":
+            a.quiet = True
+        elif tok == "--var" or tok.startswith("--var="):
+            if tok == "--var":
+                i += 1
+                if i >= len(argv):
+                    return None, "--var needs a NAME=VALUE argument"
+                pair = argv[i]
+            else:
+                pair = tok[len("--var="):]
+            if "=" not in pair:
+                return None, "--var %s: expected NAME=VALUE" % pair
+            name, _, value = pair.partition("=")
+            a.vars[name.strip()] = value
+            a.supplied = True
+        elif tok == "--vars-file" or tok.startswith("--vars-file="):
+            if tok == "--vars-file":
+                i += 1
+                if i >= len(argv):
+                    return None, "--vars-file needs a path"
+                path = argv[i]
+            else:
+                path = tok[len("--vars-file="):]
+            try:
+                with open(path) as fh:
+                    for line in fh:
+                        line = line.rstrip("\n")
+                        if not line.strip() or line.lstrip().startswith("#"):
+                            continue
+                        if "=" not in line:
+                            return None, "%s: line is not NAME=VALUE: %s" % (path, line)
+                        name, _, value = line.partition("=")
+                        a.vars[name.strip()] = value
+                        a.supplied = True
+            except OSError as e:
+                return None, "--vars-file %s: %s" % (path, e)
+        elif tok in ("-h", "--help"):
+            sys.stdout.write(__doc__)
+            return None, ""
+        elif tok.startswith("-"):
+            return None, "unknown option %s" % tok
+        else:
+            a.positional.append(tok)
+        i += 1
+    # Environment fallback, only for names --var did not supply.
+    for key, value in os.environ.items():
+        if not key.startswith(ENV_PREFIX):
+            continue
+        name = key[len(ENV_PREFIX):]
+        if name not in a.vars:
+            a.vars[name] = value
+            a.supplied = True
+    return a, None
+
+
+ARGS = Args()
+
+
+def get(name, default=""):
+    """A single resolved value. Whitespace-only is 'not configured'."""
+    v = ARGS.vars.get(name, "")
+    return v if v.strip() else default
+
+
+def lst(name):
+    """A list-valued variable. make joins lists with spaces; so do we."""
+    return get(name).split()
+
+
+def configured(name):
+    return bool(get(name))
+
+
+# ---------------------------------------------------------------------------
+# the report
+# ---------------------------------------------------------------------------
+
+class Report(object):
+    """ok / MISS / WARN / -- per variable, then a WARNINGS block, then either
+    the next command or an ordered list of what to fix.
+
+    The four statuses are not decoration. `--` means "not configured, and that
+    is legal"; MISS means "the flow cannot run"; WARN means "it will run, and
+    you should still read this". Collapsing `--` into MISS is what turns a
+    report a newcomer can act on into a wall of red they learn to ignore."""
+
+    def __init__(self):
+        self.errors = []
+        self.warnings = []
+        self.lines = []
+
+    def ok(self, label, detail=""):
+        self.lines.append(("  ok  ", label, detail))
+
+    def info(self, label, detail=""):
+        self.lines.append(("  --  ", label, detail))
+
+    def bad(self, label, detail, why, fix):
+        self.lines.append((" MISS ", label, detail))
+        self.errors.append((label, detail, why, fix))
+
+    def warn(self, label, detail, why):
+        self.lines.append((" WARN ", label, detail))
+        self.warnings.append((label, detail, why))
+
+    def emit(self):
+        if not ARGS.quiet or self.errors or self.warnings:
+            print("== FPGA flow contract: %s (board %s, target %s) ==" %
+                  (get("BLOCK", "?"), get("BOARD", "?"), get("TARGET", get("BOARD", "?"))))
+            for status, label, detail in self.lines:
+                print("%s %-24s %s" % (status, label, detail))
+
+        if self.warnings:
+            print("")
+            print("WARNINGS - the flow will run, but read these:")
+            for label, detail, why in self.warnings:
+                print("  * %s%s" % (label, ("  (%s)" % detail) if detail else ""))
+                for line in why.strip().splitlines():
+                    print("    %s" % line.strip())
+
+        if self.errors:
+            print("")
+            print("MISSING - the flow cannot run. Fix in this order:")
+            for n, (label, detail, why, fix) in enumerate(self.errors, 1):
+                print("")
+                print("  %d. %s" % (n, label))
+                print("     looked for : %s" % (detail or "(nothing configured)"))
+                # A parenthesised "fix" is an instruction, not a variable name -
+                # appending "in fpga/design.mk" to it produces nonsense.
+                if fix.startswith("("):
+                    print("     fix it by  : %s" % fix.strip("()"))
+                else:
+                    print("     set it with: %s   in fpga/design.mk" % fix)
+                for line in why.strip().splitlines():
+                    print("     %s" % line.strip())
+            print("")
+            print("%d required input(s) missing. Contract INCOMPLETE." % len(self.errors))
+            return 1
+
+        if not ARGS.quiet:
+            print("")
+            print("Contract complete.")
+            print("Next: make doctor      (can this host run the tools? no licence spent)")
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# predicates
+#
+# The split matters and is the reason this file is not forty `os.path.exists`
+# calls. `need` is "the flow cannot start without this". `optional` is "you may
+# legitimately not have one" - BUT a configured-but-missing optional is an
+# ERROR, not a shrug: the project named a path, so the project believes there is
+# a file there. Downgrading that to a warning is how a build silently runs
+# without the timing constraints someone spent a week writing.
+# ---------------------------------------------------------------------------
+
+def need(rep, var, path, why):
+    if not path:
+        rep.bad(var, "", why, var)
+        return False
+    if not os.path.exists(path):
+        rep.bad(var, path, why, var)
+        return False
+    if os.path.isfile(path):
+        if os.path.getsize(path) == 0:
+            rep.bad(var, path + "   (ZERO BYTES)",
+                    "The file exists and is empty. That is the shape a tool leaves\n"
+                    "when it opened its output and then died, and it satisfies every\n"
+                    "`test -e` in the world.\n" + why, var)
+            return False
+        if not os.access(path, os.R_OK):
+            rep.bad(var, path + "   (NOT READABLE)",
+                    "The path exists but this user cannot read it - a permissions or\n"
+                    "mount problem, not a missing file.\n" + why, var)
+            return False
+    rep.ok(var, path)
+    return True
+
+
+def optional(rep, var, path, absent_means):
+    if not path:
+        rep.info(var, "(not configured - %s)" % absent_means)
+        return False
+    if not os.path.exists(path):
+        rep.bad(var, path,
+                "It is named in design.mk, so it is expected to exist. Either\n"
+                "create it or unset the variable - a configured-but-missing input\n"
+                "is never what you meant.", var)
+        return False
+    if os.path.isfile(path) and os.path.getsize(path) == 0:
+        rep.warn(var, path + "   (ZERO BYTES)",
+                 "Present but empty. Whatever this was supposed to contribute to\n"
+                 "the build, it contributes nothing, and no tool will say so.")
+        return True
+    rep.ok(var, path)
+    return True
+
+
+def optional_list(rep, var, paths, absent_means, ordered=False):
+    """A list-valued optional. EVERY entry must exist - the list is explicit."""
+    if not paths:
+        rep.info(var, "(not configured - %s)" % absent_means)
+        return
+    missing = [p for p in paths if not os.path.exists(p)]
+    if missing:
+        rep.bad(var, " ".join(missing),
+                "%s is an EXPLICIT%s list, so every entry must exist. The entries\n"
+                "above do not. A list quietly short by one file is the hardest\n"
+                "kind of build to debug, because everything else worked." %
+                (var, " ORDERED" if ordered else ""), var)
+        return
+    rep.ok(var, "%d entr%s%s" % (len(paths), "y" if len(paths) == 1 else "ies",
+                                 ", order preserved" if ordered else ""))
+
+
+# ---------------------------------------------------------------------------
+# cheap file inspection
+# ---------------------------------------------------------------------------
+
+def read_text(path, cap=262144):
+    """Read a bounded amount of a file, or None. Never raises."""
+    try:
+        with open(path, "rb") as fh:
+            blob = fh.read(cap)
+    except OSError:
+        return None
+    if b"\0" in blob[:8192]:
+        return None          # binary; nothing here is meant for it
+    return blob.decode("utf-8", "replace")
+
+
+def meaningful_lines(text, comment_chars="#/"):
+    """Lines that are not blank and not a comment. A file of pure comments is
+    non-empty to `test -s` and empty to every tool that reads it."""
+    out = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("#") and "#" in comment_chars:
+            continue
+        if s.startswith("//") and "/" in comment_chars:
+            continue
+        out.append(s)
+    return out
+
+
+def flist_texts(path, seen=None, depth=0):
+    """The flist's own text plus that of any `-f`/`-F` include, bounded.
+
+    Only the LIST files are read, never the RTL: this is a sub-second check and
+    a real design here is 13,524 source files."""
+    if seen is None:
+        seen = []
+    if depth > 4 or len(seen) > 40 or not path or path in seen:
+        return []
+    text = read_text(path)
+    if text is None:
+        return []
+    seen.append(path)
+    out = [(path, text)]
+    base = os.path.dirname(path)
+    for line in text.splitlines():
+        s = line.strip()
+        m = re.match(r"^-[fF]\s+(\S+)", s)
+        if not m:
+            continue
+        inc = expand(m.group(1))
+        if not os.path.isabs(inc):
+            inc = os.path.join(base, inc)
+        out.extend(flist_texts(inc, seen, depth + 1))
+    return out
+
+
+def expand(s):
+    """Best-effort ${VAR} / $(VAR) expansion from the passed contract variables
+    then the environment. An unresolvable reference is left alone rather than
+    replaced with "" - an empty path silently becomes the current directory."""
+    def sub(m):
+        name = m.group(1) or m.group(2)
+        if name in ARGS.vars and ARGS.vars[name].strip():
+            return ARGS.vars[name]
+        return os.environ.get(name) or m.group(0)
+    return re.sub(r"\$\{(\w+)\}|\$\((\w+)\)", sub, s)
+
+
+# ---------------------------------------------------------------------------
+# the content scan
+#
+# The single most important check in this file, and the one the reference
+# toolkit did not have. An existence check cannot tell a finished project from
+# an untouched scaffold, because a scaffolded file EXISTS. Only opening it can.
+# ---------------------------------------------------------------------------
+
+def placeholders(rep, fpga_dir, build_dir):
+    if not fpga_dir or not os.path.isdir(fpga_dir):
+        return
+    build_real = os.path.realpath(build_dir) if build_dir else None
+    hits = {}
+    scanned = skipped = 0
+    for root, dirs, files in os.walk(fpga_dir):
+        dirs[:] = [d for d in dirs
+                   if d not in SKIP_DIRS
+                   and os.path.realpath(os.path.join(root, d)) != build_real]
+        for fn in files:
+            path = os.path.join(root, fn)
+            if os.path.islink(path):
+                continue
+            try:
+                if os.path.getsize(path) > 2 * 1024 * 1024:
+                    skipped += 1
+                    continue
+            except OSError:
+                continue
+            text = read_text(path)
+            if text is None:
+                continue
+            scanned += 1
+            lines = [i for i, line in enumerate(text.splitlines(), 1) if MARKER.search(line)]
+            if lines:
+                hits[os.path.relpath(path, fpga_dir)] = lines
+
+    if not hits:
+        if not ARGS.quiet:
+            rep.ok("placeholders", "none in %d file(s) - every scaffolded decision made" % scanned)
+        return
+
+    total = sum(len(v) for v in hits.values())
+    # One file per line with line numbers: this list is meant to be worked
+    # through, and a single wrapped line cannot be.
+    where = "\n".join(
+        "%-38s line %s" % (f, ", ".join(str(n) for n in v[:6]) +
+                           (" (+%d more)" % (len(v) - 6) if len(v) > 6 else ""))
+        for f, v in sorted(hits.items()))
+    rep.bad("UNFILLED PLACEHOLDERS",
+            "%d marker(s) in %d file(s)" % (total, len(hits)),
+            "Every one of these is a design decision the toolkit cannot make for\n"
+            "you - a clock period, a pin, a device, a firmware path. They are\n"
+            "scaffolding, not defaults.\n"
+            "A file containing one is still a file that EXISTS, which is why the\n"
+            "path checks above are green. Vivado is not so forgiving: a literal\n"
+            "<<FILL IN>> reaches it as a Tcl syntax error, or - far worse - as a\n"
+            "filename it looks for, does not find, and reports at the level of a\n"
+            "constraint that simply matched nothing.\n"
+            "\n" + where,
+            "(editing these files - no design.mk variable moves them)")
+
+
+# ---------------------------------------------------------------------------
+# XDC coverage
+#
+# DEVIATION from the existing flow, deliberate and stated in CONTRACT §3.3. That
+# flow discovers constraints with the glob `*_<name>*.xdc`, so a file named
+# anything else is invisible - and CONTRACT §9.3 records that Vivado drops a
+# constraint that matches nothing without an error, so the two failure modes
+# are indistinguishable from the log. Here every .xdc is named by a variable or
+# it is an ERROR, and the error says which variables could claim it.
+# ---------------------------------------------------------------------------
+
+XDC_VARS = ("XDC_PINS", "XDC_TIMING", "XDC_DRC", "XDC_EXTRA",
+            "XDC_OPTIONAL", "XDC_POST_ROUTE", "XDC_BASELINE")
+
+
+def claimed_xdc():
+    """Every .xdc path any variable names, as realpaths."""
+    claimed = {}
+    for var in XDC_VARS:
+        for item in lst(var):
+            path = item
+            if var == "XDC_OPTIONAL":
+                # "COND:path" - included iff $(COND) is 1.
+                if ":" not in item:
+                    continue
+                _, _, path = item.partition(":")
+            claimed.setdefault(os.path.realpath(expand(path)), []).append(var)
+    return claimed
+
+
+def xdc_coverage(rep, target_dir):
+    if not target_dir or not os.path.isdir(target_dir):
+        rep.info("XDC coverage", "(no TARGET_DIR - nothing to cross-check)")
+        return
+    claimed = claimed_xdc()
+    orphans = []
+    for root, dirs, files in os.walk(target_dir):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fn in sorted(files):
+            if not fn.lower().endswith(".xdc"):
+                continue
+            path = os.path.join(root, fn)
+            if os.path.realpath(path) not in claimed:
+                orphans.append(os.path.relpath(path, target_dir))
+    if not orphans:
+        rep.ok("XDC coverage", "%d file(s) in TARGET_DIR, all named by a variable"
+                               % len(claimed))
+        return
+    listing = "\n".join("  %s" % o for o in orphans)
+    rep.bad("ORPHAN XDC IN TARGET_DIR",
+            "%d file(s) no variable names" % len(orphans),
+            "These .xdc files sit in TARGET_DIR and NOTHING READS THEM:\n"
+            + listing + "\n"
+            "\n"
+            "This is an error and not a warning on purpose. The flow this replaces\n"
+            "discovered constraints by filename glob, so a file whose name did not\n"
+            "match was invisible - and Vivado does not complain about constraints\n"
+            "it was never given, nor about constraints that match nothing. An\n"
+            "unread pin file and a correctly read one produce the same log and\n"
+            "different silicon.\n"
+            "Name each file with the variable that describes WHEN it is read:\n"
+            "  XDC_PINS       pins/placement - read in synthesis AND implementation\n"
+            "  XDC_TIMING     implementation only\n"
+            "  XDC_DRC        implementation only\n"
+            "  XDC_EXTRA      a LIST, order preserved\n"
+            "  XDC_OPTIONAL   a LIST of COND:path - read iff $(COND) is 1\n"
+            "  XDC_POST_ROUTE `source`d after route_design, NOT read_xdc'd\n"
+            "  XDC_BASELINE   a ratcheted baseline, not a constraint\n"
+            "If a file genuinely should not be read, move it out of TARGET_DIR -\n"
+            "an unreferenced constraint file beside referenced ones is a trap for\n"
+            "the next person, not documentation.",
+            "(one of the XDC_* variables above)")
+
+
+# ---------------------------------------------------------------------------
+# extension seams
+# ---------------------------------------------------------------------------
+
+def read_seams(flow_dir):
+    """THE list of hook seams, from the one file that holds it.
+
+    Never hardcoded here. CONTRACT §6.1: flow/common/seams.txt is the only copy,
+    and the flow engine, this script and `make help` all read it. A second copy
+    in this file would be a second thing to forget to update."""
+    path = os.path.join(flow_dir, "flow", "common", "seams.txt") if flow_dir else ""
+    text = read_text(path) if path else None
+    if text is None:
+        return None, path
+    return [s for s in meaningful_lines(text, "#")], path
+
+
+def read_steps(flow_dir):
+    """The step files a project may override, from `ls flow/steps/*.tcl`.
+
+    Derived at run time, NEVER hardcoded. This rule exists because of a measured
+    defect: the reference toolkit hardcodes a five-name whitelist against a
+    directory holding seven .tcl files, so two real override points are
+    undocumented AND warn as unrecognised when someone finds them anyway."""
+    d = os.path.join(flow_dir, "flow", "steps") if flow_dir else ""
+    if not d or not os.path.isdir(d):
+        return None, d
+    return sorted(f[:-4] for f in os.listdir(d) if f.endswith(".tcl")), d
+
+
+def check_hooks(rep, hooks_dir, seams, seams_path):
+    if not hooks_dir or not os.path.isdir(hooks_dir):
+        rep.info("hooks", "(no hooks directory - optional)")
+        return
+    if seams is None:
+        rep.bad("HOOKS_DIR", hooks_dir,
+                "Cannot be checked: the seam list was not readable at\n"
+                "  %s\n"
+                "A gate never invents a verdict from missing data, so this is a\n"
+                "failure and not a pass. Most likely the toolkit checkout is\n"
+                "incomplete." % seams_path,
+                "(git submodule update --init --recursive, in the toolkit checkout)")
+        return
+
+    good, wrong_ext, unknown = [], [], []
+    for fn in sorted(os.listdir(hooks_dir)):
+        full = os.path.join(hooks_dir, fn)
+        if os.path.isdir(full):
+            unknown.append(fn + "/")
+            continue
+        stem, ext = os.path.splitext(fn)
+        if stem in seams and ext == ".tcl":
+            good.append(stem)
+        elif stem in seams:
+            wrong_ext.append(fn)
+        else:
+            unknown.append(fn)
+
+    if good:
+        rep.ok("hooks", ", ".join(good))
+    else:
+        rep.info("hooks", "(none)")
+
+    if wrong_ext:
+        rep.warn("hook file with the wrong extension", ", ".join(wrong_ext),
+                 "The NAME is a valid seam but the extension is not `.tcl`, and the\n"
+                 "engine sources $(HOOKS_DIR)/<seam>.tcl exactly. These files WILL\n"
+                 "NEVER RUN. This is the near-miss worth calling out separately:\n"
+                 "the author clearly knew the seam, so the hook is real work that\n"
+                 "is silently not happening.")
+
+    if unknown:
+        detail = []
+        for fn in unknown:
+            stem = os.path.splitext(fn.rstrip("/"))[0]
+            near = difflib.get_close_matches(stem, seams, n=1, cutoff=0.7)
+            detail.append("%s%s" % (fn, ("  (did you mean %s.tcl?)" % near[0]) if near else ""))
+        rep.warn("unrecognised file(s) in hooks/", "",
+                 "A file in hooks/ is sourced ONLY if it is exactly <seam>.tcl.\n"
+                 "These are not, so they WILL NEVER RUN and nothing at run time\n"
+                 "will say so:\n"
+                 + "\n".join("  %s" % d for d in detail) + "\n"
+                 "The valid seams, read from %s:\n" % seams_path
+                 + "\n".join("  %s" % s for s in seams))
+
+
+def check_overrides(rep, ovr_dir, steps, steps_dir):
+    if not ovr_dir or not os.path.isdir(ovr_dir):
+        rep.info("overrides", "(none - optional)")
+        return
+    files = sorted(f for f in os.listdir(ovr_dir) if os.path.isfile(os.path.join(ovr_dir, f)))
+    if not files:
+        rep.info("overrides", "(directory present, empty - optional)")
+        return
+
+    if steps is None:
+        rep.warn("overrides present, step list unreadable", ", ".join(files),
+                 "Cannot say whether these override anything: %s does not exist,\n"
+                 "so `ls flow/steps/*.tcl` - the one authority on which step names\n"
+                 "are real - has nothing to say. Reported, not silently passed."
+                 % (steps_dir or "flow/steps"))
+        return
+
+    if not steps:
+        rep.warn("overrides present, engine has no steps", ", ".join(files),
+                 "%s exists but holds no .tcl files, so there is no step for any\n"
+                 "of these to replace and NONE OF THEM WILL BE SOURCED. This is\n"
+                 "measured from the directory, not from a list in this script:\n"
+                 "if the engine's steps land later, re-run and the answer changes."
+                 % steps_dir)
+        return
+
+    active = [os.path.splitext(f)[0] for f in files
+              if f.endswith(".tcl") and os.path.splitext(f)[0] in steps]
+    unknown = [f for f in files
+               if not (f.endswith(".tcl") and os.path.splitext(f)[0] in steps)]
+
+    if active:
+        rep.warn("step overrides ACTIVE", ", ".join(active),
+                 "These replace $(FPGA_FLOW_DIR)/flow/steps/<step>.tcl WHOLESALE -\n"
+                 "the toolkit's own copies are not sourced at all. There is no\n"
+                 "merging and no partial override, because these files set tool\n"
+                 "properties in an order that matters and a half-overridden one is\n"
+                 "a design nobody can reason about.\n"
+                 "A warning is not a complaint: overrides are a supported seam. It\n"
+                 "is here because six months from now the fastest explanation for\n"
+                 "'why does this run differ' is knowing one was active. Every stage\n"
+                 "manifest records which step files a run used.")
+    if unknown:
+        detail = []
+        for fn in unknown:
+            stem = os.path.splitext(fn)[0]
+            near = difflib.get_close_matches(stem, steps, n=1, cutoff=0.7)
+            detail.append("%s%s" % (fn, ("  (did you mean %s.tcl?)" % near[0]) if near else ""))
+        rep.warn("unrecognised file(s) in overrides/", "",
+                 "A file in overrides/ replaces a step ONLY if it is exactly\n"
+                 "<step>.tcl. These are not, so they WILL NEVER BE SOURCED:\n"
+                 + "\n".join("  %s" % d for d in detail) + "\n"
+                 "Overridable steps, read from %s at run time:\n" % steps_dir
+                 + "\n".join("  %s" % s for s in steps))
+
+
+# ---------------------------------------------------------------------------
+# derived variables (CONTRACT §3.5)
+# ---------------------------------------------------------------------------
+
+def check_derived(rep, fpga_dir):
+    """Warn if the project assigned a DERIVED variable.
+
+    Two sources, because neither alone is sufficient. `--var DERIVED_ASSIGNED=`
+    is the make-side signal and is authoritative if checks.mk sends it - only
+    make can tell an assignment from a computation. Absent that, a text scan of
+    the project's own makefiles finds exactly the shape that matters: the
+    reference toolkit's shipped example assigns one of these and the value is
+    silently discarded, which is a very quiet way to lose a run directory."""
+    assigned = [v for v in lst("DERIVED_ASSIGNED") if v in DERIVED]
+    where = {v: "reported by make" for v in assigned}
+
+    if fpga_dir and os.path.isdir(fpga_dir):
+        cands = ["Makefile", "design.mk"] + sorted(
+            f for f in os.listdir(fpga_dir) if f.endswith(".mk"))
+        pat = re.compile(r"^\s*(?:override\s+|export\s+)*(%s)\s*[:+?!]?=" %
+                         "|".join(DERIVED))
+        for fn in dict.fromkeys(cands):
+            path = os.path.join(fpga_dir, fn)
+            text = read_text(path)
+            if text is None:
+                continue
+            for n, line in enumerate(text.splitlines(), 1):
+                m = pat.match(line)
+                if m and m.group(1) not in where:
+                    where[m.group(1)] = "%s:%d" % (fn, n)
+                    assigned.append(m.group(1))
+
+    if not assigned:
+        rep.ok("derived variables", "not assigned by the project - correct")
+        return
+    rep.warn("project assigns DERIVED variable(s)",
+             ", ".join(sorted(set(assigned))),
+             "These are computed with `:=` AFTER the project is read, so a project\n"
+             "assignment is OVERWRITTEN AND SILENTLY DISCARDED. Nothing errors;\n"
+             "the value simply has no effect, which reads as the flow ignoring you.\n"
+             + "\n".join("  %-14s %s" % (v, where.get(v, "?")) for v in sorted(set(assigned)))
+             + "\n"
+             "To move a run directory, set BUILD_DIR and RUN_TAG - everything else\n"
+             "is composed from those two by construction, so that a stage cannot\n"
+             "address another run's work directory even by accident.")
+
+
+# ---------------------------------------------------------------------------
+# standalone entry
+# ---------------------------------------------------------------------------
+
+def standalone():
+    """No variables were supplied, so find the project and re-invoke make - the
+    answer then comes from the same resolution make itself would do, rather than
+    from this script guessing at a `?=` chain it cannot see."""
+    if os.environ.get("FPGA_FLOW_CHECK_REENTRY"):
+        print("fpga-flow-check: re-entered from make with no variables supplied.")
+        print("")
+        print("  `make check` called this script, and this script found no --var and")
+        print("  no FPGACHECK_* - so it tried to call `make check` again. Refusing")
+        print("  rather than looping.")
+        print("  The caller (mk/checks.mk) must pass the resolved contract as")
+        print("  `--var NAME=VALUE`; see the INTERFACE block at the top of this file.")
+        return 2
+    d = os.path.abspath(ARGS.positional[0]) if ARGS.positional else os.getcwd()
+    for cand in (d, os.path.join(d, "fpga")):
+        if os.path.exists(os.path.join(cand, "Makefile")):
+            cmd = ["make", "--no-print-directory", "-C", cand, "check"]
+            if ARGS.quiet:
+                cmd.append("CHECK_ARGS=--quiet")
+            # A re-entry guard, not paranoia: if checks.mk ever invokes this
+            # script without passing any --var, `make check` would call this,
+            # which would call `make check`, forever, and the symptom would be
+            # a hung terminal rather than an error.
+            env = dict(os.environ)
+            env["FPGA_FLOW_CHECK_REENTRY"] = "1"
+            try:
+                return subprocess.call(cmd, env=env)
+            except OSError as e:
+                print("fpga-flow-check: could not run make: %s" % e)
+                return 2
+    print("fpga-flow-check: no Makefile in %s or %s/fpga" % (d, d))
+    print("")
+    print("  This script validates a project that has already been scaffolded,")
+    print("  and it is normally run as `make check` from that project.")
+    print("")
+    print("  If the project IS scaffolded, run this from its fpga/ directory or")
+    print("  pass the path:   fpga-flow-check path/to/project/fpga")
+    print("")
+    print("  Called from make? Then make passed no --var and no FPGACHECK_* was")
+    print("  set - see the INTERFACE block at the top of this file.")
+    return 2
+
+
+# ---------------------------------------------------------------------------
+# the checks
+# ---------------------------------------------------------------------------
+
+def enum(rep, var, allowed, default_note):
+    """A closed set from CONTRACT §3.3. An unknown value is an error with a
+    nearest match - never a silent default, which is how a project quietly gets
+    a flow mode nobody chose."""
+    v = get(var)
+    if not v:
+        rep.info(var, "(not set - %s)" % default_note)
+        return ""
+    if v in allowed:
+        rep.ok(var, v)
+        return v
+    near = difflib.get_close_matches(v, allowed, n=1, cutoff=0.5)
+    rep.bad(var, v,
+            "Not one of the values this variable accepts: %s\n%s"
+            % (", ".join(allowed),
+               ("Nearest match: %s" % near[0]) if near else
+               "No value is close enough to guess what you meant."),
+            var)
+    return v
+
+
+def run_checks():
+    rep = Report()
+
+    flow_dir = get("FPGA_FLOW_DIR")
+    fpga_dir = get("FPGA_DIR", os.getcwd())
+    build_dir = get("BUILD_DIR", os.path.join(fpga_dir, "build"))
+
+    # --- the engine itself ---------------------------------------------------
+    seams, seams_path = read_seams(flow_dir)
+    if seams is None:
+        rep.bad("FPGA_FLOW_DIR", flow_dir,
+                "This should be the FPGA toolkit checkout. Without\n"
+                "flow/common/seams.txt it is not one - most likely a submodule\n"
+                "that was never initialised:\n"
+                "    git submodule update --init --recursive",
+                "FPGA_FLOW_DIR")
+    else:
+        rep.ok("FPGA_FLOW_DIR", "%s   (%d seams)" % (flow_dir, len(seams)))
+
+    # CONTRACT §2: the example sits at exactly the paths every `?=` defaults to,
+    # so building from there succeeds and produces a different design silently.
+    if flow_dir and fpga_dir:
+        ex = os.path.realpath(os.path.join(flow_dir, "examples"))
+        real = os.path.realpath(fpga_dir)
+        if real == ex or real.startswith(ex + os.sep):
+            rep.bad("FPGA_DIR", fpga_dir,
+                    "This project directory is INSIDE the toolkit's own examples/.\n"
+                    "The example sits at exactly the paths every `?=` defaults to,\n"
+                    "so a build from here succeeds and produces a different design\n"
+                    "without a word. Copy it somewhere of your own first.",
+                    "(copy the example out of the toolkit, then build there)")
+    if os.path.isdir(fpga_dir):
+        rep.ok("FPGA_DIR", fpga_dir)
+    else:
+        rep.bad("FPGA_DIR", fpga_dir,
+                "The project's fpga/ directory. Everything else is relative to it.",
+                "FPGA_DIR")
+
+    # --- identity ------------------------------------------------------------
+    if get("BLOCK"):
+        rep.ok("BLOCK", get("BLOCK"))
+    else:
+        rep.bad("BLOCK", "",
+                "The design's short name and the stem of every artefact this flow\n"
+                "writes. Without it the run directory holds files called `.bit`.",
+                "BLOCK")
+    if get("BOARD"):
+        rep.ok("BOARD", get("BOARD"))
+    else:
+        rep.bad("BOARD", "",
+                "Selects the board pack that supplies the part, the platform, the\n"
+                "system clock and the .bin style.", "BOARD")
+
+    # --- the four §3.2 required inputs --------------------------------------
+    top = get("TOP")
+    if top:
+        rep.ok("TOP", top)
+    else:
+        rep.bad("TOP", "",
+                "The BOARD-LEVEL top module - the one that instantiates your SoC\n"
+                "and connects it to this board's pins. NOT the SoC top. Getting\n"
+                "this wrong is quiet: Vivado happily synthesises the wrong module\n"
+                "and every pin constraint then matches nothing, which it does not\n"
+                "report as an error.", "TOP")
+
+    flist = get("RTL_FLIST")
+    if need(rep, "RTL_FLIST", flist,
+            "The single input that decides what design gets built. One path per\n"
+            "line; -f includes another list; ${VAR} and $(VAR) are expanded."):
+        text = read_text(flist)
+        entries = [l for l in meaningful_lines(text or "", "#/")
+                   if not l.startswith("-")]
+        if not entries:
+            rep.bad("RTL_FLIST", flist + "   (NO ENTRIES)",
+                    "The file is not empty but every line is a comment, a blank or\n"
+                    "a switch, so it names NO SOURCE FILES. `test -s` passes on it\n"
+                    "and synthesis reads an empty design.", "RTL_FLIST")
+        elif not ARGS.quiet:
+            rep.ok("  flist entries", "%d source line(s)" % len(entries))
+
+    xdc_pins = get("XDC_PINS")
+    if need(rep, "XDC_PINS", xdc_pins,
+            "Pin and placement constraints, read in synthesis AND implementation.\n"
+            "Without them the design is placed on pins the board does not have."):
+        text = read_text(xdc_pins) or ""
+        if not meaningful_lines(text, "#"):
+            rep.warn("XDC_PINS is all comments", xdc_pins,
+                     "The file is non-empty but contains no constraint. Vivado reads\n"
+                     "it, applies nothing, and does not consider that an error - the\n"
+                     "same log a correctly constrained run produces.")
+
+    part = get("PART")
+    part_dir = get("PART_DIR")
+    if not part:
+        rep.bad("PART", "",
+                "The device. Normally supplied by the board pack; a project\n"
+                "override wins. Nothing downstream can be checked without it.",
+                "PART")
+    elif part_dir and os.path.exists(os.path.join(part_dir, "part.tcl")):
+        rep.ok("PART", "%s   (%s)" % (part, os.path.join(part_dir, "part.tcl")))
+    else:
+        avail = []
+        pack_root = os.path.join(flow_dir, "part") if flow_dir else ""
+        if pack_root and os.path.isdir(pack_root):
+            avail = sorted(d for d in os.listdir(pack_root)
+                           if os.path.isfile(os.path.join(pack_root, d, "part.tcl")))
+        rep.bad("PART_DIR", os.path.join(part_dir or "?", "part.tcl"),
+                "A part pack states every fact that varies by device: family,\n"
+                "package, speed grade, the global buffer primitive, whether an\n"
+                "IDELAY exists, how many SLRs. Part packs ship in the TOOLKIT; a\n"
+                "board pack ships in the project.\n"
+                "Packs available in this toolkit: %s" % (", ".join(avail) or "(none)"),
+                "PART   (or add a pack under the toolkit's part/)")
+
+    board_dir = get("BOARD_DIR")
+    need(rep, "BOARD_DIR/board.tcl",
+         os.path.join(board_dir, "board.tcl") if board_dir else "",
+         "The board pack - a fact about a CIRCUIT BOARD, so it lives in the\n"
+         "project, not in the toolkit. Required keys: board_name, part,\n"
+         "platform, sys_clk_freq_hz, bin_style.")
+
+    target_dir = get("TARGET_DIR")
+    optional(rep, "TARGET_DIR", target_dir, "no separate target collateral")
+
+    # --- modes ---------------------------------------------------------------
+    enum(rep, "FLOW_MODE", FLOW_MODES, "defaults to project")
+    enum(rep, "PLATFORM", PLATFORMS, "defaults to bare")
+
+    # --- RTL -----------------------------------------------------------------
+    optional(rep, "TOP_HDL", get("TOP_HDL"),
+             "no wrapper read outside the flist")
+    top_hdl = get("TOP_HDL")
+    if top and top_hdl and os.path.isfile(top_hdl):
+        text = read_text(top_hdl) or ""
+        if not re.search(r"\bmodule\s+%s\b" % re.escape(top), text):
+            rep.warn("TOP not defined in TOP_HDL", "%s / module %s" % (top_hdl, top),
+                     "TOP_HDL is read AFTER the flist and is where the board-level\n"
+                     "top normally lives, but it does not declare a module called\n"
+                     "%s. Either TOP names the SoC top by mistake - the quiet\n"
+                     "failure this variable exists to prevent - or the board top is\n"
+                     "somewhere else and this is fine." % top)
+
+    optional_list(rep, "RTL_INCDIRS", lst("RTL_INCDIRS"), "no include search path")
+    optional_list(rep, "EXTRA_SRCS", lst("EXTRA_SRCS"), "no sources outside the flist")
+    optional_list(rep, "SV_FILES", lst("SV_FILES"), "no per-file SystemVerilog forcing")
+
+    defines = lst("RTL_DEFINES")
+    inbody = lst("RTL_DEFINES_INBODY")
+    if defines:
+        rep.ok("RTL_DEFINES", " ".join(defines))
+    else:
+        rep.info("RTL_DEFINES", "(none)")
+    if inbody:
+        rep.ok("RTL_DEFINES_INBODY", " ".join(inbody))
+    else:
+        rep.info("RTL_DEFINES_INBODY", "(none)")
+
+    # RTL_DEFINES_NEVER: asserted ABSENT, and cheaply cross-checked.
+    never = lst("RTL_DEFINES_NEVER")
+    if not never:
+        rep.info("RTL_DEFINES_NEVER", "(none asserted absent)")
+    else:
+        rep.ok("RTL_DEFINES_NEVER", "%s   ASSERTED ABSENT" % " ".join(never))
+        clash = sorted(set(n.split("=")[0] for n in never) &
+                       set(d.split("=")[0] for d in defines + inbody))
+        if clash:
+            rep.bad("RTL_DEFINES_NEVER contradicted", ", ".join(clash),
+                    "These are asserted ABSENT by RTL_DEFINES_NEVER and are also set\n"
+                    "by RTL_DEFINES or RTL_DEFINES_INBODY. One of the two statements\n"
+                    "is wrong and this check cannot tell which, so it refuses to\n"
+                    "pick. A define that is both required-absent and supplied is the\n"
+                    "shape of a copy-pasted manifest, not of an intention.",
+                    "(RTL_DEFINES_NEVER, or the RTL_DEFINES* that sets it)")
+        # Cheap flist scan. Reading the LIST files is bounded; reading the RTL
+        # is not - this tree holds 13,524 source files.
+        found = []
+        for path, text in flist_texts(flist):
+            for n in never:
+                bare = n.split("=")[0]
+                if re.search(r"\+define\+%s\b|-define\s+%s\b"
+                             % (re.escape(bare), re.escape(bare)), text):
+                    found.append("%s in %s" % (bare, os.path.basename(path)))
+        if found:
+            rep.bad("RTL_DEFINES_NEVER present in flist", "; ".join(sorted(set(found))),
+                    "The flist itself passes a define this project asserts must be\n"
+                    "absent. Note what this scan does and does NOT cover: it reads\n"
+                    "the flist and its -f includes only, never the RTL, so a define\n"
+                    "reaching the tools another way is NOT measured here.",
+                    "(remove the +define+ from the flist, or drop it from RTL_DEFINES_NEVER)")
+        elif not ARGS.quiet:
+            rep.ok("  absence cross-checked", "flist and -f includes only, not the RTL")
+
+    params = lst("RTL_PARAMS")
+    if params:
+        bad_form = [p for p in params if "=" not in p]
+        if bad_form:
+            rep.bad("RTL_PARAMS", " ".join(bad_form),
+                    "Entries must be NAME=VALUE. Parameters are the PRIMARY\n"
+                    "configuration mechanism here because they survive IP packaging\n"
+                    "as CONFIG.*; `ipx::package_project` drops fileset defines by\n"
+                    "three separate routes, which once left an opt-in false in every\n"
+                    "FPGA build - proven by a byte-identical bitstream.",
+                    "RTL_PARAMS")
+        else:
+            rep.ok("RTL_PARAMS", " ".join(params))
+    else:
+        rep.info("RTL_PARAMS", "(none - all module defaults)")
+
+    if get("RTL_FLIST_GEN"):
+        # A target in the PROJECT, not a file - it is run before `flist`, so it
+        # is checked by make refusing to build it, not by this script stat()ing
+        # something that was never a path.
+        rep.ok("RTL_FLIST_GEN", "%s   (a make target in the PROJECT)" % get("RTL_FLIST_GEN"))
+    else:
+        rep.info("RTL_FLIST_GEN", "(not configured - the flist is not regenerated)")
+
+    # --- IP / BD -------------------------------------------------------------
+    optional_list(rep, "IP_REPOS", lst("IP_REPOS"), "no external IP repositories")
+    optional(rep, "PACKAGE_TCL", get("PACKAGE_TCL"), "no IP packaging step")
+    optional(rep, "BD_TCL", get("BD_TCL"), "no block design")
+    optional_list(rep, "BD_OVERLAY_TCL", lst("BD_OVERLAY_TCL"),
+                  "no overlays over the base BD", ordered=True)
+    if get("BD_OVERLAY_TCL") and not get("BD_TCL"):
+        rep.bad("BD_OVERLAY_TCL without BD_TCL", get("BD_OVERLAY_TCL"),
+                "Overlays are applied IN ORDER over BD_TCL. With no BD_TCL there is\n"
+                "nothing to apply them to and they will not run.", "BD_TCL")
+
+    # --- constraints ---------------------------------------------------------
+    optional(rep, "XDC_TIMING", get("XDC_TIMING"), "implementation-only timing: none")
+    optional(rep, "XDC_DRC", get("XDC_DRC"), "no DRC constraints")
+    optional_list(rep, "XDC_EXTRA", lst("XDC_EXTRA"), "no extra constraints", ordered=True)
+    optional(rep, "XDC_POST_ROUTE", get("XDC_POST_ROUTE"),
+             "nothing sourced after route_design")
+
+    opt_xdc = lst("XDC_OPTIONAL")
+    if not opt_xdc:
+        rep.info("XDC_OPTIONAL", "(none)")
+    else:
+        malformed = [e for e in opt_xdc if ":" not in e]
+        if malformed:
+            rep.bad("XDC_OPTIONAL", " ".join(malformed),
+                    "Every entry is COND:path - the file is read only when $(COND)\n"
+                    "is 1. An entry with no colon has no condition, so it is neither\n"
+                    "conditional nor read.", "XDC_OPTIONAL")
+        else:
+            missing = [e for e in opt_xdc if not os.path.exists(e.partition(":")[2])]
+            if missing:
+                rep.bad("XDC_OPTIONAL", " ".join(missing),
+                        "Conditional on a variable, but still NAMED - so the file has\n"
+                        "to exist. 'Optional' here means the flow may not read it, not\n"
+                        "that it may not be there.", "XDC_OPTIONAL")
+            else:
+                rep.ok("XDC_OPTIONAL", ", ".join(e.partition(":")[0] + ":..." for e in opt_xdc))
+
+    xdc_coverage(rep, target_dir)
+
+    # --- firmware and the system clock, TOGETHER (CONTRACT §3.4) -------------
+    fw_app = get("FW_APP")
+    fw_hex = get("FW_HEX")
+    image_hex = get("FPGA_IMAGE_HEX")
+    fw_configured = bool(fw_app or fw_hex or image_hex)
+    freq = get("SYS_CLK_FREQ_HZ")
+
+    optional(rep, "FW_APP", fw_app, "no firmware built with the bitstream")
+    optional(rep, "FW_HEX", fw_hex, "no pre-built hex")
+    optional(rep, "FPGA_IMAGE_HEX", image_hex, "no $readmemh image")
+    enum(rep, "FW_HEX_FORMAT", FW_HEX_FORMATS, "defaults to word")
+
+    if not fw_configured:
+        rep.info("SYS_CLK_FREQ_HZ + firmware",
+                 "%s / no firmware configured" % (freq or "(from board pack)"))
+    elif freq:
+        rep.ok("SYS_CLK_FREQ_HZ + firmware",
+               "%s Hz, and firmware IS built here - they must agree" % freq)
+    else:
+        rep.warn("SYS_CLK_FREQ_HZ unset, firmware configured",
+                 "firmware: %s" % (fw_app or fw_hex or image_hex),
+                 "This value is compiled INTO the firmware and separately\n"
+                 "constrains the bitstream. A build whose firmware and fabric\n"
+                 "disagree about it produces a board that boots and gets every baud\n"
+                 "rate and every timer wrong - the hardest class of bug to see,\n"
+                 "because nothing failed.\n"
+                 "It is unset here, so the board pack's sys_clk_freq_hz is what the\n"
+                 "firmware will be compiled against. This script does not load packs\n"
+                 "and will not invent the number: confirm it with `make board-probe`,\n"
+                 "or set SYS_CLK_FREQ_HZ explicitly so both halves read one value.")
+
+    # --- deploy (CONTRACT §9.7) ---------------------------------------------
+    hub_board = get("FPGAHUB_BOARD")
+    hub_target = get("FPGAHUB_TARGET")
+    hub_toml = get("FPGAHUB_TOML")
+    deploy = bool(hub_board or hub_target or (hub_toml and os.path.exists(hub_toml)))
+
+    if not (hub_board or hub_target):
+        rep.info("FPGAHUB_BOARD / _TARGET", "(no deploy configured)")
+    else:
+        # Reported as two lines, never one, because they are two namespaces.
+        (rep.ok if hub_board else rep.info)(
+            "FPGAHUB_BOARD", "%s   <- the board GROUP: lease, queue, reservation"
+            % (hub_board or "(unset)"))
+        (rep.ok if hub_target else rep.info)(
+            "FPGAHUB_TARGET", "%s   <- the TARGET: program, reset, actions"
+            % (hub_target or "(unset)"))
+        if bool(hub_board) != bool(hub_target):
+            rep.bad("FPGAHUB namespaces", "board=%s target=%s" % (hub_board or "(unset)",
+                                                                  hub_target or "(unset)"),
+                    "THESE ARE TWO DIFFERENT NAMESPACES AND THEY DO NOT OVERLAP.\n"
+                    "Leases, queues and reservations address the board GROUP.\n"
+                    "Program, reset and actions address the TARGET.\n"
+                    "Setting one and not the other does not fall back to the other -\n"
+                    "the half of deploy that needs the missing one returns 404, and\n"
+                    "a 404 from a deploy step reads as a network or a hub problem\n"
+                    "for as long as it takes someone to learn this.",
+                    "FPGAHUB_BOARD and FPGAHUB_TARGET   (both)")
+
+    if hub_toml:
+        optional(rep, "FPGAHUB_TOML", hub_toml, "no deploy declaration")
+
+    bin_style = get("BIN_STYLE")
+    if not deploy:
+        rep.info("BIN_STYLE", "(no deploy configured - %s)" % (bin_style or "unset"))
+    elif not bin_style:
+        rep.bad("BIN_STYLE", "",
+                "A deploy is configured, so a .bin has to be produced, and .bin\n"
+                "conversion is BOARD-FAMILY DEPENDENT: one family needs a byte\n"
+                "swap, the other needs a header strip. They are NOT interchangeable\n"
+                "and the wrong one corrupts the load rather than failing it.\n"
+                "Accepted values: %s\n"
+                "Normally supplied by the board pack as bin_style." % ", ".join(BIN_STYLES),
+                "BIN_STYLE   (or bin_style in the board pack)")
+    else:
+        enum(rep, "BIN_STYLE", BIN_STYLES, "from the board pack")
+
+    # --- run namespace -------------------------------------------------------
+    run_tag = get("RUN_TAG", "default")
+    if not run_tag or "/" in run_tag or run_tag in (".", ".."):
+        rep.bad("RUN_TAG", repr(run_tag),
+                "A run tag becomes a directory name under BUILD_DIR and is composed\n"
+                "into every path a stage writes. Empty, `.`, `..` or anything with a\n"
+                "path separator lets a stage address another run's work directory,\n"
+                "or lets `clean` walk somewhere it was never meant to.\n"
+                "mk/flow.mk hard-errors on this before any recipe can run; this is\n"
+                "the friendly version of the same refusal.", "RUN_TAG")
+    else:
+        rep.ok("RUN_TAG", run_tag)
+
+    if get("IN_RUN_TAG", run_tag) != run_tag:
+        rep.warn("IN_RUN_TAG differs from RUN_TAG",
+                 "reads %s, writes %s" % (get("IN_RUN_TAG"), run_tag),
+                 "This stage will READ another run's databases and WRITE into this\n"
+                 "one. That is a supported thing to do - reusing a synthesis for\n"
+                 "several implementations is the main reason it exists - but it\n"
+                 "means the two halves of the result have different provenance, and\n"
+                 "compare-runs will say so.")
+
+    if not build_dir or not os.path.isabs(build_dir) or build_dir == "/":
+        rep.bad("BUILD_DIR", repr(build_dir),
+                "Must be an absolute path and must not be `/`. A relative BUILD_DIR\n"
+                "moves with the tool's working directory - which the flow changes -\n"
+                "so `clean` and the build would disagree about what to delete.",
+                "BUILD_DIR")
+    else:
+        probe = build_dir
+        while probe and not os.path.exists(probe):
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+        if probe and not os.access(probe, os.W_OK):
+            rep.bad("BUILD_DIR", "%s   (%s is not writable)" % (build_dir, probe),
+                    "Everything a run produces goes under BUILD_DIR - the toolkit\n"
+                    "never writes into the project's source tree - so it has to be\n"
+                    "somewhere you can write. Point BUILD_DIR at scratch space if\n"
+                    "the checkout is read-only.", "BUILD_DIR")
+        else:
+            rep.ok("BUILD_DIR", build_dir)
+
+    # --- gates ---------------------------------------------------------------
+    ratchets = [(v, get(v)) for v in
+                ("EXPECT_WNS_MIN", "EXPECT_WHS_MIN", "EXPECT_LUT_MAX", "EXPECT_FF_MAX",
+                 "EXPECT_BRAM_MAX", "EXPECT_DSP_MAX", "EXPECT_UNROUTED_MAX",
+                 "EXPECT_BLACKBOX_MAX")
+                if get(v) and get(v) != "-1"]
+    if ratchets:
+        rep.ok("gate budgets set", ", ".join("%s=%s" % (k, v) for k, v in ratchets))
+    else:
+        rep.info("gate budgets", "(all -1: measure and report, do not gate)")
+
+    allow = lst("MSG_GATE_ALLOWLIST")
+    if allow:
+        rep.warn("MSG_GATE_ALLOWLIST is not empty", "%d entry/entries" % len(allow),
+                 "Every allowlist here defaults EMPTY on purpose: a default that\n"
+                 "tolerates message IDs hands each new project somebody else's\n"
+                 "undiagnosed exemptions. Each of these should carry a paragraph of\n"
+                 "diagnosis and a named owner beside it.")
+    else:
+        rep.info("MSG_GATE_ALLOWLIST", "(empty - the correct default)")
+
+    optional(rep, "XDC_BASELINE", get("XDC_BASELINE"), "no ratcheted XDC baseline")
+
+    # --- extension seams -----------------------------------------------------
+    steps, steps_dir = read_steps(flow_dir)
+    check_hooks(rep, get("HOOKS_DIR", os.path.join(fpga_dir, "hooks")), seams, seams_path)
+    check_overrides(rep, get("OVERRIDES_DIR", os.path.join(fpga_dir, "overrides")),
+                    steps, steps_dir)
+
+    # --- what the project actually says --------------------------------------
+    check_derived(rep, fpga_dir)
+    placeholders(rep, fpga_dir, build_dir)
+
+    # --- interface drift -----------------------------------------------------
+    unknown = sorted(k for k in ARGS.vars
+                     if k not in KNOWN_VARS and k != "DERIVED_ASSIGNED")
+    if unknown and not ARGS.quiet:
+        detail = []
+        for k in unknown:
+            near = difflib.get_close_matches(k, KNOWN_VARS, n=1, cutoff=0.75)
+            detail.append("%s%s" % (k, ("~%s?" % near[0]) if near else ""))
+        rep.info("variables not in CONTRACT §3", ", ".join(detail))
+
+    return rep.emit()
+
+
+def main():
+    global ARGS
+    args, err = parse_args(sys.argv[1:])
+    if args is None:
+        if err:
+            print("fpga-flow-check: %s" % err, file=sys.stderr)
+            return 2
+        return 0
+    ARGS = args
+    try:
+        if not ARGS.supplied:
+            return standalone()
+        return run_checks()
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        # Never exit 0 on a crash. A checker that dies silently is worse than no
+        # checker: the caller reads the missing failure as a pass.
+        traceback.print_exc()
+        print("")
+        print("fpga-flow-check: CRASHED (traceback above). Exit 2 - this is NOT a pass,")
+        print("and nothing above it was necessarily checked.")
+        return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)

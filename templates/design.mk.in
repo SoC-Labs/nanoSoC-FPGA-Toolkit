@@ -1,0 +1,630 @@
+#-----------------------------------------------------------------------------
+# fpga/design.mk  --  THE ONE FILE THE FLOW READS FIRST
+#
+# Scaffolded into @PROJECT@ by `fpga-flow-init` on @DATE@.
+#
+# Everything below is YOURS. Nothing in $(FPGA_FLOW_DIR) is. If you find
+# yourself editing the toolkit to make your design build, that is a toolkit bug
+# -- raise it, do not fork it. The one exception is the two extension seams at
+# the bottom of this file, which exist precisely so you never have to.
+#
+# HOW TO USE THIS FILE
+#   1. Fill in every <<FILL IN>>. `make check` names any you miss, with the
+#      variable, the path it looked for, and what the file is for. A fresh
+#      scaffold FAILS `make check` on purpose.
+#   2. Leave the `?=` assignments alone unless your project already has a
+#      different layout. They are conventions, not requirements -- every path
+#      the flow uses is overridable from here, so an existing tree does not
+#      have to be moved to adopt this flow.
+#   3. DELETE what you do not use. A variable set to something plausible and
+#      never exercised is worse than an absent one: `make check` will assert
+#      the file it names exists, and you will fix a path to a file nothing
+#      reads.
+#   4. `make help` lists targets. `make check` costs no licence hours and
+#      should pass before you spend any.
+#
+# THE READING ORDER OF THIS FILE IS THE ORDER MAKE READS IT. A `:=` is expanded
+# the moment make reaches the line, so anything it references must ALREADY be
+# defined ABOVE it. Referencing something defined further down does not error --
+# it expands to empty, and `$(MY_ROOT)/rtl/top.flist` quietly becomes
+# `/rtl/top.flist`, an absolute path that looks plausible and does not exist.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+#-----------------------------------------------------------------------------
+
+
+# ── 1. REQUIRED: the three the engine will not start without ────────────────
+#
+# These three are a hard `$(error)` at make PARSE time, before any target runs,
+# because every path in this file and every path in the engine is built from
+# them. An empty one produces a tree of plausible-looking wrong paths rather
+# than a message.
+
+# BLOCK is the design's short name and the STEM OF EVERY ARTEFACT the flow
+# writes: $(BLOCK).bit, $(BLOCK).bin, $(BLOCK)_synth.dcp, $(BLOCK)_routed.dcp.
+# It is not required to equal TOP -- see the warning under TOP -- but on most
+# designs it does, and where it does not, a reader will assume it does unless
+# you say why here.
+BLOCK := @BLOCK@
+
+# BOARD selects the board pack at $(BOARD_DIR)/board.tcl. That pack is a
+# PROJECT file, not a toolkit file: which pin, which IO standard and what the
+# oscillator runs at are facts about a circuit board, and this toolkit has no
+# business holding them. `make board-probe` loads and validates it without a
+# licence.
+BOARD := @BOARD@
+
+# FPGA_FLOW_DIR is where you cloned or submoduled this toolkit. `fpga-flow-init`
+# wrote a RELATIVE path if the toolkit sits inside this project, because a
+# relative path survives the tree being moved, cloned, or checked out by CI
+# under a different root. An absolute path is a path that works on one machine.
+FPGA_FLOW_DIR ?= @FPGA_FLOW_DIR@
+
+
+# ── 2. REQUIRED: reported by `make check`, not by make ──────────────────────
+#
+# These four are not parse-time errors because a half-filled scaffold should
+# still be able to run `make check`, `make env` and `make help` and be TOLD what
+# is missing. A parse error here would mean the one command that explains the
+# problem is the one command that cannot run.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAP: TOP IS THE BOARD-LEVEL TOP, NOT THE SoC TOP.
+#
+#   The module that instantiates your SoC and wires it to the BOARD: the
+#   clock buffer or MMCM, the reset conditioning, the IO buffers, the debug
+#   bridge, the pins that only exist because there is a PCB underneath.
+#
+#   GETTING THIS WRONG IS QUIET. Naming the SoC top synthesises happily. The
+#   run completes. The bitstream builds. What you discover afterwards is that
+#   the constraints matched nothing (the ports they name are one level up and
+#   no longer exist), that Vivado inferred IO buffers for internal signals,
+#   and that the design on the board is not the design you drew.
+#
+#   If your board-level top is a block design, this is the BD's wrapper
+#   module -- typically $(DESIGN_NAME)_wrapper -- and not the BD itself.
+# ═══════════════════════════════════════════════════════════════════════════
+TOP := <<FILL IN: the BOARD-LEVEL top module. Read the box above.>>
+
+# The master flist: the flow's only route into your RTL. Absolute, or built
+# from a variable defined ABOVE this line -- see the reading-order note in the
+# header. A relative flist works until someone runs make from another directory.
+#
+# If your flist is GENERATED, do not commit a stale copy: set RTL_FLIST_GEN in
+# section 4 to the make target that rebuilds it, and the flow runs that first.
+RTL_FLIST := <<FILL IN: absolute path to the master flist>>
+
+# Pin and placement constraints. See section 6; this line is here because
+# `make check` treats it as required and it belongs beside the other three.
+XDC_PINS ?= $(TARGET_DIR)/$(BLOCK).pins.xdc
+
+# The device. NORMALLY THE BOARD PACK SAYS THIS -- a part is a consequence of
+# which board you are building for -- and a project override here wins over it.
+# Override when you are building for a board that ships in more than one device
+# variant, or when you are speed-grade-sweeping. Otherwise delete this line and
+# let board.tcl be the single place the device is named.
+PART ?= @PART@
+
+
+# ── 3. IDENTITY (optional, with defaults) ───────────────────────────────────
+
+# The block-design name, when a BD is used. It is the name of the .bd file and
+# the stem of the generated wrapper, so it is what TOP usually derives from.
+DESIGN_NAME  ?= $(BLOCK)
+
+# Used for git provenance ONLY -- the manifest records what commit built this
+# bitstream. It is never used to construct an input path: the flow does not
+# reach up out of fpga/ for anything it reads.
+PROJECT_ROOT ?= $(FPGA_DIR)/..
+
+
+# ── 4. TARGET: which board, which device, which flavour of build ────────────
+
+# Where the board pack lives. One file, sourced as plain Tcl.
+BOARD_DIR        ?= $(FPGA_DIR)/board/$(BOARD)
+
+# A TARGET is a BUILD of this design for a board. It defaults to the board, and
+# stays that way on most projects. It becomes its own thing when one board
+# carries several builds that differ in collateral rather than in RTL -- a
+# debug build with an ILA and a wider constraint set, a bring-up build with a
+# reduced top level. Each gets a directory, and the directory is the difference.
+TARGET           ?= $(BOARD)
+TARGET_DIR       ?= $(FPGA_DIR)/targets/$(TARGET)
+
+# Where the part pack lives. Part packs ship WITH THE TOOLKIT: how many LUTs a
+# device has and whether it has an IDELAY primitive are facts about silicon,
+# and every project on that device wants the same answer. Point this elsewhere
+# for a site pack held outside the checkout.
+PART_DIR         ?= $(FPGA_FLOW_DIR)/part/$(PART)
+
+# The Vivado BOARD FILE, if you use one -- a vendor-supplied description that
+# lets IP configure itself against named board interfaces. It is not the same
+# thing as the board pack in section 4: that is ours and holds pins, this is
+# the vendor's and holds interfaces. Using one is optional and it is a
+# reasonable choice to use neither.
+#
+# If you set BOARD_PART you MUST also set BOARD_REPO_PATHS, or Vivado resolves
+# the VLNV against whatever board files happen to be installed on THIS machine
+# -- which is how a build becomes machine-dependent without anyone writing a
+# path down. The board pack's schema enforces the pairing.
+BOARD_PART       ?=
+BOARD_REPO_PATHS ?=
+
+# How the flow drives the tool:
+#   project        a Vivado project on disk. What the GUI opens. The default.
+#   direct         non-project mode: read, synth, opt, place, route by script.
+#                  Faster, reproducible, and there is no project to inspect
+#                  afterwards -- checkpoints are the only artefact.
+#   dfx            dynamic function exchange (partial reconfiguration).
+#   protocompiler  a prototyping-system flow with its own partitioner.
+FLOW_MODE        ?= project
+
+# What runs on the board once it is programmed:
+#   bare   a bitstream and firmware you built. The default.
+#   pynq   a Linux image whose overlay is this bitstream plus its .hwh.
+PLATFORM         ?= bare
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAP: SYS_CLK_FREQ_HZ IS COMPILED INTO THE FIRMWARE *AND* CONSTRAINS THE
+#       FABRIC.
+#
+#   It reaches the firmware as -DNANOSOC_SYS_CLK_FREQ_HZ and it reaches the
+#   timing constraints as the period the design is closed at. It is ONE
+#   number with TWO consumers, and nothing downstream compares them.
+#
+#   A build where they disagree BOOTS. It comes up, it runs, and every baud
+#   rate and every timer is wrong by the ratio between them -- so the UART
+#   prints garbage at the rate you expected and the symptom reads as a serial
+#   wiring fault. `make check` reports the two together for this reason.
+#
+#   The board pack states the oscillator; this is the SYSTEM clock the design
+#   actually runs at, which is usually the oscillator through an MMCM. They
+#   are not the same number and only one of them is this one.
+# ═══════════════════════════════════════════════════════════════════════════
+SYS_CLK_FREQ_HZ  ?= <<FILL IN: the SYSTEM clock in Hz, e.g. 50000000>>
+
+
+# ── 5. RTL ──────────────────────────────────────────────────────────────────
+
+# A make target IN THIS PROJECT that regenerates RTL_FLIST. The flow runs it
+# before reading the flist, so a generated flist can never be stale. Leave it
+# empty if the flist is committed.
+RTL_FLIST_GEN      ?=
+
+# Include directories, in addition to any `+incdir+` the flist itself carries.
+RTL_INCDIRS        ?=
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAP: `ipx::package_project` DROPS FILESET DEFINES.
+#
+#   A `+define+` you set on a fileset does not survive IP packaging. Three
+#   separate routes through packaging lose it, and NONE of them warn.
+#
+#   THIS FAILED SILENTLY, IN THIS CODEBASE, FOR MONTHS. An
+#   `ifdef TIDELINK_USE_IDELAY` opt-in was false in EVERY build -- the
+#   builds that opted in and the builds that did not. It was proven by
+#   building both and finding the "IDELAY-off" bitstream BYTE-IDENTICAL to
+#   the "IDELAY-on" one: the primitive was absent from every build that
+#   believed it had it, and the tool reported nothing, ever.
+#
+#   So there are three variables here and they are NOT interchangeable:
+#
+#     RTL_PARAMS          THE PRIMARY MECHANISM. Parameters survive packaging
+#                         as CONFIG.* properties on the IP. Prefer a module
+#                         parameter over a macro for anything that selects
+#                         behaviour -- it is visible in the BD, visible in the
+#                         report, and it cannot be silently dropped.
+#
+#     RTL_DEFINES_INBODY  baked into the MATERIALISED COPY of each source, so
+#                         the define is in the file rather than in a fileset
+#                         property nothing carries. Use it when the RTL is not
+#                         yours to re-parameterise.
+#
+#     RTL_DEFINES         reaches the tools the ordinary way. Fine for a
+#                         non-packaged flow. IN A PACKAGED FLOW A PLAIN
+#                         +define+ MAY REACH NOTHING.
+#
+#   And one more, which is the other half of the same lesson: this codebase
+#   has ZERO occurrences of `ifdef FPGA` and `ifdef ASIC` across 13,524 RTL
+#   files, along with XILINX, VIVADO, SIMULATION and FPGA_ONLY. A flow that
+#   configures the build with +define+FPGA CONFIGURES NOTHING. Selection here
+#   is by FLIST FILE-SWAP (same module name, opposite directory) and by
+#   MODULE PARAMETER. Check that the macro you are about to set is read by
+#   any file at all before you set it.
+#
+#   fpga/hooks/pre_synth.tcl is a ready-made assertion for exactly this. It
+#   checks that a declared parameter is actually set and that a declared
+#   define is actually present -- or actually absent -- on the fileset the
+#   tool is about to synthesise.
+# ═══════════════════════════════════════════════════════════════════════════
+RTL_DEFINES        ?=
+RTL_DEFINES_INBODY ?=
+
+# Macros asserted ABSENT. This is not paranoia: an ASIC-only macro reaching an
+# FPGA build swaps a memory wrapper for one that instantiates a foundry macro
+# the fabric does not have, and the failure is a black box in the netlist
+# rather than an error. Name them and the flow proves they are not set.
+RTL_DEFINES_NEVER  ?= <<FILL IN: e.g. ASIC_TSMC65, or leave empty>>
+
+# NAME=VALUE, space separated. Read the box above: these are what survives.
+RTL_PARAMS         ?=
+
+# The top-level HDL, read AFTER the flist. A board-level top is usually a
+# hand-written wrapper that is deliberately NOT in the RTL flist -- the flist
+# describes the SoC, and the board wrapper is target collateral. It lives in
+# $(TARGET_DIR) with the XDCs for the same reason.
+TOP_HDL            ?= <<FILL IN: e.g. $(TARGET_DIR)/$(TOP).v, or empty if the flist has it>>
+
+# Anything else the tools must read that the flist does not name: a .coe, an
+# .xci committed rather than generated, a vendor .edif.
+EXTRA_SRCS         ?=
+
+# Files whose file_type must be forced to SystemVerilog. Vivado decides by
+# EXTENSION, so a .v file using SystemVerilog constructs is read as Verilog-2001
+# and fails on a syntax error somewhere in the middle of a package import -- a
+# message that names a line rather than a language.
+SV_FILES           ?=
+
+
+# ── 6. IP AND BLOCK DESIGN ──────────────────────────────────────────────────
+
+# A LIST of directories Vivado scans for packaged IP. It is a LIST because real
+# designs have more than one: your own packaged cores, a shared library, and a
+# vendor drop are three different trees and three different lifetimes.
+IP_REPOS        ?=
+
+IP_VENDOR       ?= soclabs.org
+IP_CORE_REV     ?= 1
+
+# The out-of-context synthesis cache. Under BUILD_DIR by default so a clean is
+# a clean; point it at a shared scratch path to share OOC runs between run tags,
+# and expect the first build after a source change to be slow either way.
+IP_CACHE_DIR    ?= $(BUILD_DIR)/ip_cache
+
+# Your packaging script, if this design packages IP. See the packaging trap in
+# section 5 before you write it.
+PACKAGE_TCL     ?=
+
+# The block design, and overlays applied over it IN ORDER. An overlay is how a
+# variant is expressed without forking the BD: the base BD is generated by the
+# vendor tooling and regenerated wholesale, and the overlay is the handful of
+# connections that make it yours. Forking the BD instead means the next
+# regeneration silently discards them.
+BD_TCL          ?=
+BD_OVERLAY_TCL  ?=
+
+# 1 synthesises the BD as one unit rather than per-IP out-of-context. Faster to
+# a first bitstream, slower on every incremental change, and it discards the
+# OOC checkpoints - so a small RTL edit re-synthesises everything.
+BD_GLOBAL_SYNTH ?= 0
+
+
+# ── 7. CONSTRAINTS ──────────────────────────────────────────────────────────
+#
+# EXPLICIT PATHS, NOT A GLOB. Every XDC this design uses is NAMED by a variable
+# here, and `make check` ERRORS on a .xdc sitting in $(TARGET_DIR) that no
+# variable names. That is deliberate and it is the correction of a measured
+# defect: the flow this replaces discovered its constraints by a glob over a
+# fixed filename fragment, so an XDC named anything else was silently invisible
+# -- present in the directory, read by nothing, and warned about by nobody.
+#
+# The three files are split BY WHEN THEY ARE READ, and the split is not
+# optional. See fpga/targets/README.md, which is the long version.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAP: VIVADO DROPS A CONSTRAINT THAT MATCHES NOTHING, WITHOUT AN ERROR.
+#
+#   `set_property PACKAGE_PIN ... [get_ports clk_i]` on a design whose port
+#   is called `clk` does not fail. `get_ports` returns an empty list, the
+#   property is applied to nothing, and the run continues. The pin is
+#   unconstrained, Vivado places it wherever it likes, and you find out on
+#   the bench.
+#
+#   Renaming a port silently unconstrains every line that named it. So does
+#   getting TOP wrong (see section 2), because then NONE of the ports exist.
+#
+#   That is what XDC_BASELINE and `make xdc-lint` are for, in section 11:
+#   xdc-lint counts what each constraint file actually matched and compares
+#   it against a committed baseline, so a constraint that stops matching is
+#   a diff rather than a silence.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Read in SYNTHESIS and in IMPLEMENTATION. Declared in section 2 with the other
+# required inputs.
+#   XDC_PINS
+
+# Read in IMPLEMENTATION ONLY (USED_IN_SYNTHESIS false). Clocks, IO delays,
+# exceptions.
+XDC_TIMING      ?= $(TARGET_DIR)/$(BLOCK).timing.xdc
+
+# Read in IMPLEMENTATION ONLY. Configuration properties and DRC severities.
+XDC_DRC         ?= $(TARGET_DIR)/$(BLOCK).drc.xdc
+
+# A LIST, ORDER PRESERVED, read after the three above. XDC is order-dependent
+# in the same way SDC is: a later command silently overrides an earlier one on
+# the same object.
+XDC_EXTRA       ?=
+
+# A LIST of "COND:path". Each is included IFF $(COND) is 1, so a build variant
+# is a variable rather than an edited file:
+#
+#     XDC_OPTIONAL += USE_IDELAY:$(TARGET_DIR)/$(BLOCK).idelay.xdc
+#
+# The condition is a make variable YOU set. Read the packaging trap in section
+# 5 first: if the RTL side of that variant is a `+define+`, the constraint may
+# be the only half of it that actually took effect.
+XDC_OPTIONAL    ?=
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAP: A DRC-WAIVER XDC CANNOT BE read_xdc'd.
+#
+#   Vivado REJECTS procedural Tcl inside an XDC. `create_waiver` is
+#   procedural. So the file you naturally write -- a waiver per finding,
+#   each with its diagnosis -- cannot be a constraint file at all, and
+#   read_xdc on it errors in a way that reads like a syntax problem.
+#
+#   XDC_POST_ROUTE is `source`d AFTER route_design, as ordinary Tcl, which is
+#   where a waiver has to go anyway: a waiver waives a finding, and the
+#   findings do not exist until the design is routed.
+#
+#   Do not use this seam for anything that changes the design. By the time it
+#   runs, place and route are done.
+# ═══════════════════════════════════════════════════════════════════════════
+XDC_POST_ROUTE  ?=
+
+
+# ── 8. FIRMWARE ─────────────────────────────────────────────────────────────
+#
+# A BITSTREAM CO-DEPENDENCY, NOT A SEPARATE BUILD. On a soft-core design the
+# firmware is initialised into block RAM at bitstream generation, so the .bit
+# carries a copy of the program. Rebuilding the firmware and re-programming the
+# OLD bitstream loads the OLD program, silently. The flow tracks the hex as an
+# input for exactly this reason, and records its SHA-256 in the manifest.
+
+# The firmware application to build, if this flow builds it.
+FW_APP          ?=
+
+# The hex image itself, if you build it elsewhere and hand it over.
+FW_HEX          ?=
+
+# byte | word. What one line of the hex file holds. Getting it wrong does not
+# fail: it loads a program whose every instruction is shuffled, and the CPU
+# executes it.
+FW_HEX_FORMAT   ?= word
+
+# What $readmemh in the RTL actually resolves to. It is separate from FW_HEX
+# because the RTL names a path and the build produces a file, and they are only
+# the same thing if somebody makes them so. This is where that is made explicit.
+FPGA_IMAGE_HEX  ?=
+
+
+# ── 9. EXTENSION POINTS ─────────────────────────────────────────────────────
+#
+# Project Tcl sourced at a named point in a stage. Absent is SILENT; present is
+# ANNOUNCED with its path and runtime; an error in one STOPS THE STAGE and is
+# not downgraded. The valid seam names are in
+# $(FPGA_FLOW_DIR)/flow/common/seams.txt and a file here whose name is not on
+# that list NEVER RUNS -- `make check` warns and names it. See hooks/README.md.
+HOOKS_DIR       ?= $(FPGA_DIR)/hooks
+
+# A file here REPLACES $(FPGA_FLOW_DIR)/flow/steps/<name>.tcl WHOLESALE. No
+# merging, no partial override: those files set tool properties in an order
+# that matters and a half-overridden one is a design nobody can reason about.
+# `make check` warns whenever an override is active, and the manifest records
+# which step files were the toolkit's and which were yours.
+OVERRIDES_DIR   ?= $(FPGA_DIR)/overrides
+
+
+# ── 10. RUN NAMESPACE ───────────────────────────────────────────────────────
+#
+# Everything a run produces goes to
+#
+#     $(BUILD_DIR)/$(RUN_TAG)/{work,logs,reports,outputs}
+#
+# so two runs cannot collide and an experiment is a NEW RUN TAG rather than a
+# copied directory. Point BUILD_DIR at scratch if you would rather it were not
+# in the repo -- but read section 11's note on evidence first: a gate that
+# passed and left its evidence somewhere nothing collects is indistinguishable
+# from a gate that never ran.
+BUILD_DIR       ?= $(FPGA_DIR)/build
+RUN_TAG         ?= default
+
+# Which run's databases a stage READS. Both default to RUN_TAG; set them to
+# resume or to branch:
+#     make impl RUN_TAG=tighter_pblock IN_RUN_TAG=baseline
+# The input run is read-only BY CONSTRUCTION -- paths are composed from
+# WORK_DIR and a run tag containing a path separator is refused -- not by
+# convention.
+IN_RUN_TAG      ?= $(RUN_TAG)
+SYNTH_RUN_TAG   ?= $(RUN_TAG)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAP: THE DERIVED VARIABLES ARE SILENTLY OVERRIDDEN IF YOU SET THEM.
+#
+#     RUN_DIR  WORK_DIR  LOG_DIR  REPORT_DIR  OUT_DIR
+#     IN_WORK_DIR  SYNTH_OUT_DIR
+#
+#   The engine assigns all seven with `:=` from BUILD_DIR and the run tags,
+#   AFTER this file is read. So anything you set here is computed over and
+#   discarded -- your value never reaches a recipe, and nothing says so.
+#
+#   The reference toolkit's own shipped example does exactly this. `make
+#   check` WARNS if it finds any of them assigned here, which is the only
+#   warning in the whole check that exists because the toolkit's own
+#   documentation was wrong.
+#
+#   Move the run somewhere else with BUILD_DIR and RUN_TAG. That is what
+#   they are for, and they are the only two inputs the seven are built from.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+# ── 11. TOOLS ───────────────────────────────────────────────────────────────
+
+VIVADO          ?= vivado
+
+# When set, this is ASSERTED, not assumed: the flow refuses to run under a
+# different version rather than producing a bitstream from a toolchain nobody
+# recorded. Leave it empty during bring-up; set it the day you have a build you
+# would want to reproduce.
+#
+# `make doctor` reports what is ON THE FILESYSTEM, never what a modulefile
+# advertises. On this host the modulefiles advertise three versions and two of
+# them are not installed.
+VIVADO_VER      ?=
+
+# Local CPU count. Measure the host (`lscpu`) rather than guessing; do not
+# exceed the PHYSICAL core count, because the placer and router scale on real
+# cores and thrash on hyperthreads.
+NUM_JOBS        ?= 8
+
+TCLSH           ?= tclsh
+
+
+# ── 12. GATES ───────────────────────────────────────────────────────────────
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAP: EVERY EXPECT_* DEFAULTS TO -1, WHICH MEANS *MEASURE, DO NOT GATE*.
+#
+#   -1 is not "no limit" in the sense of "we do not care". It is "this run
+#   reports the number and does not judge it", and the report says so in
+#   those words, so a green run cannot be mistaken for a run that checked
+#   something.
+#
+#   SET THE RATCHET AFTER A FIRST RUN, and write the measurement and the
+#   margin down BESIDE IT, in a comment, on the same day you set it:
+#
+#       # measured -0.031 ns on 2026-09-08, run tag baseline, Vivado 2024.1.
+#       # 0.100 ns of margin for temperature and for the ILA we will add.
+#       EXPECT_WNS_MIN := -0.131
+#
+#   A budget with no measurement beside it is a number somebody guessed, and
+#   the next person to see it fail cannot tell whether the design regressed
+#   or the guess was always wrong. This project has a whole class of those:
+#   budgets set to whatever the day's number happened to be, which pass
+#   everything and discriminate nothing.
+# ═══════════════════════════════════════════════════════════════════════════
+EXPECT_WNS_MIN          ?= -1
+EXPECT_WHS_MIN          ?= -1
+EXPECT_LUT_MAX          ?= -1
+EXPECT_FF_MAX           ?= -1
+EXPECT_BRAM_MAX         ?= -1
+EXPECT_DSP_MAX          ?= -1
+
+# These two default to ZERO rather than -1, because unlike a resource count
+# there is no design for which the right answer is "some". An unrouted net is
+# not a tight budget; it is a bitstream that does not implement the schematic.
+EXPECT_UNROUTED_MAX     ?= 0
+EXPECT_BLACKBOX_MAX     ?= 0
+
+ALLOW_CRITICAL_WARNINGS ?= 0
+
+# The committed record of what each constraint file MATCHED, against which
+# `make xdc-lint` compares. This is the answer to the "Vivado drops a
+# constraint that matches nothing" trap in section 7: without a baseline, a
+# constraint that stops matching produces no output at all, and there is
+# nothing for a gate to be red about.
+XDC_BASELINE          ?= <<FILL IN: e.g. $(TARGET_DIR)/xdc_baseline.txt, after your first run>>
+
+# EMPTY BY DEFAULT, AND IT STAYS EMPTY UNTIL YOU DIAGNOSE SOMETHING. A default
+# that tolerates message IDs hands every new project somebody else's
+# undiagnosed exemptions, which is how a gate comes to pass on a defect it was
+# written to catch. Every entry carries a paragraph of diagnosis and a named
+# owner, here, beside it.
+MSG_GATE_ALLOWLIST    ?=
+
+
+# ── 13. DEPLOY ──────────────────────────────────────────────────────────────
+#
+# Declaration only at this phase: nothing here programs a board yet. Fill it in
+# anyway if you know the answers, because they are answers about YOUR bench and
+# nobody else can supply them later.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAP: THE BOARD GROUP AND THE TARGET ARE DIFFERENT NAMESPACES.
+#
+#   FPGAHUB_BOARD   is the board GROUP  -- the LEASE scope. Leases, queues
+#                   and reservations address this.
+#   FPGAHUB_TARGET  is the TARGET       -- the PROGRAM scope. Program, reset
+#                   and actions address this.
+#
+#   They do not overlap. Passing a board group where a target is expected
+#   returns 404, and passing a target where a board group is expected
+#   returns 404, and neither 404 says which of the two you got wrong.
+#
+#   A board with one FPGA on it still has both names, and they are often
+#   similar enough to look like typos of each other. Write both down.
+# ═══════════════════════════════════════════════════════════════════════════
+FPGAHUB_BOARD   ?=
+FPGAHUB_TARGET  ?=
+FPGAHUB_TOML    ?= $(FPGA_DIR)/fpgahub.toml
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAP: BIN_STYLE IS NOT COSMETIC.
+#
+#   .bin conversion is board-family dependent. Zynq-7000 needs a BYTE SWAP;
+#   ZynqMP needs a HEADER STRIP. They are not interchangeable and the wrong
+#   one CORRUPTS THE LOAD -- the file is produced, it is the right size, it
+#   is accepted by the loader, and the device does not come up.
+#
+#   The board pack declares this as a REQUIRED key, because it is a fact
+#   about the board and not about your design. Set it here only to override
+#   a pack you cannot edit.
+# ═══════════════════════════════════════════════════════════════════════════
+BIN_STYLE       ?=
+
+
+# ── 14. THE ENGINE ──────────────────────────────────────────────────────────
+#
+# Nothing above this line is the toolkit's. Nothing below it is yours, except
+# the appended prerequisites in section 15, which must come AFTER it.
+#
+# This include is also in fpga/Makefile. That is deliberate and safe:
+# mk/flow.mk carries an include guard, so design.mk is self-sufficient when
+# something includes it directly.
+include $(FPGA_FLOW_DIR)/mk/flow.mk
+
+
+# ── 15. YOUR OWN WORK, ATTACHED TO A STAGE ──────────────────────────────────
+#
+# To make one of your targets run as part of a stage, add a RECIPE-LESS rule:
+#
+#     synth: my-project-lint
+#     impl:  my-project-pblock-report
+#
+#     my-project-lint:
+#             $(MY_LINTER) --flist $(RTL_FLIST)
+#
+# THE RULE MUST BE HERE, AFTER THE INCLUDE ABOVE. Before it, `synth` does not
+# exist yet, so `synth: my-project-lint` DEFINES it -- as a target with a
+# prerequisite and no recipe -- and the engine's later definition then collides
+# with yours.
+#
+# Four hazards, all of them quiet:
+#
+#   * A SECOND RECIPE SILENTLY REPLACES OURS. Writing `synth:` with a TAB line
+#     under it does not extend the stage; it replaces it. GNU make says so as
+#     a WARNING ("overriding recipe for target"), which scrolls past in a build
+#     log, and then runs yours instead. If you want work attached to a stage,
+#     write NO recipe under the stage's name.
+#
+#   * AN INCLUDE GUARD CANNOT SEE A TARGET COLLISION. The guard on mk/flow.mk
+#     stops the file being PARSED twice; it has nothing to say about a target
+#     name defined in two files. The only protection is a manual name check --
+#     `make help-all` lists every target the engine defines -- redone every
+#     time you add one. Prefix yours (`my-project-`, or the block's name) and
+#     the check becomes unnecessary.
+#
+#   * PREREQUISITES CARRY NO ORDERING. Under `-j`, the prerequisites of one
+#     target may run in any order and at the same time. If two of yours must
+#     be sequenced, sequence them inside one recipe, not by listing them.
+#
+#   * A PREREQUISITE RUNS *BEFORE* THE STAGE. If what you want is a check on
+#     the stage's OUTPUT, a prerequisite runs at the wrong time: use
+#     <STAGE>_POST_TARGETS, which runs after the stage's verdict artefact
+#     exists.
+#
+#     BITSTREAM_POST_TARGETS += my-project-deploy
+#
+#     Failure there is non-fatal to the BUILD and fatal to the CLAIM: a
+#     90-minute implementation must not die because a board was busy, but the
+#     run is not "deployed" and the message says so loudly.

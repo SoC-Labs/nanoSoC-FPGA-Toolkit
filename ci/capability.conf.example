@@ -1,0 +1,185 @@
+#-----------------------------------------------------------------------------
+# ci/capability.conf.example - what a host must have, per capability tier
+#
+# Copy to  fpga/ci-capability.conf  and edit. `ci/capability.sh` reads it two
+# ways, and that is the whole point of the file:
+#
+#   --labels             at runner registration: "which labels has this host
+#                        EARNED?" - derived by probing, never hand-typed
+#   --require <label>    as the FIRST STEP of every CI job: "did I land
+#                        somewhere capable?" A job that lands on an
+#                        under-provisioned host must fail in seconds, not forty
+#                        minutes into synthesis.
+#
+# Re-probing per job is not redundant with the runner's tag. A tag records what
+# a host claimed when someone registered it, possibly months ago; the probe
+# records what is true now. On an FPGA host that gap is wider than on an ASIC
+# one, because half of what these labels assert is HARDWARE - see the deploy
+# tier at the bottom.
+#
+# FORMAT
+#   <label>  <directive>  <argument>   | why it matters
+#
+#   tool     X            X is on PATH
+#   cmd      <shell>      the command exits 0
+#   path     <dir>        the path exists AND IS READABLE
+#   env      X            $X is set and non-empty
+#   pymod    X            python3 imports X
+#   doctor   -            delegate to scripts/fpga-flow-doctor
+#   requires <label>      this tier includes another
+#
+# WRITE THE REASON. A bare "vivado 2024.1" tells the next person nothing; "the
+# timing closure and the DRC waivers are calibrated against 2024.1, and two
+# hosts on two versions return different verdicts for the same commit" tells
+# them why it is not negotiable.
+#
+#-----------------------------------------------------------------------------
+# NO PATH IN THIS FILE BELONGS TO A PARTICULAR LAB, AND NONE EVER MAY.
+#
+# Vivado is located BY ASKING - `command -v vivado`, then `vivado -version`,
+# then scripts/fpga-flow-doctor - and never by testing an install root. A
+# hardcoded tool mount is wrong three times over: it belongs to one site, so it
+# is the single line that stops this toolkit being usable anywhere else; an
+# empty autofs mount point passes every existence test and then fails the job
+# forty minutes later; and it answers the wrong question, because what the
+# build needs is a Vivado that RUNS, not a directory that is present.
+#
+# The same rule covers the board. There is no board name, no serial, no part
+# and no fpgahub host in this file. Those are the project's facts and they live
+# in fpga/board/<board>/board.tcl and fpga/fpgahub.toml, where a run manifest
+# records them. What this file asserts is that the CLIENT works and the NAMES
+# THE PROJECT CONFIGURED resolve - which is a probe you can write once and use
+# everywhere.
+#-----------------------------------------------------------------------------
+
+
+# --- fpga-flow-lint: the licence-free tier. Any host, including a laptop. ----
+#
+# This is the tier that makes cheap CI possible. It needs no EDA tool, no
+# licence, no part and no board, so it can run on a cloud runner on every push.
+# It covers the static, host, contract and flist tiers of ci/tier.sh.
+
+fpga-flow-lint  tool  make    | the engine is GNU make
+fpga-flow-lint  tool  tclsh   | the flow steps and the part/board packs are Tcl; this is the syntax gate
+fpga-flow-lint  tool  git     | every run manifest records the project and toolkit sha, and a dirty flag. Without git those fields are UNVERIFIED and the run cannot be compared to any other
+fpga-flow-lint  tool  python3 | the report parsers and the contract checker. Stdlib only, so any python3 will do
+
+
+# --- fpga-flow-synth: synthesis. Needs Vivado. -------------------------------
+
+fpga-flow-synth  requires fpga-flow-lint | everything the licence-free tier needs
+fpga-flow-synth  tool     vivado         | make synth
+
+# THE VERSION PIN. Two hosts on two Vivado versions return different verdicts
+# for the same commit: the synthesiser's inference of DSP and BRAM changes
+# between releases, so utilisation budgets calibrated on one version fire
+# spuriously on the other, and the message IDs a msg-gate allowlist names are
+# not stable across major versions either.
+#
+# `vivado -version` ASKS THE TOOL. It takes no licence and no project. Do not
+# replace it with a test on an install directory: that is a path belonging to
+# one site, and it answers "is a directory present", not "does a Vivado run".
+#
+# Edit the version to the one YOUR constraints are calibrated against, and keep
+# it equal to VIVADO_VER in design.mk - the two are separate assertions of the
+# same fact (CONTRACT.md §3.3: when VIVADO_VER is set it is ASSERTED, not
+# assumed) and a host that satisfies one and not the other is the confusing case.
+fpga-flow-synth  cmd  "vivado -version 2>/dev/null | head -1 | grep -q 'v2024\.1'"  | timing closure, the utilisation budgets and the msg-gate allowlist are all calibrated against this release
+
+# Delegates the rest of the tool half to fpga-flow-doctor rather than
+# duplicating it. That script reports what is ON THE FILESYSTEM rather than
+# what a modulefile advertises, which is the distinction that matters here:
+# a `module avail` listing a release nobody installed is the common failure,
+# and "is the module loadable?" cannot see it.
+fpga-flow-synth  doctor   -              | the tools this flow launches are really installed, not merely advertised
+
+
+# --- fpga-flow-impl: implementation and bitstream. ---------------------------
+#
+# The same tool as synthesis, so this looks redundant - and it is not. It is
+# where a host declares it has the RESOURCES for the long stage: implementation
+# holds a licence for hours and will use every core and several gigabytes per
+# job. A small runner that synthesises happily should not be handed a routing
+# job it will be killed out of at hour two.
+#
+# Set the numbers from your own largest design; there is no useful default,
+# and a default here would be somebody else's design's numbers.
+
+fpga-flow-impl  requires fpga-flow-synth | it consumes what synthesis produced
+fpga-flow-impl  cmd  "[ \"$(nproc 2>/dev/null || echo 0)\" -ge 8 ]"                            | implementation is given NUM_JOBS parallel workers; on fewer cores the run does not fail, it just takes all day and holds the licence while it does
+fpga-flow-impl  cmd  "[ \"$(free -g 2>/dev/null | awk '/^Mem:/{print \$7+0}')\" -ge 16 ]"      | Vivado is killed by the OOM killer rather than failing cleanly, and an OOM kill leaves a half-written checkpoint that looks exactly like a tool crash
+
+
+# --- fpga-flow-deploy: put it on a board. THE HARDWARE TIER. -----------------
+#
+# THIS TIER HAS NO ANALOGUE IN THE ASIC TOOLKIT, and the difference is not
+# cosmetic. Every ASIC capability is a file, a binary or a licence server:
+# things that change when somebody installs software, which is to say rarely
+# and traceably. This tier depends on physical objects - a board powered on, a
+# cable in a socket, a lease nobody else is holding - and each of those can
+# stop being true between the runner being registered and the job landing on
+# it, with no software change at all and nothing in any log.
+#
+# Three consequences, all of them deliberate design here:
+#
+#   1. It is a SEPARATE label, not an extra requirement on fpga-flow-impl. A
+#      host that builds bitstreams well should keep its build label on the
+#      afternoon somebody borrows its cable.
+#   2. It is re-probed as the job's first step, every time. A tag cannot be.
+#   3. It is only ever a NECESSARY condition. The cable is in the socket; the
+#      board answered a moment ago; the lease was free. None of those is a
+#      promise about the next ten minutes, and no probe can be.
+
+fpga-flow-deploy  requires fpga-flow-lint | it reads a bitstream; it does not build one
+
+fpga-flow-deploy  tool  hw_server | the JTAG server every program and readback goes through. It ships with Vivado but is a separate process and is frequently absent from a stripped install
+
+# THE CABLE. USB hardware, probed by VENDOR ID - which names a DEVICE CLASS,
+# not a site, and is therefore allowed here where a /dev path or a serial
+# number would not be. 0403 is FTDI (Digilent JTAG-HS, most vendor cables and
+# every FT2232-based programmer); 03fd is Xilinx (Platform Cable USB, and the
+# programming interface a SOM exposes over USB).
+#
+# What this CANNOT tell you: whether the cable is attached to the board you
+# meant, or to any board at all. The complete probe is hw_server's own target
+# list, and that needs hw_server running and holding the cable - which is the
+# deploy stage's job, not a capability probe's. Say so rather than implying the
+# stronger claim: this asserts a cable is plugged into this host, and nothing
+# about what is on the other end of it.
+fpga-flow-deploy  cmd  "grep -qil -e 0403 -e 03fd /sys/bus/usb/devices/*/idVendor 2>/dev/null" | no JTAG cable is plugged into this host. This does NOT check what the cable is attached to - only hw_server can, and only while it holds the cable
+
+# THE BOARD, THROUGH fpgahub. Two variables, and they are NOT the same
+# namespace: leases, queues and reservations address the board GROUP, while
+# program, reset and actions address a TARGET. Conflating them returns 404,
+# which reads as "the board is down" and is not.
+fpga-flow-deploy  tool  fpgahub                  | the deploy client itself
+fpga-flow-deploy  env   FPGAHUB_BOARD            | the board GROUP - the LEASE scope. Unset means this host has no board configured, whatever hardware is attached to it
+fpga-flow-deploy  env   FPGAHUB_TARGET           | the TARGET - the PROGRAM scope. A different namespace from the group: leases address one, programming addresses the other, and using the wrong one returns 404 rather than an error you can read
+
+# Replace this with whatever your fpgahub client's READ-ONLY probe is. It must
+# be read-only: a capability probe that resets a board is a capability probe
+# that interrupts somebody else's run. It must also RESOLVE THE NAME rather
+# than test the service - a hub that is up and a board group that exists are
+# different facts, and it is the second one that is usually wrong.
+fpga-flow-deploy  cmd  "fpgahub board show \"$FPGAHUB_BOARD\" >/dev/null 2>&1" | the configured board GROUP resolves on this hub right now. A hub that answers and a group that exists are different facts; this asserts the second
+
+
+# --- Things deliberately NOT checked here ------------------------------------
+#
+# GROUP MEMBERSHIP. Inside a container or a user namespace a group cannot be
+# resolved to its NAME while access still works - so a group check denies the
+# label to a host that reads everything perfectly well. `path` and the tool
+# probes answer the question the group check was a proxy for, and answer it
+# correctly in both environments.
+#
+# LICENCE SEAT AVAILABILITY. `doctor` proves a tool runs. It does not prove a
+# seat will be free in four hours' time, and no probe can.
+#
+# THE BOARD'S LEASE. A free lease now is not a lease later, and TAKING one here
+# to prove it would mean a capability probe that holds hardware. The deploy
+# stage takes the lease, and it is the deploy stage that must report clearly
+# when it could not - see ci/tier.sh, which is explicit that a busy board and a
+# bad bitstream both land on the same gate and must be told apart before
+# anybody debugs the design.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
