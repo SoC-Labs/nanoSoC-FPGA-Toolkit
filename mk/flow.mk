@@ -471,8 +471,12 @@ TCLSH           ?= tclsh
 # project sets the ratchet after a first run, with the measurement and the
 # margin written down beside it. A default budget is somebody else's number
 # applied to your design, and it is either vacuous or wrong.
-EXPECT_WNS_MIN        ?= -1
-EXPECT_WHS_MIN        ?= -1
+# EMPTY, not -1, and only for these two. A slack is in nanoseconds and a real
+# budget can legitimately be -1 ns, so the -1 sentinel would make that exact
+# budget inexpressible AND silently unarmed. Count budgets below cannot be
+# negative, so -1 is safe there. CONTRACT.md 3.3.
+EXPECT_WNS_MIN        ?=
+EXPECT_WHS_MIN        ?=
 EXPECT_LUT_MAX        ?= -1
 EXPECT_FF_MAX         ?= -1
 EXPECT_BRAM_MAX       ?= -1
@@ -625,111 +629,127 @@ override SYNTH_OUT_DIR := $(BUILD_DIR)/$(SYNTH_RUN_TAG)/outputs
 #-----------------------------------------------------------------------------
 
 # -- Engine and identity --
+# EXPORTED WITH `=`, NOT `:=`, THROUGHOUT THIS BLOCK.
+#
+# `:=` snapshots here, which is BEFORE mk/*.mk is included and before anything a
+# project assigns after `include mk/flow.mk`. The exported copy and the make
+# variable then disagree, and the way that shows up is the worst possible one:
+# `make env` reads the MAKE variable and prints the project's value, while the
+# Tcl layer reads the EXPORTED copy and gets the engine default. Measured
+# 2026-09-08 - `make env` reported MSG_GATE_ALLOWLIST as {Project 1-1924} while
+# the run manifest for the same invocation recorded `(none)`. A report that
+# disagrees with the run it describes is worse than no report.
+#
+# Three exports below keep `:=` because their name IS the variable they export,
+# so `=` would be an infinite self-reference. They are values the engine
+# normalises in place during parsing, before any include, so a snapshot is
+# correct for them specifically.
+
 export FPGA_FLOW_DIR
 export FPGA_DIR
-export FPGA_PROJECT_ROOT     := $(PROJECT_ROOT)
-export FPGA_BLOCK            := $(BLOCK)
-export FPGA_DESIGN_NAME      := $(DESIGN_NAME)
+export FPGA_PROJECT_ROOT     = $(PROJECT_ROOT)
+export FPGA_BLOCK            = $(BLOCK)
+export FPGA_DESIGN_NAME      = $(DESIGN_NAME)
 
 # -- Target: board pack (project) and part pack (toolkit) --
-export FPGA_BOARD            := $(BOARD)
-export FPGA_BOARD_DIR        := $(BOARD_DIR)
-export FPGA_TARGET           := $(TARGET)
-export FPGA_TARGET_DIR       := $(TARGET_DIR)
-export FPGA_PART             := $(PART)
-export FPGA_PART_DIR         := $(PART_DIR)
-export FPGA_BOARD_PART       := $(BOARD_PART)
-export FPGA_BOARD_REPO_PATHS := $(BOARD_REPO_PATHS)
-export FPGA_FLOW_MODE        := $(FLOW_MODE)
-export FPGA_PLATFORM         := $(PLATFORM)
-export FPGA_SYS_CLK_FREQ_HZ  := $(SYS_CLK_FREQ_HZ)
+export FPGA_BOARD            = $(BOARD)
+export FPGA_BOARD_DIR        = $(BOARD_DIR)
+export FPGA_TARGET           = $(TARGET)
+export FPGA_TARGET_DIR       = $(TARGET_DIR)
+export FPGA_PART             = $(PART)
+export FPGA_PART_DIR         = $(PART_DIR)
+export FPGA_BOARD_PART       = $(BOARD_PART)
+export FPGA_BOARD_REPO_PATHS = $(BOARD_REPO_PATHS)
+export FPGA_FLOW_MODE        = $(FLOW_MODE)
+export FPGA_PLATFORM         = $(PLATFORM)
+export FPGA_SYS_CLK_FREQ_HZ  = $(SYS_CLK_FREQ_HZ)
 
 # -- Run namespace --
-export FPGA_BUILD_DIR        := $(BUILD_DIR)
-export FPGA_RUN_TAG          := $(RUN_TAG)
-export FPGA_RUN_DIR          := $(RUN_DIR)
-export FPGA_WORK_DIR         := $(WORK_DIR)
-export FPGA_LOG_DIR          := $(LOG_DIR)
-export FPGA_REPORT_DIR       := $(REPORT_DIR)
-export FPGA_OUT_DIR          := $(OUT_DIR)
-export FPGA_IN_RUN_TAG       := $(IN_RUN_TAG)
-export FPGA_IN_WORK_DIR      := $(IN_WORK_DIR)
-export FPGA_SYNTH_RUN_TAG    := $(SYNTH_RUN_TAG)
-export FPGA_SYNTH_OUT_DIR    := $(SYNTH_OUT_DIR)
+export FPGA_BUILD_DIR        = $(BUILD_DIR)
+export FPGA_RUN_TAG          = $(RUN_TAG)
+export FPGA_RUN_DIR          = $(RUN_DIR)
+export FPGA_WORK_DIR         = $(WORK_DIR)
+export FPGA_LOG_DIR          = $(LOG_DIR)
+export FPGA_REPORT_DIR       = $(REPORT_DIR)
+export FPGA_OUT_DIR          = $(OUT_DIR)
+export FPGA_IN_RUN_TAG       = $(IN_RUN_TAG)
+export FPGA_IN_WORK_DIR      = $(IN_WORK_DIR)
+export FPGA_SYNTH_RUN_TAG    = $(SYNTH_RUN_TAG)
+export FPGA_SYNTH_OUT_DIR    = $(SYNTH_OUT_DIR)
 
 # -- RTL --
-export FPGA_TOP              := $(TOP)
-export FPGA_RTL_FLIST        := $(RTL_FLIST)
-export FPGA_RTL_FLIST_GEN    := $(RTL_FLIST_GEN)
-export FPGA_RTL_INCDIRS      := $(RTL_INCDIRS)
-export FPGA_RTL_DEFINES      := $(RTL_DEFINES)
-export FPGA_RTL_DEFINES_INBODY := $(RTL_DEFINES_INBODY)
-export FPGA_RTL_DEFINES_NEVER  := $(RTL_DEFINES_NEVER)
-export FPGA_RTL_PARAMS       := $(RTL_PARAMS)
-export FPGA_TOP_HDL          := $(TOP_HDL)
-export FPGA_EXTRA_SRCS       := $(EXTRA_SRCS)
-export FPGA_SV_FILES         := $(SV_FILES)
+export FPGA_TOP              = $(TOP)
+export FPGA_RTL_FLIST        = $(RTL_FLIST)
+export FPGA_RTL_FLIST_GEN    = $(RTL_FLIST_GEN)
+export FPGA_RTL_INCDIRS      = $(RTL_INCDIRS)
+export FPGA_RTL_DEFINES      = $(RTL_DEFINES)
+export FPGA_RTL_DEFINES_INBODY = $(RTL_DEFINES_INBODY)
+export FPGA_RTL_DEFINES_NEVER  = $(RTL_DEFINES_NEVER)
+export FPGA_RTL_PARAMS       = $(RTL_PARAMS)
+export FPGA_TOP_HDL          = $(TOP_HDL)
+export FPGA_EXTRA_SRCS       = $(EXTRA_SRCS)
+export FPGA_SV_FILES         = $(SV_FILES)
 
 # -- IP / BD --
-export FPGA_IP_REPOS         := $(IP_REPOS)
-export FPGA_IP_VENDOR        := $(IP_VENDOR)
-export FPGA_IP_CORE_REV      := $(IP_CORE_REV)
-export FPGA_IP_CACHE_DIR     := $(IP_CACHE_DIR)
-export FPGA_PACKAGE_TCL      := $(PACKAGE_TCL)
-export FPGA_BD_TCL           := $(BD_TCL)
-export FPGA_BD_OVERLAY_TCL   := $(BD_OVERLAY_TCL)
-export FPGA_BD_GLOBAL_SYNTH  := $(BD_GLOBAL_SYNTH)
+export FPGA_IP_REPOS         = $(IP_REPOS)
+export FPGA_IP_VENDOR        = $(IP_VENDOR)
+export FPGA_IP_CORE_REV      = $(IP_CORE_REV)
+export FPGA_IP_CACHE_DIR     = $(IP_CACHE_DIR)
+export FPGA_PACKAGE_TCL      = $(PACKAGE_TCL)
+export FPGA_BD_TCL           = $(BD_TCL)
+export FPGA_BD_OVERLAY_TCL   = $(BD_OVERLAY_TCL)
+export FPGA_BD_GLOBAL_SYNTH  = $(BD_GLOBAL_SYNTH)
 
 # -- Constraints --
-export FPGA_XDC_PINS         := $(XDC_PINS)
-export FPGA_XDC_TIMING       := $(XDC_TIMING)
-export FPGA_XDC_DRC          := $(XDC_DRC)
-export FPGA_XDC_EXTRA        := $(XDC_EXTRA)
-export FPGA_XDC_OPTIONAL     := $(XDC_OPTIONAL)
-export FPGA_XDC_POST_ROUTE   := $(XDC_POST_ROUTE)
-export FPGA_XDC_BASELINE     := $(XDC_BASELINE)
+export FPGA_XDC_PINS         = $(XDC_PINS)
+export FPGA_XDC_TIMING       = $(XDC_TIMING)
+export FPGA_XDC_DRC          = $(XDC_DRC)
+export FPGA_XDC_EXTRA        = $(XDC_EXTRA)
+export FPGA_XDC_OPTIONAL     = $(XDC_OPTIONAL)
+export FPGA_XDC_POST_ROUTE   = $(XDC_POST_ROUTE)
+export FPGA_XDC_BASELINE     = $(XDC_BASELINE)
 
 # -- Firmware --
-export FPGA_FW_APP           := $(FW_APP)
-export FPGA_FW_HEX           := $(FW_HEX)
-export FPGA_FW_HEX_FORMAT    := $(FW_HEX_FORMAT)
+export FPGA_FW_APP           = $(FW_APP)
+export FPGA_FW_HEX           = $(FW_HEX)
+export FPGA_FW_HEX_FORMAT    = $(FW_HEX_FORMAT)
 export FPGA_IMAGE_HEX        := $(FPGA_IMAGE_HEX)
 
 # -- Extension seams --
 # The seam LIST is a file, not a variable, and the path to it is exported so
 # that the flow, the check and `make help` all read THE SAME COPY. Exporting the
 # list itself would create the second copy CONTRACT.md section 6.1 forbids.
-export FPGA_HOOKS_DIR        := $(HOOKS_DIR)
-export FPGA_OVERRIDES_DIR    := $(OVERRIDES_DIR)
-export FPGA_SEAMS_FILE       := $(FPGA_FLOW_DIR)/flow/common/seams.txt
+export FPGA_HOOKS_DIR        = $(HOOKS_DIR)
+export FPGA_OVERRIDES_DIR    = $(OVERRIDES_DIR)
+export FPGA_SEAMS_FILE       = $(FPGA_FLOW_DIR)/flow/common/seams.txt
 # The valid STEP list is `ls $(FPGA_STEPS_DIR)/*.tcl`, derived at run time by
 # whoever needs it. Never enumerated - section 6.2.
-export FPGA_STEPS_DIR        := $(FPGA_FLOW_DIR)/flow/steps
-export FPGA_FLOW_TCL_DIR     := $(FPGA_FLOW_DIR)/flow
+export FPGA_STEPS_DIR        = $(FPGA_FLOW_DIR)/flow/steps
+export FPGA_FLOW_TCL_DIR     = $(FPGA_FLOW_DIR)/flow
 
 # -- Tools --
-export FPGA_VIVADO           := $(VIVADO)
-export FPGA_VIVADO_VER       := $(VIVADO_VER)
-export FPGA_NUM_JOBS         := $(NUM_JOBS)
+export FPGA_VIVADO           = $(VIVADO)
+export FPGA_VIVADO_VER       = $(VIVADO_VER)
+export FPGA_NUM_JOBS         = $(NUM_JOBS)
 export TCLSH
 
 # -- Gates --
-export FPGA_EXPECT_WNS_MIN      := $(EXPECT_WNS_MIN)
-export FPGA_EXPECT_WHS_MIN      := $(EXPECT_WHS_MIN)
-export FPGA_EXPECT_LUT_MAX      := $(EXPECT_LUT_MAX)
-export FPGA_EXPECT_FF_MAX       := $(EXPECT_FF_MAX)
-export FPGA_EXPECT_BRAM_MAX     := $(EXPECT_BRAM_MAX)
-export FPGA_EXPECT_DSP_MAX      := $(EXPECT_DSP_MAX)
-export FPGA_EXPECT_UNROUTED_MAX := $(EXPECT_UNROUTED_MAX)
-export FPGA_EXPECT_BLACKBOX_MAX := $(EXPECT_BLACKBOX_MAX)
-export FPGA_ALLOW_CRITICAL_WARNINGS := $(ALLOW_CRITICAL_WARNINGS)
-export FPGA_MSG_GATE_ALLOWLIST  := $(MSG_GATE_ALLOWLIST)
+export FPGA_EXPECT_WNS_MIN      = $(EXPECT_WNS_MIN)
+export FPGA_EXPECT_WHS_MIN      = $(EXPECT_WHS_MIN)
+export FPGA_EXPECT_LUT_MAX      = $(EXPECT_LUT_MAX)
+export FPGA_EXPECT_FF_MAX       = $(EXPECT_FF_MAX)
+export FPGA_EXPECT_BRAM_MAX     = $(EXPECT_BRAM_MAX)
+export FPGA_EXPECT_DSP_MAX      = $(EXPECT_DSP_MAX)
+export FPGA_EXPECT_UNROUTED_MAX = $(EXPECT_UNROUTED_MAX)
+export FPGA_EXPECT_BLACKBOX_MAX = $(EXPECT_BLACKBOX_MAX)
+export FPGA_ALLOW_CRITICAL_WARNINGS = $(ALLOW_CRITICAL_WARNINGS)
+export FPGA_MSG_GATE_ALLOWLIST  = $(MSG_GATE_ALLOWLIST)
 
 # -- Deploy --
-export FPGA_FPGAHUB_BOARD    := $(FPGAHUB_BOARD)
-export FPGA_FPGAHUB_TARGET   := $(FPGAHUB_TARGET)
-export FPGA_FPGAHUB_TOML     := $(FPGAHUB_TOML)
-export FPGA_BIN_STYLE        := $(BIN_STYLE)
+export FPGA_FPGAHUB_BOARD    = $(FPGAHUB_BOARD)
+export FPGA_FPGAHUB_TARGET   = $(FPGAHUB_TARGET)
+export FPGA_FPGAHUB_TOML     = $(FPGAHUB_TOML)
+export FPGA_BIN_STYLE        = $(BIN_STYLE)
 
 # -- Facts that exist ONLY IN make, and therefore only get out this way ------
 #
@@ -755,7 +775,7 @@ export FPGA_BIN_STYLE        := $(BIN_STYLE)
 #                            symptom is a deploy step that never ran and never
 #                            said it did not. make is the only layer that can
 #                            enumerate a variable nobody named.
-export FPGA_MAKE_VERSION     := $(MAKE_VERSION)
+export FPGA_MAKE_VERSION     = $(MAKE_VERSION)
 export FPGA_ALIASES_USED     := $(strip $(FPGA_ALIASES_USED))
 export FPGA_DERIVED_PRESET   := $(FPGA_DERIVED_PRESET)
 

@@ -243,11 +243,17 @@ TCLSH           ?= tclsh
 ```
 
 **Gates** — every `EXPECT_*` defaults to `-1`, meaning *measure and report, do
-not gate*. A project sets the ratchet after a first run, with the measurement
+not gate*, **except the timing budgets, whose unarmed sentinel is EMPTY.**
+
+`EXPECT_WNS_MIN` and `EXPECT_WHS_MIN` are slacks in nanoseconds and a real
+budget can legitimately be negative, so `-1` as "unarmed" makes a budget of
+exactly -1 ns inexpressible — and, worse, silently unarmed. A count budget
+(LUT, FF, BRAM, unrouted nets) cannot be negative, so `-1` is a safe sentinel
+there and stays. Found 2026-09-08 by the implementation stage. A project sets the ratchet after a first run, with the measurement
 and the margin written down beside it.
 ```
-EXPECT_WNS_MIN        ?= -1
-EXPECT_WHS_MIN        ?= -1
+EXPECT_WNS_MIN        ?=              # EMPTY = unarmed. A slack can be negative,
+EXPECT_WHS_MIN        ?=              # so -1 would hide a real -1 ns budget.
 EXPECT_LUT_MAX        ?= -1
 EXPECT_FF_MAX         ?= -1
 EXPECT_BRAM_MAX       ?= -1
@@ -764,13 +770,30 @@ the standing `FPGA_*` set.
 source [file join $env(FPGA_FLOW_DIR) flow common flow_utils.tcl]
 flow_boot                                  ;# env, part pack, board pack, config
 opt STAGE_KNOB default ;# what it does     ;# knobs, at the left margin
-flow_hook pre_<stage>                      ;# seam
+... set up everything the stage's work needs: sources, constraints,
+    generics, tool properties ...
+flow_hook pre_<stage>                      ;# seam - see below
+... the tool command the stage exists to run (synth_design, route_design, ...)
 ... the work, in flow_step units where a project may reasonably override ...
 flow_hook post_<stage>                     ;# seam, BEFORE the writes (§6.1.3)
 ... write artefacts ...
 <stage>_gate                               ;# the verdict, AFTER the seam
 prov_manifest <stage>                      ;# last
 ```
+
+**Where `pre_<stage>` fires, corrected 2026-09-08.** An earlier draft put it
+immediately after the knob declarations, before the stage had set anything up.
+That makes the shipped `templates/hooks/pre_synth.tcl` impossible: its entire job
+is to assert that a declared parameter or define ACTUALLY REACHED the design,
+which cannot be asked before the generics and sources have been applied. So
+`pre_<stage>` fires **after the stage has prepared its inputs and immediately
+before the tool command it exists to run** — late enough to inspect what the
+tool is about to be given, early enough to stop it.
+
+That is the useful reading of "pre": before the work, not before the setup. A
+seam that fires before anything has been configured can only see the defaults,
+and a hook that can only see defaults cannot check anything a project cares
+about.
 
 ### 12.2 Rules
 
