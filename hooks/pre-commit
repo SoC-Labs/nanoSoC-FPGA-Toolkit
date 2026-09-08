@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+#-----------------------------------------------------------------------------
+# hooks/pre-commit - refuse to commit vendor collateral
+#
+# A GIT HOOK, NOT A FLOW HOOK. It runs when you type `git commit`; it affects no
+# build, no run directory and no bitstream. The flow's extension seams are
+# $(HOOKS_DIR)/<seam>.tcl in the PROJECT and are listed in
+# flow/common/seams.txt - see `make help-hooks`. Two unrelated things in this
+# toolkit are called hooks and the reference toolkit's failure to say which was
+# which cost somebody a wrapper script.
+#
+# Runs ci/check-vendor-collateral.sh --staged --fast --new-lines-only: the SAME
+# rules the CI gate runs, over the INDEX, printing nothing when the index is
+# clean.
+#
+# THE INDEX, NOT THE WORKING TREE, and the distinction is why this is worth
+# having rather than a grep in a wrapper. `git add core.edn` followed by an edit
+# that empties the file on disk leaves a working tree with nothing in it and a
+# commit that publishes a netlist. `git diff --cached` is the only corpus that
+# answers the question a commit hook is actually being asked.
+#
+# BUDGET: under a second, and what it costs is proportional to what is STAGED -
+# not to the size of the repository. That is what makes the budget hold on a tree
+# this hook will still be installed on in five years.
+#
+# WHAT THIS HOOK CANNOT DO, none of it fixable from inside a hook:
+#
+#   * stop `git commit --no-verify`. That is git declining to run the hook, and
+#     nothing here executes to object. hooks/pre-push covers it by re-scanning
+#     from scratch, which is precisely why that layer exists.
+#   * fire on a merge, a cherry-pick, a rebase, an `am` or a revert. git runs
+#     DIFFERENT hooks for two of those and none at all for the rest - see the
+#     table in vc_hook_index_main. hooks/pre-merge-commit and
+#     hooks/pre-applypatch cover the two that can be covered; the others cannot
+#     be, and are again pre-push's problem.
+#   * run at all in a fresh clone. core.hooksPath is LOCAL config and is unset
+#     until somebody runs `make hooks-install`. Nothing in a repository can make
+#     a clone protect itself.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+#-----------------------------------------------------------------------------
+set -uo pipefail
+
+_HD="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -z "$_HD" ] || [ ! -r "$_HD/lib-hook.sh" ]; then
+    printf '\npre-commit: BLOCKED - the hook cannot find its own library (hooks/lib-hook.sh).\n' >&2
+    printf '            A guard that cannot load has not checked anything.\n' >&2
+    exit 1
+fi
+# shellcheck source=hooks/lib-hook.sh
+. "$_HD/lib-hook.sh"
+
+vc_hook_index_main pre-commit || exit 1
+exit 0

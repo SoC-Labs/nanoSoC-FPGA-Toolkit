@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+#-----------------------------------------------------------------------------
+# hooks/pre-push - the last thing between this repository and publication
+#
+# A GIT HOOK, NOT A FLOW HOOK. It runs when you type `git push`; it launches no
+# tool, reads no part or board pack, and writes into no run directory. The flow's
+# extension seams are $(HOOKS_DIR)/<seam>.tcl in the PROJECT and are listed in
+# flow/common/seams.txt.
+#
+# THIS HOOK DOES NOT TRUST THAT pre-commit RAN. `git commit --no-verify` skips
+# it, git offers no way to prevent that, and somebody in a hurry will use it -
+# which is not a character flaw, it is the documented behaviour of the tool. So
+# this layer re-asks the whole question from scratch. If the two layers shared an
+# assumption, a bypass of the first would be a bypass of both, and there would be
+# one layer wearing two names.
+#
+# THE QUESTION IT ASKS, AND THE ONE IT DELIBERATELY DOES NOT
+#
+# The obvious pre-push scans the whole TREE at each pushed commit and refuses if
+# anything in it matches. That answers "is this repository clean?". The question
+# a push actually poses is "does this push make it WORSE?", and on any repository
+# with a backlog the two answers diverge immediately and never reconverge: the
+# tree-clean question refuses a push over content the server ALREADY HAS, in
+# bytes the public already holds, which refusing does not unpublish. What that
+# buys is an unpassable gate, and an unpassable gate is spent through its own
+# escape hatch - the reference toolkit's consuming repository has four
+# VENDOR_CHECK_BYPASS entries in its log, every one of them reading "pre-existing
+# content, not published by this commit". A guard that is right about a number
+# nobody can act on, often enough, stops being a guard and becomes a formality
+# with a log file.
+#
+# So the corpus is unchanged - the whole tree is still READ, because a rule can
+# only fire on what it is shown - and the VERDICT is narrowed to what this push
+# ADDS. git already hands this hook the base to measure against: the fourth field
+# on every stdin line is the sha THE SERVER HAS. Everything the tree scan finds
+# beyond that is still counted, still named and still printed, as a BACKLOG - a
+# number somebody has to own, not a reason to refuse an unrelated push.
+#
+# WHAT THAT DOES NOT GIVE UP, and this is the part worth checking rather than
+# believing. A file this push ADDS is charged WHOLE - the narrowing keeps every
+# line-0 finding for a path the range writes, so `git add core.edn && git push`
+# still fails. A value COPIED to a new line sits on an added line and fails. A
+# file moved wholesale re-adds every line and fails. What is dropped is the line
+# this push did not touch, and only that.
+#
+# IT SCANS TWO THINGS, because they are two different questions:
+#
+#   1. EVERY REF BEING PUSHED, read from stdin. git hands this hook one line per
+#      ref - `<local ref> <local sha> <remote ref> <remote sha>` - and the local
+#      sha is what is about to exist on the server. That is NOT always HEAD:
+#      `git push origin work:main` publishes a ref nobody has checked out, and a
+#      file added in one commit of a pushed range and deleted in the next is
+#      published by the push and appears in no working tree anywhere. This is the
+#      corpus that BLOCKS.
+#
+#   2. THE UNTRACKED, NON-IGNORED FILES. A push does not publish these, so they
+#      WARN and do not block - refusing a push over a file the push does not
+#      contain teaches the reader that the hook is wrong, and it is. They are
+#      still reported in full, every time, because an untracked vendor file in a
+#      directory .gitignore does not cover is the precise shape that breaches, and
+#      it is one `git add -A` from being question 1. The moment it becomes
+#      question 1 it is caught: pre-commit charges a newly added file for every
+#      line of it, and so does this hook's own range scan.
+#
+# BUDGET: a few seconds. The per-push scan is capped (VENDOR_CHECK_MAX_REVS) and
+# SAYS SO OUT LOUD when the cap bites, because a cap that hides is a cap that
+# turns into a hole.
+#
+# WHAT THIS HOOK CANNOT DO: stop `git push --no-verify`. Nothing in a hook can.
+# What it can do is make the quiet path the checked one and leave the loud path
+# loud - VENDOR_CHECK_BYPASS in lib-hook.sh is the escape that leaves a name and
+# a reason behind it.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+#-----------------------------------------------------------------------------
+set -uo pipefail
+
+_HD="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -z "$_HD" ] || [ ! -r "$_HD/lib-hook.sh" ]; then
+    printf '\npre-push: BLOCKED - the hook cannot find its own library (hooks/lib-hook.sh).\n' >&2
+    printf '          A guard that cannot load has not checked anything.\n' >&2
+    exit 1
+fi
+# shellcheck source=hooks/lib-hook.sh
+. "$_HD/lib-hook.sh"
+
+if ! command -v git >/dev/null 2>&1; then
+    vc_hook_block "pre-push" "no git on PATH - this hook cannot read what is being pushed."
+    exit 1
+fi
+
+# The remote NAME, git's first argument. Needed to answer "what does this server
+# already have" for a ref the server does not have yet - see vc_push_base.
+VC_REMOTE="${1:-origin}"
+
+# THE REFS, READ FIRST AND IN FULL. The scanner is invoked with </dev/null by
+# vc_run_scanner; if anything downstream inherited this stdin it would eat the
+# ref list, and the hook would scan whatever was left - which is nothing - and
+# report clean.
+VC_REFS=""
+if [ ! -t 0 ]; then VC_REFS="$(cat)"; fi
+
+ZERO=0000000000000000000000000000000000000000
+
+# Distinct local shas, deletions dropped, EACH WITH THE REMOTE SHA IT IS BEING
+# MEASURED AGAINST. A deletion publishes nothing, and scanning the all-zero sha
+# would fail to resolve and - through the fail-closed path, correctly but
+# uselessly - block every branch deletion in the repository.
+REVS=(); BASES=(); n_del=0
+while read -r _lref lsha _rref rsha; do
+    [ -n "${lsha:-}" ] || continue
+    case "$lsha" in "$ZERO") n_del=$((n_del + 1)); continue ;; esac
+    _seen=0
+    for _r in ${REVS[@]+"${REVS[@]}"}; do [ "$_r" = "$lsha" ] && _seen=1; done
+    [ "$_seen" = 1 ] && continue
+    REVS+=("$lsha"); BASES+=("${rsha:-$ZERO}")
+done <<< "$VC_REFS"
+n_revs="${#REVS[@]}"
+
+## vc_push_base <local sha> <remote sha> - what the server already has, or empty
+##
+## THE ORDINARY CASE is the remote sha git supplied: the ref exists there, and
+## everything reachable from it is published.
+##
+## A NEW BRANCH arrives as the all-zero sha, and "nothing is published" would be
+## the wrong reading - the branch almost always forks from something the server
+## has. The last published ancestor is the parent of the first commit on this line
+## that is on no remote-tracking ref for this remote, which is git's own
+## pre-push.sample idiom (`--not --remotes=<remote>`) read one commit further.
+##
+## EMPTY MEANS NO BASE, and the caller then scans the whole tree - the honest
+## answer for a line with no published ancestor at all, because then the whole
+## tree really is what this push publishes.
+##
+## Remote-tracking refs can be stale, and stale here fails SAFE: a ref this clone
+## has not seen yet makes the base older, so MORE is charged, never less.
+vc_push_base() {
+    local lsha="$1" rsha="$2" first parent
+    if [ "$rsha" != "$ZERO" ] && git rev-parse --verify -q "${rsha}^{commit}" >/dev/null 2>&1; then
+        printf '%s' "$rsha"; return 0
+    fi
+    first="$(git rev-list --topo-order --reverse "$lsha" --not --remotes="$VC_REMOTE" 2>/dev/null | head -1)"
+    ## EMPTY MEANS TWO DIFFERENT THINGS AND THEY NEED DIFFERENT ANSWERS.
+    ## `rev-list <lsha> --not --remotes` is empty when there is NOTHING NEW to
+    ## publish, which is the normal case for a tag pointing at a commit the server
+    ## already has. Falling into the "no published ancestor" arm there charges the
+    ## WHOLE TREE, and every tag on published history is refused over findings it
+    ## is not introducing. So: if lsha is itself reachable from the remote,
+    ## everything is published and the base IS lsha - an empty delta, nothing
+    ## charged. Still fails safe, because it only fires when the commit is
+    ## provably on the remote; an unknown commit keeps the whole-tree behaviour.
+    if [ -z "$first" ]; then
+        if [ -n "$(git branch -r --contains "$lsha" 2>/dev/null | head -1)" ]; then
+            printf '%s' "$lsha"; return 0
+        fi
+        printf ''; return 1
+    fi
+    parent="$(git rev-parse --verify -q "${first}^" 2>/dev/null)" || parent=""
+    printf '%s' "$parent"
+    [ -n "$parent" ]
+}
+
+# A CAP, AND IT ANNOUNCES ITSELF. Pushing forty branches at once would otherwise
+# turn a few seconds into a few minutes and this hook into something people
+# remove. When it bites it says which commits went unscanned, because a silent
+# cap is the same defect as a silent pass.
+VC_MAX_REVS="${VENDOR_CHECK_MAX_REVS:-5}"
+
+OUT="$(mktemp "${TMPDIR:-/tmp}/vc-prepush.XXXXXX")" || {
+    printf '\npre-push: BLOCKED - could not create a temporary file, so the scan did not run.\n' >&2
+    exit 1
+}
+ONE="$(mktemp "${TMPDIR:-/tmp}/vc-prepush1.XXXXXX")"  || { rm -f "$OUT"; exit 1; }
+WARN="$(mktemp "${TMPDIR:-/tmp}/vc-prepushw.XXXXXX")" || { rm -f "$OUT" "$ONE"; exit 1; }
+BACK="$(mktemp "${TMPDIR:-/tmp}/vc-prepushb.XXXXXX")" || { rm -f "$OUT" "$ONE" "$WARN"; exit 1; }
+BACK1="$(mktemp "${TMPDIR:-/tmp}/vc-prepushb1.XXXXXX")" || { rm -f "$OUT" "$ONE" "$WARN" "$BACK"; exit 1; }
+trap 'rm -f "$OUT" "$ONE" "$WARN" "$BACK" "$BACK1" ${VC_FINDINGS:+"$VC_FINDINGS"}' EXIT
+
+# rc_worst: 0 clean, 1 a finding, anything else "could not look" - and the last
+# of those wins over the others, because "we found something" and "we could not
+# look" must never be merged into one verdict.
+rc_worst=0
+vc_note_rc() {
+    case "$1" in
+        0) ;;
+        1) [ "$rc_worst" -eq 0 ] && rc_worst=1 ;;
+        *) rc_worst="$1" ;;
+    esac
+}
+
+CORPUS_LABEL=""
+n_unscoped=0
+
+# --- 1. what this push ADDS to what the server already has --------------------
+n_rev=0
+for _i in ${REVS[@]+"${!REVS[@]}"}; do
+    sha="${REVS[$_i]}"; rsha="${BASES[$_i]}"
+    n_rev=$((n_rev + 1))
+    if [ "$n_rev" -gt "$VC_MAX_REVS" ]; then
+        printf '\n%snote%s  %s more pushed ref(s) were NOT scanned - the per-push cap is %s.\n' \
+            "$_H_YEL" "$_H_OFF" "$((n_revs - VC_MAX_REVS))" "$VC_MAX_REVS" >&2
+        printf '      Raise it with VENDOR_CHECK_MAX_REVS, or scan them by hand:\n' >&2
+        printf '          ci/check-vendor-collateral.sh --rev <commit>\n' >&2
+        break
+    fi
+    base="$(vc_push_base "$sha" "$rsha")" || base=""
+    rc=0
+    : > "$BACK1"
+    if [ -n "$base" ]; then
+        VENDOR_CHECK_BACKLOG_OUT="$BACK1" \
+            vc_run_scanner "$ONE" --rev "$sha" --since "$base" --new-lines-only --fast || rc=$?
+        cat "$BACK1" >> "$BACK" 2>/dev/null
+        _label="what ${sha:0:8} adds since ${base:0:8}"
+    else
+        # No published ancestor. Nothing to subtract, so the whole tree IS the
+        # answer - and it is said out loud, because a scan that silently changed
+        # question is the defect this shape exists to avoid.
+        n_unscoped=$((n_unscoped + 1))
+        vc_run_scanner "$ONE" --rev "$sha" --fast || rc=$?
+        _label="the whole tree at ${sha:0:8} (no published ancestor to measure against)"
+    fi
+    cat "$ONE" >> "$OUT"
+    vc_note_rc "$rc"
+    [ "$rc" -ne 0 ] && CORPUS_LABEL="${CORPUS_LABEL:+$CORPUS_LABEL, }$_label"
+done
+
+# --- 2. the untracked files, which this push does not publish -----------------
+# WARN, NEVER BLOCK - for findings. "Could not run" still blocks, because that is
+# not a result.
+rc=0
+if [ "$n_rev" -gt 0 ]; then
+    vc_run_scanner "$WARN" --untracked-only --fast || rc=$?
+else
+    vc_run_scanner "$WARN" --fast || rc=$?
+fi
+case "$rc" in
+    0|1) ;;
+    *)  cat "$WARN" >> "$OUT"
+        vc_note_rc "$rc"
+        CORPUS_LABEL="${CORPUS_LABEL:+$CORPUS_LABEL, }the untracked files" ;;
+esac
+_untracked_found=0
+[ "$rc" -eq 1 ] && _untracked_found=1
+
+# --- what is not being refused, but is not nothing either ---------------------
+n_back=0
+[ -s "$BACK" ] && n_back=$(sort -u "$BACK" | wc -l | tr -d ' ')
+if [ "${n_back:-0}" -gt 0 ]; then
+    printf '\n%sbacklog%s  %s pre-existing finding(s) in the tree being pushed - already on %s, NOT charged to this push.\n' \
+        "$_H_YEL" "$_H_OFF" "$n_back" "$VC_REMOTE" >&2
+    printf '         They are still published. Nothing here refuses them and nothing here fixes them:\n' >&2
+    sort -u "$BACK" | awk -F'\t' '{ print $2 }' | sort | uniq -c | sort -rn \
+        | awk 'NR<=8 { printf "             %5d  %s\n", $1, $2 }' >&2
+    _nf=$(sort -u "$BACK" | awk -F'\t' '{ print $2 }' | sort -u | wc -l | tr -d ' ')
+    [ "${_nf:-0}" -gt 8 ] && printf '             ... across %s files in total\n' "$_nf" >&2
+    printf '         Full list:  ci/check-vendor-collateral.sh --rev <sha>\n' >&2
+fi
+
+if [ "$_untracked_found" = 1 ]; then
+    printf '\n%swarning%s  untracked, non-ignored files match - this push does NOT publish them,\n' \
+        "$_H_YEL" "$_H_OFF" >&2
+    printf '         and one git add -A would. This is a warning, not a refusal:\n' >&2
+    sed -n '3,22p' "$WARN" >&2
+fi
+
+if [ "$rc_worst" -eq 0 ] && [ "$n_del" -gt 0 ] && [ "$n_revs" -eq 0 ]; then
+    # Nothing but deletions. Silent, deliberately: there is nothing to publish.
+    exit 0
+fi
+
+vc_hook_verdict "pre-push" "${CORPUS_LABEL:-what this push adds}" "$rc_worst" "$OUT" || exit 1
+exit 0

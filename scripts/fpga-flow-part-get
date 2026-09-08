@@ -1,0 +1,191 @@
+#!/usr/bin/env tclsh
+################################################################################
+# fpga-flow-part-get - read part-pack or board-pack values from outside Vivado
+#
+#   fpga-flow-part-get [--part <spec>] <key> [<key> ...]
+#   fpga-flow-part-get  --board <spec>  <key> [<key> ...]
+#   fpga-flow-part-get [--part <spec>] --all
+#
+#   <spec>  a pack directory, a pack file, or a pack name resolved against
+#           $FPGA_FLOW_DIR/part (for --part) or $FPGA_DIR/board (for --board).
+#           Defaults to $FPGA_PART_DIR / $FPGA_BOARD_DIR, which mk/flow.mk
+#           exports, so inside a project this needs no argument.
+#
+# WHY THIS EXISTS
+#
+# The pack is the single place a device constant is written down, and without
+# this script only Vivado could read it. Everything else - a shell script, a
+# Makefile, a deploy hook, a bitstream-conversion step - either hardcodes the
+# number again or takes it as an argument somebody typed.
+#
+# That is how one constant becomes three. The measured case in this lab is
+# BIN_STYLE: Zynq-7000 needs a byte swap and ZynqMP needs a header strip, the
+# conversion succeeds either way, the file is the right size either way, the
+# loader accepts it either way, and the device does not come up. The board pack
+# knows which; before this script, the shell doing the conversion did not, so it
+# was told again, separately, in a variable nobody re-checked against the pack.
+#
+# OUTPUT is manifest-shaped - `<key> <value>` lines - so a caller can eval it,
+# parse it with read, or paste it into a run manifest, and so it matches every
+# other machine-readable thing this toolkit prints.
+#
+#     $ fpga-flow-part-get --part xck26-sfvc784-2LV-c mmcm_primitive pll_primitive
+#     mmcm_primitive MMCME4_ADV
+#     pll_primitive PLLE4_ADV
+#
+# A KEY THE PACK DOES NOT SET IS AN ERROR, NOT AN EMPTY LINE, and when ANY key
+# is missing this prints NOTHING AT ALL. A partial answer is the dangerous
+# shape: a caller reading line by line gets values for the keys that resolved
+# and silently defaults the rest, which is the exact failure the pack API's
+# "an unset optional errors rather than returning empty" rule exists to stop.
+# Printing half an answer here would reintroduce it one process boundary away.
+#
+# IT LOADS THE PACK AND NOTHING ELSE. Not flow_boot: that wants a block name, a
+# run directory it can create and a project manifest, none of which a device
+# constant depends on. Asking "which MMCM does this part have" should not
+# require a project to exist, because the answer is the same before one does -
+# and the callers who need it most (a Makefile, a scaffolding script, a deploy
+# hook) run outside a project or before it is complete.
+#
+# Exit status:
+#   0  every key was printed
+#   1  at least one key is missing, unset or deferred - nothing was printed
+#   2  refused: no pack named, pack does not exist, or pack failed to validate
+# 130  interrupted
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+################################################################################
+
+set HERE     [file dirname [file normalize [info script]]]
+set FLOW_DIR [file normalize [file join $HERE ..]]
+
+proc usage {{rc 2}} {
+    # Printed by reading this file's own header, so help cannot drift from the
+    # file - the same rule the shell scripts follow.
+    set fh [open [info script] r]
+    set n 0
+    while {[gets $fh line] >= 0} {
+        incr n
+        if {$n < 2} { continue }
+        if {[string match "###*" $line]} { break }
+        regsub {^# ?} $line "" line
+        puts stderr $line
+    }
+    close $fh
+    exit $rc
+}
+
+set role ""
+set spec ""
+set keys {}
+set want_all 0
+
+for {set i 0} {$i < [llength $argv]} {incr i} {
+    set a [lindex $argv $i]
+    switch -glob -- $a {
+        --part  { set role part;  incr i; set spec [lindex $argv $i] }
+        --board { set role board; incr i; set spec [lindex $argv $i] }
+        --all   { set want_all 1 }
+        -h - --help { usage 0 }
+        -* {
+            puts stderr "fpga-flow-part-get: unknown option '$a'"
+            usage 2
+        }
+        default { lappend keys $a }
+    }
+}
+
+# NO PACK NAMED IS A REFUSAL, NOT A GUESS. With both FPGA_PART_DIR and
+# FPGA_BOARD_DIR exported - which is what a stage sees - picking one of them
+# would answer a question the caller did not ask, and the two roles share key
+# names (`part` is a board key; `part_name` is a part key). Silence about which
+# pack an answer came from is how a report ends up describing the wrong device.
+if {$role eq ""} {
+    if {[info exists ::env(FPGA_PART_DIR)] && $::env(FPGA_PART_DIR) ne ""} {
+        set role part
+        set spec $::env(FPGA_PART_DIR)
+    } elseif {[info exists ::env(FPGA_BOARD_DIR)] && $::env(FPGA_BOARD_DIR) ne ""} {
+        set role board
+        set spec $::env(FPGA_BOARD_DIR)
+    } else {
+        puts stderr "fpga-flow-part-get: no pack. Pass --part <spec> or --board\
+                     <spec>, or run where FPGA_PART_DIR / FPGA_BOARD_DIR is\
+                     exported (mk/flow.mk exports both)."
+        exit 2
+    }
+} elseif {$spec eq ""} {
+    set var FPGA_[string toupper $role]_DIR
+    if {[info exists ::env($var)] && $::env($var) ne ""} {
+        set spec $::env($var)
+    } else {
+        puts stderr "fpga-flow-part-get: --$role given with no pack, and \$$var\
+                     is not set."
+        exit 2
+    }
+}
+
+if {![llength $keys] && !$want_all} { usage 2 }
+
+set api [file join $FLOW_DIR part pack_api.tcl]
+if {![file exists $api]} {
+    puts stderr "fpga-flow-part-get: no pack API at $api - this checkout of the\
+                 toolkit is incomplete."
+    exit 2
+}
+source $api
+
+# A pack that will not load or will not validate is a REFUSAL (2), not a failed
+# check (1). The distinction matters to a caller: one means "ask a different
+# question", the other means "the pack is broken and no question can be asked".
+if {[catch {pack_load $role $spec} e]} {
+    puts stderr $e
+    exit 2
+}
+
+if {$want_all} { set keys [pack_keys $role] }
+
+set missing {}
+set out {}
+foreach key $keys {
+    if {[catch {pack_has $role $key} present]} {
+        # An unknown key raises rather than answering "no", which is right: a
+        # caller asking for a key that does not exist has a bug, and reporting
+        # it as "the pack does not set it" would send them to the wrong file.
+        if {$want_all} { continue }
+        puts stderr $present
+        exit 2
+    }
+    if {$present} {
+        lappend out [list $key [pack_get $role $key]]
+    } elseif {!$want_all} {
+        lappend missing $key
+    }
+}
+
+if {[llength $missing]} {
+    puts stderr "fpga-flow-part-get: $role pack '[pack_pack_name $role]' does not\
+                 supply: [join $missing {, }]"
+    puts stderr ""
+    puts stderr "  NOTHING HAS BEEN PRINTED, including the keys that did resolve.\
+                 \n  A partial answer is worse than none: a caller reading line by\
+                 \n  line would take the values it got and silently default the\
+                 \n  rest, which is the failure this whole API is built to stop."
+    foreach k $missing {
+        if {[catch {pack_get $role $k} why]} {
+            puts stderr ""
+            puts stderr "  --- $k ---"
+            puts stderr "  $why"
+        }
+    }
+    puts stderr ""
+    puts stderr "  `fpga-flow-part-probe` lists what this pack does resolve on\
+                 this host."
+    exit 1
+}
+
+foreach pair $out {
+    puts "[lindex $pair 0] [lindex $pair 1]"
+}
+exit 0
+
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)

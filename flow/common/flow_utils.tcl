@@ -615,9 +615,22 @@ proc flow_step {name} {
 # spelled something differently, not a guess about one that might.
 ################################################################################
 
+# AN ALIAS WHOSE NAME IS ALSO A REAL SCHEMA KEY NEVER FIRES, AND IS WORSE THAN
+# NO ALIAS. `device` was here, mapping to `part_name`. But the pack schema
+# declares `device` as a key in its own right - the DIE (`xc7z020`) as opposed
+# to the full part string (`xc7z020clg400-1`) - so the alias was dead code that
+# read, to anyone scanning this table, as a promise that `part device` returns
+# the full part string. It returns the die. Two names for two different things,
+# one of which silently loses a package and a speed grade, is exactly the class
+# of confusion an alias table is supposed to remove. Removed 2026-09-08, found
+# by the pack API's own author.
+#
+# THE STANDING HAZARD: this table is NOT validated against the schema, so the
+# next dead alias will be just as invisible. part/pack_api.tcl validates its own
+# alias table at source time; this second table does not. Either it should, or
+# there should not be two tables. Recorded in CONTRACT §8.
 array set ::part_alias {
     name        part_name
-    device      part_name
     buffer      global_buffer
     min_vivado  min_vivado_version
 }

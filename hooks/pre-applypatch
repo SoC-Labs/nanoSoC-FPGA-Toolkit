@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+#-----------------------------------------------------------------------------
+# hooks/pre-applypatch - the same check, for a patch arriving by `git am`
+#
+# A GIT HOOK, NOT A FLOW HOOK. It runs when you type `git am`; it affects no
+# build and no bitstream. The flow's seams are in flow/common/seams.txt.
+#
+# THIS FILE EXISTS BECAUSE pre-commit DOES NOT FIRE ON `git am`. Measured with
+# stub hooks: `git am` runs pre-applypatch and does NOT run pre-commit. A mailed
+# or exported patch is a perfectly ordinary way for a file somebody else staged
+# to land in this repository, and it is the path least likely to be read line by
+# line before it is applied.
+#
+# By the time this runs the patch is already applied to the index and the working
+# tree and the commit has not been made - which is exactly the state --staged
+# reads, so this asks the same question about the same corpus as pre-commit does.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+#-----------------------------------------------------------------------------
+set -uo pipefail
+
+_HD="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -z "$_HD" ] || [ ! -r "$_HD/lib-hook.sh" ]; then
+    printf '\npre-applypatch: BLOCKED - the hook cannot find its own library (hooks/lib-hook.sh).\n' >&2
+    printf '                A guard that cannot load has not checked anything.\n' >&2
+    exit 1
+fi
+# shellcheck source=hooks/lib-hook.sh
+. "$_HD/lib-hook.sh"
+
+vc_hook_index_main pre-applypatch || exit 1
+exit 0

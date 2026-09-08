@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+#-----------------------------------------------------------------------------
+# hooks/pre-merge-commit - the same check, for the commit `git merge` makes
+#
+# A GIT HOOK, NOT A FLOW HOOK. It runs when you type `git merge`; it affects no
+# build and no bitstream. The flow's seams are in flow/common/seams.txt.
+#
+# THIS FILE EXISTS BECAUSE pre-commit DOES NOT FIRE ON A MERGE. Measured with
+# stub hooks: `git merge --no-ff` runs pre-merge-commit and does NOT run
+# pre-commit. A repository protected only by pre-commit therefore has a hole
+# exactly the shape of a merge - and a merge is how somebody else's branch, with
+# somebody else's untracked-then-added board file, arrives in yours.
+#
+# `git merge --ff-only` fires NOTHING, and neither do cherry-pick, rebase, the
+# later stages of `am`, or revert. Those are not fixable from a hook at all.
+# They are what hooks/pre-push is for, and they are why it re-scans instead of
+# trusting that any of these ran.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+#-----------------------------------------------------------------------------
+set -uo pipefail
+
+_HD="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -z "$_HD" ] || [ ! -r "$_HD/lib-hook.sh" ]; then
+    printf '\npre-merge-commit: BLOCKED - the hook cannot find its own library (hooks/lib-hook.sh).\n' >&2
+    printf '                  A guard that cannot load has not checked anything.\n' >&2
+    exit 1
+fi
+# shellcheck source=hooks/lib-hook.sh
+. "$_HD/lib-hook.sh"
+
+vc_hook_index_main pre-merge-commit || exit 1
+exit 0

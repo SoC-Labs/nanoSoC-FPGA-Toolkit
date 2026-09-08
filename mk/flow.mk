@@ -927,8 +927,25 @@ FLOW_VIVADO_DIR := $(FPGA_FLOW_DIR)/flow/vivado
 
 # $(call vivado_stage,<stage-name>,<script>). One definition, seven callers -
 # so a change to the invocation cannot reach six stages and miss the seventh.
+#
+# THE THREE PER-STAGE EXPORTS. flow_utils.tcl's header declares FPGA_STAGE_T0,
+# FPGA_LOG_FILE and FPGA_TOOL_HINT as environment it reads, and for a while this
+# macro exported none of them - so provenance.tcl could only time from its own
+# boot (excluding tool startup) and had to GUESS the log path it was supposed to
+# record. CONTRACT.md's rule for that case is explicit: when the code and the
+# contract disagree, one of them is a bug and you say which. This was the bug.
+#
+# They are set here rather than in the export block above because they are the
+# only three values that differ PER STAGE, and this macro is the one place that
+# knows which stage is starting. `date +%s` is evaluated by the shell when the
+# recipe runs, not by make at parse time, so it is the real launch instant.
 define vivado_stage
-cd "$(WORK_DIR)" && $(VIVADO) -mode batch \
+cd "$(WORK_DIR)" && \
+FPGA_STAGE=$(1) \
+FPGA_STAGE_T0=$$(date +%s) \
+FPGA_LOG_FILE="$(LOG_DIR)/$(1).log" \
+FPGA_TOOL_HINT="$(VIVADO)" \
+$(VIVADO) -mode batch \
     -log "$(LOG_DIR)/$(1).log" -journal "$(LOG_DIR)/$(1).jou" \
     -source "$(2)" < /dev/null
 endef

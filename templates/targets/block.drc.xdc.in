@@ -1,0 +1,143 @@
+#-----------------------------------------------------------------------------
+# fpga/targets/@BOARD@/@BLOCK@.drc.xdc  --  CONFIGURATION, AND WHICH RULES THIS
+#                                           DESIGN IS ALLOWED TO BREAK
+#
+# Scaffolded into @PROJECT@ by `fpga-flow-init` on @DATE@.
+# Named by XDC_DRC in fpga/design.mk. READ IN IMPLEMENTATION ONLY.
+#
+# WHAT BELONGS IN THIS FILE
+#   Configuration properties of the implemented design, and DRC SEVERITY
+#   changes - the rules this design is knowingly, deliberately, in writing,
+#   allowed to break.
+#
+# WHAT DOES NOT
+#   * pins and IO standards  ->  @BLOCK@.pins.xdc
+#   * clocks and exceptions  ->  @BLOCK@.timing.xdc
+#   * A WAIVER. Read the trap below: a waiver cannot live in an XDC at all.
+#
+# ── WHY THIS FILE IS IMPLEMENTATION-ONLY ────────────────────────────────────
+#
+# Nothing in it means anything to synthesis. A DRC severity applies to checks
+# that run on a placed and routed design; a configuration property describes
+# how the device is loaded. Read during synthesis they would apply to a design
+# state that has none of those things - and since Vivado drops a constraint
+# that matches nothing without an error, that would be silence, not a warning.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAP: A WAIVER CANNOT BE read_xdc'd. AT ALL.
+#
+#   `create_waiver` is PROCEDURAL TCL, and Vivado REJECTS procedural Tcl inside
+#   a constraints file. So the file you would naturally write - one waiver per
+#   finding, each with its diagnosis - is not a constraint file, and read_xdc
+#   on it fails in a way that reads like a syntax problem in your waiver.
+#
+#   A waiver goes in XDC_POST_ROUTE, which the flow `source`s as ordinary Tcl
+#   AFTER route_design. That is where it has to go anyway: a waiver waives a
+#   FINDING, and the findings do not exist until the design is routed.
+#
+#       # in design.mk
+#       XDC_POST_ROUTE ?= $(TARGET_DIR)/$(BLOCK).waivers.tcl
+#
+#   Do not use that seam for anything that changes the design. By the time it
+#   runs, place and route are done.
+#
+#   THE DIFFERENCE BETWEEN THE TWO MECHANISMS IS NOT COSMETIC:
+#     set_property SEVERITY   changes how a rule is REPORTED, everywhere, for
+#                             every object, for the life of the file
+#     create_waiver           excuses ONE FINDING, on named objects, with a
+#                             description and an owner recorded in the report
+#   Prefer the waiver. A severity downgrade is a blanket, and the next
+#   violation of that rule - the real one - arrives already silenced.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# ── THE RULE FOR EVERYTHING IN THIS FILE ────────────────────────────────────
+#
+# EVERY ENTRY CARRIES A PARAGRAPH OF DIAGNOSIS AND A NAMED OWNER, beside it,
+# here, in this file. That is the same rule MSG_GATE_ALLOWLIST follows in
+# design.mk and it exists because of the same failure: a list of exemptions
+# nobody can date, attribute or re-derive becomes a list nobody dares remove,
+# and a gate that carries it passes on the defect it was written to catch.
+#
+# An entry with no diagnosis is not a decision, it is a residue.
+#
+# ── EVERY .xdc HERE MUST BE NAMED BY A VARIABLE IN design.mk ────────────────
+#
+# An .xdc in this directory that no variable names is an ERROR from
+# `make check`, deliberately: the flow this replaces discovered constraints by
+# a glob and silently ignored anything named differently.
+#
+# ── IF THIS DESIGN NEEDS NOTHING HERE ───────────────────────────────────────
+#
+# Delete the marked lines below and leave the file. It is legitimately empty of
+# constraints on a first build, and `make check` warns about an all-comments
+# file only for XDC_PINS - where empty means "unconstrained pins" - and not for
+# this one, where empty means "no rule is being bent".
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+#-----------------------------------------------------------------------------
+
+
+#### 1. CONFIGURATION PROPERTIES ###############################################
+#
+# BEFORE YOU SET ONE HERE: check whether the PART PACK already declares it.
+# `cfgbvs`, `config_voltage` and `bitstream_compress` are part-pack keys -
+# facts about the device and how it is configured, which every project on that
+# device wants the same answer to - and `make part-probe` prints what the pack
+# resolved without launching a tool.
+#
+# Setting one in both places gives one fact two sources, and the one that wins
+# is whichever is applied last. If the pack is wrong, fix the pack; if this
+# board needs something different from every other board with that device, set
+# it here and write down which board fact makes it different.
+#
+# set_property CFGBVS         <VCCO|GND>  [current_design]
+# set_property CONFIG_VOLTAGE <volts>     [current_design]
+#
+# Bitstream properties are properties of the implemented design too. Compression
+# changes the SIZE of the .bit and nothing else about the design - and the .bin
+# conversion that follows it is board-family dependent (BIN_STYLE: zynq7 needs
+# a byte swap, zynqmp a header strip, and the wrong one corrupts a load that
+# reports no error).
+#
+# set_property BITSTREAM.GENERAL.COMPRESS <TRUE|FALSE> [current_design]
+
+
+#### 2. DRC SEVERITY CHANGES ###################################################
+#
+# One block per rule. Fill in the markers or DELETE THIS BLOCK - an
+# undiagnosed exemption is worse than no file, and a scaffold that shipped one
+# already downgraded would be handing every new project somebody else's
+# undiagnosed exemption, which is exactly how a gate comes to pass on the
+# defect it was written to catch.
+#
+# WHAT TO WRITE IN THE MARKERS
+#   rule    the DRC check id, exactly as the implementation report prints it
+#   why     what the tool is objecting to, why it is not true of this design,
+#           and how that was established - the run, the date, the report
+#   owner   a person. Not a team, not "TBD"
+#
+# rule:  <<FILL IN: the DRC rule id, from the first implementation run's report>>
+# why:   <<FILL IN: the diagnosis - what the rule objects to and why it is wrong here>>
+# owner: <<FILL IN: who owns this decision>>
+# set_property SEVERITY {Warning} [get_drc_checks <the rule id above>]
+#
+# A rule id that does not exist matches nothing and reports nothing, so a typo
+# here is a downgrade that never happened AND a rule you believe is silenced.
+# `get_drc_checks` with no argument lists them in a Vivado shell:
+#     make vivado-shell
+
+
+#### 3. WHAT THE FLOW ALREADY GATES, SO YOU DO NOT REPEAT IT HERE ##############
+#
+# EXPECT_UNROUTED_MAX and EXPECT_BLACKBOX_MAX default to ZERO in design.mk, not
+# to -1, because unlike a resource budget there is no design for which the
+# right answer is "some": an unrouted net is not a tight number, it is a
+# bitstream that does not implement the schematic, and a black box is a module
+# the tools never read.
+#
+# ALLOW_CRITICAL_WARNINGS defaults to 0 for the same reason. Do not downgrade a
+# critical warning here to get a build through - the flow's message gate is
+# where that decision is recorded, with its diagnosis and its owner, and one
+# place to look is worth more than two ways to do it.
+
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)

@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+#-----------------------------------------------------------------------------
+# fpga-flow-hooks - install, remove and prove the vendor-collateral GIT hooks
+#
+#   fpga-flow-hooks install   [<repo>] [--force]  point <repo> at the toolkit's hooks/
+#   fpga-flow-hooks uninstall [<repo>] [--force]  put it back the way it was
+#   fpga-flow-hooks status    [<repo>]            what is installed, and does it work
+#   fpga-flow-hooks selftest  [<repo>]            prove the installed hook can say no
+#
+# <repo> defaults to the current directory, and is normally the PROJECT rather
+# than this toolkit - the project is the one being published.
+#
+# Exit: 0 ok, 1 a check failed, 2 refused or unusable input.
+#
+#-----------------------------------------------------------------------------
+# THESE ARE GIT HOOKS. THEY ARE NOT FLOW HOOKS. The word means two unrelated
+# things in this toolkit and this script only ever means the first:
+#
+#   FLOW HOOK   $(HOOKS_DIR)/<seam>.tcl in the PROJECT, sourced by a build stage
+#               at a seam named in flow/common/seams.txt. Runs during a build,
+#               affects the bitstream. `make help-hooks` is about those.
+#   GIT HOOK    hooks/pre-commit and friends, run by git, refusing to commit or
+#               push vendor collateral. This script installs those. It launches
+#               no tool, reads no part or board pack, writes into no run
+#               directory, and affects nothing in any build, ever. It edits ONE
+#               git config key.
+#
+# The reference ASIC toolkit carries both meanings under one word, and it is a
+# live source of confusion: somebody looking for the extension seams finds the
+# git-hook installer, concludes the flow has no seams, and writes a wrapper
+# script instead. Every header in this layer says which kind it is in its first
+# two lines, on purpose.
+#
+# WHY core.hooksPath AND NOT A COPY INTO .git/hooks
+#
+# `.git/hooks` is not tracked and never can be. A hook that lives only there
+# protects the one machine it was typed on, cannot be reviewed in a pull request,
+# cannot be fixed for everybody at once, and silently reverts to nothing on a
+# fresh clone - which is the state most people's checkout is in on the day it
+# matters. Copying files there also means the copies DRIFT: the thing being
+# reviewed and the thing being run become two different files, with no mechanism
+# that notices.
+#
+# `core.hooksPath` points git at a TRACKED directory instead. The hook that runs
+# is the hook in the repository, at the revision the repository is on, and
+# updating it is a merge rather than an email asking everybody to re-run an
+# installer.
+#
+# THE PRICE, WHICH THIS SCRIPT REFUSES TO PAY QUIETLY: setting core.hooksPath
+# DISABLES EVERY EXISTING HOOK IN .git/hooks. Not overrides - disables; git stops
+# looking there entirely. Somebody's commit-msg hook, their Husky install, their
+# site's push guard: all silently inert, with no message from git and nothing in
+# `git status`. So `install` LOOKS FIRST, names what it is about to switch off,
+# and refuses unless told --force. A security tool whose installation quietly
+# removes another security tool has made things worse.
+#
+# THE SUBMODULE CASE, which is the deployment here and is the one that breaks
+# naive installers. In a submodule `.git` is a FILE holding `gitdir: ../../.git/
+# modules/<path>`, so anything that writes to `$repo/.git/hooks/pre-commit`
+# creates a file inside a text file's directory, or beside it, and reports
+# success. This script never touches `.git` as a path at all: it asks `git
+# config` and `git rev-parse --git-dir`, both of which resolve the indirection,
+# and its self-test COMMITS in a throwaway repository to prove the hook actually
+# FIRES rather than merely that the config was written.
+#
+# WHAT IT DOES NOT DO: INSTALL ITSELF. mk/hooks.mk makes no target here a
+# prerequisite of anything, and nothing in the flow invokes one. A build system
+# that quietly turns off somebody else's guard while they were waiting on an
+# implementation run is not a thing to be clever about.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+#-----------------------------------------------------------------------------
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FLOW_DIR="$(cd "$HERE/.." && pwd)"
+HOOKS_SRC="$FLOW_DIR/hooks"
+SCANNER="$FLOW_DIR/ci/check-vendor-collateral.sh"
+
+if [ -t 1 ]; then
+    _R=$'\033[31m'; _G=$'\033[32m'; _Y=$'\033[33m'; _O=$'\033[0m'
+else
+    _R=""; _G=""; _Y=""; _O=""
+fi
+say()  { printf '   %s\n' "$*"; }
+ok()   { printf '%s  ok %s%s\n' "$_G" "$_O" "$*"; }
+bad()  { printf '%sFAIL%s  %s\n' "$_R" "$_O" "$*" >&2; }
+warn() { printf '%swarn%s  %s\n' "$_Y" "$_O" "$*"; }
+
+# The usage text is the file's own header, sed-ed out of it, so help cannot drift
+# from the file (CONTRACT.md 10).
+usage() { sed -n '3,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+ACTION="${1:-status}"
+case "$ACTION" in
+    -h|--help|help) usage; exit 0 ;;
+esac
+shift 2>/dev/null || true
+
+FORCE=0
+REPO=""
+for a in "$@"; do
+    case "$a" in
+        --force) FORCE=1 ;;
+        -*) bad "unknown option $a"; usage >&2; exit 2 ;;
+        *)  REPO="$a" ;;
+    esac
+done
+REPO="${REPO:-$PWD}"
+
+# THE HOOKS THEMSELVES MUST EXIST BEFORE ANY CONFIG IS WRITTEN. Pointing
+# core.hooksPath at a directory that is not there does not fail loudly - git
+# finds no hook and runs none, which is indistinguishable from a repository with
+# no protection at all, and which looks installed in `git config`.
+VC_HOOK_NAMES="pre-commit pre-merge-commit pre-applypatch pre-push"
+for h in $VC_HOOK_NAMES lib-hook.sh; do
+    if [ ! -r "$HOOKS_SRC/$h" ]; then
+        bad "$HOOKS_SRC/$h is missing - refusing to point a repository at an incomplete hooks directory"
+        exit 2
+    fi
+done
+
+if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+    bad "$REPO is not a git repository (or its .git is unreadable)"
+    exit 2
+fi
+GITDIR="$(git -C "$REPO" rev-parse --git-dir 2>/dev/null)"
+case "$GITDIR" in /*) ;; *) GITDIR="$(cd "$REPO" && cd "$GITDIR" && pwd)" ;; esac
+TOPLEVEL="$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$REPO")"
+
+## existing_hooks <dir> - the non-sample, executable hooks git uses TODAY
+existing_hooks() {
+    local d="$1" f
+    [ -d "$d" ] || return 0
+    for f in "$d"/*; do
+        [ -f "$f" ] || continue
+        case "$f" in *.sample) continue ;; esac
+        [ -x "$f" ] || continue
+        printf '%s\n' "${f##*/}"
+    done
+}
+
+current_path() { git -C "$REPO" config --get core.hooksPath 2>/dev/null || true; }
+
+#-----------------------------------------------------------------------------
+case "$ACTION" in
+
+install)
+    cur="$(current_path)"
+    if [ -n "$cur" ] && [ "$cur" != "$HOOKS_SRC" ]; then
+        if [ "$FORCE" != 1 ]; then
+            bad "core.hooksPath is already set to $cur"
+            say "Something else owns the hooks in this repository. Read it, decide, then"
+            say "re-run with HOOKS_FORCE=--force if the toolkit's hooks should replace it."
+            exit 1
+        fi
+        warn "replacing an existing core.hooksPath: $cur"
+    fi
+
+    # THE HOOKS ABOUT TO BE SWITCHED OFF. Only meaningful when core.hooksPath is
+    # not already redirected, because that is the case where git is reading
+    # $GITDIR/hooks right now.
+    if [ -z "$cur" ]; then
+        found="$(existing_hooks "$GITDIR/hooks")"
+        if [ -n "$found" ]; then
+            if [ "$FORCE" != 1 ]; then
+                bad "setting core.hooksPath would SILENTLY DISABLE the hooks already in $GITDIR/hooks:"
+                printf '%s\n' "$found" | sed 's/^/           /' >&2
+                say ""
+                say "git stops looking in that directory entirely - it does not merge them, and"
+                say "it does not warn. Move what you want to keep into a repository-tracked"
+                say "hook, or re-run with HOOKS_FORCE=--force having decided they are"
+                say "expendable. A guard that quietly removes another guard is not an install."
+                exit 1
+            fi
+            warn "these hooks in $GITDIR/hooks are being disabled by core.hooksPath:"
+            printf '%s\n' "$found" | sed 's/^/           /'
+        fi
+    fi
+
+    # ABSOLUTE, deliberately. git resolves a RELATIVE core.hooksPath against the
+    # directory the hook runs in, which is the top of the working tree for some
+    # hooks and is not documented to be for all of them - and in a submodule the
+    # answer differs again. An absolute path has one meaning. It is
+    # machine-specific, which is correct: .git/config is machine-specific, and the
+    # thing under review is the tracked hooks/ directory, not this pointer.
+    if ! git -C "$REPO" config core.hooksPath "$HOOKS_SRC"; then
+        bad "could not write core.hooksPath into this repository's config"
+        exit 1
+    fi
+
+    # EXEC BITS. A checkout that came through an export, a zip or a copy that
+    # dropped the mode leaves git finding the hook and declining to run it -
+    # silently, and looking exactly like a clean tree.
+    for h in $VC_HOOK_NAMES; do
+        chmod +x "$HOOKS_SRC/$h" 2>/dev/null || true
+        [ -x "$HOOKS_SRC/$h" ] || { bad "$HOOKS_SRC/$h is not executable and could not be made so - git will silently skip it"; exit 1; }
+    done
+
+    ok "core.hooksPath -> $HOOKS_SRC"
+    say "repository: $TOPLEVEL"
+    say "git dir:    $GITDIR"
+    say ""
+    say "pre-commit        blocks a commit whose STAGED content matches a vendor rule"
+    say "pre-merge-commit  the same, for the commit \`git merge --no-ff\` makes"
+    say "pre-applypatch    the same, for a patch arriving by \`git am\`"
+    say "pre-push          re-scans what the push ADDS, trusting none of the above"
+    say ""
+    say "WHAT IS STILL NOT COVERED, so you know what you have:"
+    say "  git commit --no-verify and git push --no-verify skip hooks entirely."
+    say "  cherry-pick, rebase, revert and merge --ff-only fire NO hook at all."
+    say "  A fresh clone has none of this until somebody runs this installer."
+    say "  pre-push is the only layer that sees all of those; it is not a second"
+    say "  opinion, it is the one that has to be right."
+    say ""
+    say "Prove it can say no before you trust it:  make hooks-selftest"
+    ;;
+
+uninstall)
+    cur="$(current_path)"
+    if [ -z "$cur" ]; then
+        ok "nothing to remove - core.hooksPath is not set in this repository"
+        exit 0
+    fi
+    if [ "$cur" != "$HOOKS_SRC" ] && [ "$FORCE" != 1 ]; then
+        bad "core.hooksPath is $cur, which is not this toolkit's hooks directory"
+        say "Refusing to unset somebody else's configuration. HOOKS_FORCE=--force if you mean it."
+        exit 1
+    fi
+    git -C "$REPO" config --unset core.hooksPath || { bad "could not unset core.hooksPath"; exit 1; }
+    ok "core.hooksPath removed - git is reading $GITDIR/hooks again"
+    found="$(existing_hooks "$GITDIR/hooks")"
+    [ -n "$found" ] && { say "and these are live again:"; printf '%s\n' "$found" | sed 's/^/           /'; }
+    say ""
+    say "This repository now has NO commit-time or push-time vendor-collateral guard."
+    say "CI still runs the same scanner - after the push, which for a public"
+    say "repository is a notification and not a gate."
+    ;;
+
+status)
+    cur="$(current_path)"
+    printf '\n== vendor-collateral GIT hooks - %s ==\n' "$TOPLEVEL"
+    say "git dir        $GITDIR"
+    say "toolkit hooks  $HOOKS_SRC"
+    say "(these are GIT hooks. The flow's seams are flow/common/seams.txt - make help-hooks)"
+    rc=0
+    if [ -z "$cur" ]; then
+        warn "core.hooksPath is NOT set - git is running $GITDIR/hooks, which is untracked"
+        found="$(existing_hooks "$GITDIR/hooks")"
+        [ -n "$found" ] && { say "what is there now:"; printf '%s\n' "$found" | sed 's/^/           /'; }
+        say ""
+        say "Install with:  make hooks-install"
+        exit 1
+    fi
+    if [ "$cur" = "$HOOKS_SRC" ]; then
+        ok "core.hooksPath -> $cur"
+    else
+        warn "core.hooksPath -> $cur   (not this toolkit)"
+    fi
+    for h in $VC_HOOK_NAMES; do
+        if   [ -x "$cur/$h" ]; then ok "$h present and executable"
+        elif [ -f "$cur/$h" ]; then bad "$h is present but NOT EXECUTABLE - git will skip it without a word"; rc=1
+        else                        bad "$h is missing from $cur"; rc=1
+        fi
+    done
+    say ""
+    say "not covered by any of them: --no-verify, cherry-pick, rebase, revert,"
+    say "merge --ff-only, and any clone where this installer has not been run"
+    if [ -r "$SCANNER" ]; then
+        ok "scanner present at ci/check-vendor-collateral.sh"
+    else
+        bad "the scanner is missing - the hooks will BLOCK every commit until it is back"
+        rc=1
+    fi
+    log="$GITDIR/vendor-check-bypass.log"
+    if [ -s "$log" ]; then
+        n=$(wc -l < "$log" | tr -d ' ')
+        warn "$n recorded bypass(es) in $log"
+        tail -3 "$log" | awk -F'\t' '{ printf "           %s  %s  %s\n", $1, $2, $8 }'
+    else
+        say "no bypass has been recorded here"
+    fi
+    exit $rc
+    ;;
+
+selftest)
+    # A HOOK NOBODY HAS WATCHED FAIL IS NOT KNOWN TO WORK, and a check that
+    # cannot fail is not a check. Everything below happens in a THROWAWAY
+    # repository under $TMPDIR - never in $REPO - and the specimen is INVENTED.
+    cur="$(current_path)"
+    [ -n "$cur" ] || { bad "hooks are not installed in $TOPLEVEL - nothing to test"; say "Install them first:  make hooks-install"; exit 1; }
+
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/vc-hookselftest.XXXXXX")" || exit 2
+    trap 'rm -rf "$tmp"' EXIT
+    fails=0
+
+    printf '\n== hook self-test - a throwaway repository at %s ==\n' "$tmp"
+    say "the hooks under test are the INSTALLED ones: $cur"
+
+    git -C "$tmp" init -q >/dev/null 2>&1 || { bad "could not create a throwaway git repository"; exit 2; }
+    git -C "$tmp" config user.email selftest@example.invalid
+    git -C "$tmp" config user.name  "hook selftest"
+    git -C "$tmp" config core.hooksPath "$cur"
+
+    # 1. A CLEAN TREE MUST COMMIT. Tested FIRST and tested at all because a hook
+    #    that blocks everything passes every "does it refuse" test ever written
+    #    and is useless. The refusal below only means something if this succeeds.
+    printf 'notes for a throwaway repository\n' > "$tmp/notes.txt"
+    git -C "$tmp" add notes.txt >/dev/null 2>&1
+    if git -C "$tmp" commit -q -m "clean" >/dev/null 2>&1; then
+        ok "a clean tree commits - the hook is not simply refusing everything"
+    else
+        bad "the installed hook refused a CLEAN commit"
+        say "A guard that blocks everything is not stricter, it is broken, and the"
+        say "refusal test below would pass on a hook that does nothing but refuse."
+        git -C "$tmp" commit -m "clean" 2>&1 | sed 's/^/        /' >&2
+        fails=$((fails + 1))
+    fi
+
+    # 2. THE PLANTED SPECIMEN MUST BE BLOCKED. INVENTED: three words of
+    #    encrypted-IP envelope syntax and a 9999 version. There is no vendor
+    #    payload here and there never may be - a detector shipping the thing it
+    #    detects is the disclosure it was written to prevent.
+    {
+        printf 'module specimen_9999;\n'
+        printf '`pragma protect begin_protected\n'
+        printf '`pragma protect key_keyowner = "SPECIMEN VENDOR"\n'
+        printf 'endmodule\n'
+    } > "$tmp/specimen_core.v"
+    git -C "$tmp" add specimen_core.v >/dev/null 2>&1
+    if git -C "$tmp" commit -q -m "specimen" >/dev/null 2>&1; then
+        bad "the installed pre-commit hook let an INVENTED encrypted-IP specimen through"
+        say "It is configured and it is not working. Do not rely on it."
+        fails=$((fails + 1))
+    else
+        ok "the installed pre-commit hook refused an invented encrypted-IP specimen"
+    fi
+
+    # 3. THE BYPASS MUST WORK. An escape hatch nobody can use is an escape hatch
+    #    that gets replaced by --no-verify, which leaves no record at all.
+    if VENDOR_CHECK_BYPASS="fpga-flow-hooks selftest, invented specimen, not a vendor file" \
+       git -C "$tmp" commit -q -m "specimen" >/dev/null 2>&1; then
+        ok "VENDOR_CHECK_BYPASS with a reason let the commit through"
+    else
+        bad "VENDOR_CHECK_BYPASS did not let the commit through - the escape hatch is broken"
+        fails=$((fails + 1))
+    fi
+
+    # 4. AND IT MUST LEAVE A RECORD. A silent bypass is --no-verify with extra
+    #    steps. Read through `git rev-parse --git-dir` and not as "$tmp/.git",
+    #    because that string is a FILE in the submodule deployment.
+    tmpgit="$(git -C "$tmp" rev-parse --git-dir 2>/dev/null)"
+    case "$tmpgit" in /*) ;; *) tmpgit="$tmp/$tmpgit" ;; esac
+    if [ -s "$tmpgit/vendor-check-bypass.log" ]; then
+        ok "and left a record in \$GIT_DIR/vendor-check-bypass.log"
+        sed 's/^/           /' "$tmpgit/vendor-check-bypass.log" | cut -c1-150
+    else
+        bad "the bypass left NO record - a silent bypass is --no-verify with extra steps"
+        fails=$((fails + 1))
+    fi
+
+    # 5. EVERY RULE IN THE SCANNER MUST STILL FIRE, and none may fire on a near
+    #    miss. This is the check the four above cannot make: they exercise ONE
+    #    rule through ONE hook. A rule that has stopped matching reports zero
+    #    findings over a tree full of them, and the only symptom is silence.
+    if [ ! -r "$SCANNER" ]; then
+        bad "the scanner is not readable at $SCANNER - the rules cannot be armed"
+        fails=$((fails + 1))
+    elif CI_COLOUR=0 bash "$SCANNER" --arm-only > "$tmp/arm.out" 2>&1; then
+        ok "$(sed -n 's/^ *ok vendor.arm *//p' "$tmp/arm.out" | head -1)"
+    else
+        bad "the scanner's own rules did not arm - it cannot be trusted to find anything"
+        sed 's/^/        /' "$tmp/arm.out" >&2
+        fails=$((fails + 1))
+    fi
+
+    # 6. AND THE CENSUS MUST BE ABLE TO REFUSE. An empty corpus is the failure
+    #    this whole layer is shaped around: the reference guard iterated a glob
+    #    that matched nothing, reported OK, and did so for months. So a
+    #    repository with no tracked file must come back UNVERIFIED (exit 2) and
+    #    not clean. Run in a SECOND throwaway repository, because the first one
+    #    now has commits.
+    empty="$tmp/empty"
+    mkdir -p "$empty" && git -C "$empty" init -q >/dev/null 2>&1
+    ( cd "$empty" && CI_COLOUR=0 bash "$SCANNER" > "$tmp/census.out" 2>&1 )
+    crc=$?
+    if [ "$crc" -eq 2 ]; then
+        ok "an empty corpus is refused (exit 2), not reported clean"
+    else
+        bad "a repository with NO tracked file exited $crc - zero files scanned must be UNVERIFIED, never OK"
+        sed -n '1,12p' "$tmp/census.out" | sed 's/^/        /' >&2
+        fails=$((fails + 1))
+    fi
+
+    printf '\n'
+    if [ "$fails" -gt 0 ]; then
+        bad "$fails of 6 self-test check(s) failed - the hooks in this repository are NOT known to work"
+        exit 1
+    fi
+    ok "6 of 6: clean commits, specimen blocked, bypass works, bypass recorded, every rule armed, empty corpus refused"
+    say ""
+    say "What this does NOT prove: that anyone has run it on the machine that"
+    say "matters. core.hooksPath is local config, and a fresh clone has none of"
+    say "this until somebody types make hooks-install."
+    ;;
+
+*)
+    bad "unknown action: $ACTION"
+    usage >&2
+    exit 2 ;;
+esac
+exit 0

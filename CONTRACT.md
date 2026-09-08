@@ -59,6 +59,22 @@ That is the whole requirement; if an agent finds itself wanting to add a
 board name, a pin, or an XDC path to this repo, that is the signal the contract
 is wrong. Raise it, do not add the file.
 
+### 1.1 This repository ships FLOW, never COLLATERAL
+
+Normative, and enforced by `ci/check-vendor-collateral.sh` in front of every
+commit, merge, patch and push. Nothing may be committed here that is: encrypted
+or licensed vendor IP, a vendor-catalogue `.xci`/`.xcix`, a board file, a
+bitstream, a `.dcp`/`.ltx`/`.xsa`/`.hwh`, a file copied out of a vendor install
+tree, or anything carrying a vendor EULA or confidentiality header.
+
+The mechanism for needing one anyway is a **path in a variable, resolved on the
+host** — never a vendored file. `VENDOR_COLLATERAL.md` holds the detail.
+
+The rule extends to `.gitignore`: a path that might be collateral must NOT be
+ignored, because the scanner reads the untracked corpus too, and that is the
+half which catches the file that sits in a working tree for three weeks and then
+goes in under `git add -A`.
+
 ---
 
 ## 2. The entry contract
@@ -187,6 +203,14 @@ XDC_POST_ROUTE  ?=                    # `source`d AFTER route_design, NOT
                                       # read_xdc'd. Vivado rejects procedural
                                       # Tcl in an XDC; a DRC waiver needs it.
 ```
+
+**THE ENGINE SETS THE READ WINDOW, FROM THE VARIABLE THAT NAMED THE FILE.**
+Settled 2026-09-08. `XDC_PINS` gets `USED_IN_SYNTHESIS true` and
+`USED_IN_IMPLEMENTATION true`; `XDC_TIMING` and `XDC_DRC` get
+`USED_IN_SYNTHESIS false`. The project does not set those properties and must
+not need to — the whole point of naming a file in a role-specific variable is
+that the role is then known. `flow/vivado/*.tcl` must match this when it lands;
+if it does not, one of the two is a bug and this line says which.
 
 **Firmware** — a bitstream co-dependency, not a separate build.
 ```
@@ -330,7 +354,11 @@ Every stage writes `$(REPORT_DIR)/<stage>_manifest.txt`, in this order:
 
 1. **Header** — `date runtime_s stage run_tag host user tool tool_version log_file`
 2. **Provenance** — `prov.design.git_{describe,sha,dirty}`; for each input file
-   `path / sha256 / bytes`; `prov.part.name`, `prov.part.pack_sha256`,
+   `path / sha256 / bytes`, where a path INSIDE the project, the toolkit or the
+   run tree is rewritten to a `<project>/...`-style label (so two runs under
+   different build roots compare equal instead of differing in every path
+   field) and anything OUTSIDE all three is a site path and appears only as a
+   `sha256:` digest; `prov.part.name`, `prov.part.pack_sha256`,
    `prov.board.name`, `prov.board.pack_sha256`. Any site path is recorded as a
    `sha256:` digest, **never** as the raw path — a manifest gets pasted into bug
    reports and a mount point is inventory-shaped disclosure.
@@ -340,6 +368,10 @@ Every stage writes `$(REPORT_DIR)/<stage>_manifest.txt`, in this order:
 6. **`hooks_run`** — `pre_synth(2s)` or `(none)`
 7. **Every registered knob and its resolved value**, enumerated from the `opt`
    declarations in the flow scripts — *not* a hand-maintained list, which drifts.
+   Knobs DECLARED but not read by this stage are emitted too, marked
+   `UNVERIFIED:declared-in-<file>-not-sourced-by-this-stage`. Emitting only
+   what was read would let a reader diff two stages and conclude they agreed
+   about a knob neither of them saw.
 
 Every field is a value or an `UNVERIFIED:<reason>` string. `compare-runs`
 **refuses** (exit 2) a comparison where either side is UNVERIFIED, or where the
@@ -403,7 +435,40 @@ Four required properties:
   result traces to the project code that shaped it
 
 A file in `hooks/` whose name is not a seam **never runs**. `make check` warns,
-naming the file and listing the valid seams.
+naming the file and listing the valid seams — except for plain documentation
+(`README*`, a licence, a dotfile, an editor turd), which is skipped. A warning
+that fires on every scaffolded project from its first run is worse than no
+warning: it teaches the reader to skim the block, and the run where that block
+says something real scrolls past unread.
+
+### 6.1.1 A shipped check that is not yet configured
+
+Settled 2026-09-08. A hook the toolkit *scaffolds* carries a declaration table
+the project must fill in. Until it is filled in, the hook **refuses** — exit 2,
+"nothing was measured" — and says so on every run. It must not pass quietly, and
+it must not fail as though it had measured something and found it wrong. The
+three honest ways out are stated in the hook itself: declare the expectation,
+move the file to a seam you do use, or delete it. Deleting it is a legitimate
+answer and the template says so.
+
+An **unknown key** in such a declaration table is **fatal**, not ignored: an
+expectation nothing reads is worse than no expectation, because it looks like
+cover.
+
+### 6.1.2 Hook configuration lives in the manifest
+
+A project's hook expectations are declared in `design.mk` like any other
+contract value, exported to the Tcl layer, and registered through `opt` so they
+land in the run manifest. A hook configured by an environment variable nobody
+recorded produces a result nobody can reproduce.
+
+### 6.1.3 Open: intra-stage seam ordering
+
+**Unresolved, and the templates deliberately refuse to guess.** Whether
+`post_impl` fires before or after the stage writes its checkpoint decides
+whether a change made there reaches the bitstream but not the checkpoint — i.e.
+whether the artefact and the record can disagree. §4 and §5 do not fix it. It
+must be fixed when `flow/vivado/*.tcl` lands, and the answer written here.
 
 `post_bitstream` carries the reference toolkit's `post_route` trap: the
 bitstream is already written. A hook there cannot change the design. Say so in
@@ -508,7 +573,14 @@ Optional, with **conditional cascades**:
 | `has_mmcm` true | `mmcm_primitive` |
 
 Other keys: `luts ffs brams dsps urams clock_regions io_banks clock_buffer_ce
-pll_primitive io_buffer_primitive cfgbvs config_voltage bitstream_compress`
+pll_primitive io_buffer_primitive bitstream_compress`
+
+**`cfgbvs` and `config_voltage` are BOARD keys, not part keys** — corrected
+2026-09-08. They follow how config bank 0 is *wired*, which is a fact about a
+PCB, not about a die. They were listed here first; all three shipped part packs
+correctly declined to set them, and because an unknown key is an error, nothing
+could state them at all. The DRC they satisfy (`CFGBVS-1`) is only a warning, so
+the symptom would have been a permanent warning nobody could clear.
 
 ### Board pack (project) — `fpga/board/<board>/board.tcl`
 
@@ -521,7 +593,7 @@ Required: `board_name part platform sys_clk_freq_hz bin_style`
 | `fpgahub_board` set | `fpgahub_target` — **the lease scope and the program scope are different namespaces** |
 
 Other keys: `deploy_style jtag_serial oscillator_hz io_voltage_by_bank
-connectors`
+connectors cfgbvs config_voltage`
 
 ### Accessors
 
@@ -584,6 +656,16 @@ own header comment so help cannot drift from the file.
 
 **Exit codes.** `0` ok · `1` a check failed · `2` refused / unusable input /
 crash · `75` `EX_TEMPFAIL` (lock contention) · `130` SIGINT.
+
+**`1` and `2` are "we looked and found something" versus "we could not look",
+and a caller is entitled to tell them apart.** Settled 2026-09-08. §7's verdict
+model folds `UNVERIFIED` into FAIL so that a run cannot go green on evidence it
+never read — that is right for a *ladder*, where the only question is whether
+the run may proceed. It is not right for a *scanner*, whose caller has to decide
+between refusing a commit and reporting that the guard itself is broken. So:
+`ci_exit` keeps §7's model, and a gate that must distinguish the two returns `2`
+for "could not measure" directly. Both are failures; only one is the author's
+fault.
 
 **Docstring shape**, universal:
 ```

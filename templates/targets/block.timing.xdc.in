@@ -1,0 +1,178 @@
+#-----------------------------------------------------------------------------
+# fpga/targets/@BOARD@/@BLOCK@.timing.xdc  --  WHAT THIS DESIGN PROMISES ABOUT
+#                                              TIME
+#
+# Scaffolded into @PROJECT@ by `fpga-flow-init` on @DATE@.
+# Named by XDC_TIMING in fpga/design.mk. READ IN IMPLEMENTATION ONLY -
+# the engine sets USED_IN_SYNTHESIS false on this file.
+#
+# WHAT BELONGS IN THIS FILE
+#   The clock definitions this design's timing is closed against, the IO
+#   delays, the clock groups, and the exceptions - false paths, multicycles,
+#   max/min delays.
+#
+# WHAT DOES NOT
+#   * pins, IO standards, electrical properties  ->  @BLOCK@.pins.xdc
+#   * DRC severities and configuration properties  ->  @BLOCK@.drc.xdc
+#   * a DRC WAIVER. It cannot be in an XDC at all - see the trap in
+#     @BLOCK@.drc.xdc and XDC_POST_ROUTE in design.mk.
+#
+# ── WHY THIS FILE IS IMPLEMENTATION-ONLY, AND WHY THAT IS NOT A DETAIL ──────
+#
+# Constraints read during synthesis are APPLIED during synthesis. Three
+# consequences, and the first two are the ones that bite:
+#
+#   1. AN EXCEPTION READ IN SYNTHESIS CHANGES WHAT SYNTHESIS BUILDS. A
+#      `set_false_path` tells the tool not to work on a path. If the exception
+#      is wrong, synthesis will not have built the logic that could have closed
+#      it, and implementation cannot recover what was never there.
+#
+#   2. THE OBJECT NAMES DO NOT MEAN THE SAME THING IN BOTH PASSES. An exception
+#      anchored to a pin, a cell or a generated clock names something that
+#      exists after elaboration and mapping. The same line read BEFORE that
+#      matches a different set - often the empty set - and Vivado drops a
+#      constraint that matches nothing WITHOUT AN ERROR. So the same file
+#      quietly means two things and no log distinguishes them.
+#
+#   3. A synthesis timing report is then unmistakably not a signoff number,
+#      because synthesis was not given the constraints. That is a feature: it
+#      removes a number people quote.
+#
+# The engine decides this from WHICH VARIABLE NAMED THE FILE. Moving a clock
+# definition into the pins file does not keep it out of synthesis - it puts it
+# in.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAP: THE PERIOD HERE IS THE OSCILLATOR'S, NOT SYS_CLK_FREQ_HZ.
+#
+#   `create_clock` on a PORT describes the waveform ARRIVING AT THE PIN. That
+#   is the board's oscillator - `oscillator_hz` in the board pack.
+#
+#   SYS_CLK_FREQ_HZ in design.mk is the SYSTEM clock: what the design runs at
+#   after the MMCM/PLL, and it is also compiled into the firmware as
+#   -DNANOSOC_SYS_CLK_FREQ_HZ. THEY ARE TWO DIFFERENT NUMBERS and only one of
+#   them belongs on the line below.
+#
+#   Do NOT `create_clock` the MMCM outputs. The tool derives generated clocks
+#   from the primitive's own settings, and a hand-written `create_clock` on a
+#   generated clock's net REPLACES that derivation with your arithmetic -
+#   silently, and usually with the multiply/divide of the day the file was
+#   written. `create_generated_clock` belongs only where the tool genuinely
+#   cannot derive the relationship (a clock divided in the fabric, a clock
+#   crossing a black box).
+#
+#   A build whose firmware and fabric disagree about the system clock BOOTS. It
+#   comes up, runs, and gets every baud rate and every timer wrong by the ratio
+#   between them - so the UART prints garbage at the rate you expected and the
+#   symptom reads as a serial wiring fault.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAP: `set_clock_groups -asynchronous` IS A PROMISE, NOT AN ANALYSIS.
+#
+#   It tells the tool to STOP TIMING the paths between two domains. It does not
+#   check that a synchroniser exists, that the crossing is on a bus that needs
+#   one, or that the handshake is sound. Every crossing it covers becomes
+#   invisible to every timing report for the rest of the design's life.
+#
+#   That is the right constraint for a genuinely asynchronous crossing WITH a
+#   synchroniser, and it is a way to hide a real defect for months otherwise.
+#   Write the diagnosis beside each one: which two domains, why they are
+#   asynchronous, and where the synchroniser is. If you cannot name the
+#   synchroniser, you are not describing a crossing - you are silencing one.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# ── THE EXCEPTION PRIORITY LADDER ───────────────────────────────────────────
+#
+#   set_false_path  >  set_max_delay / set_min_delay  >  set_multicycle_path
+#
+# A stronger exception silently outranks a weaker one on the same path, so a
+# `set_multicycle_path` under an overlapping `set_false_path` does nothing at
+# all and reports nothing at all. When two exceptions overlap, only the
+# strongest is in force; write them so they do not overlap, or write down which
+# one you meant to win.
+#
+# ── EVERY .xdc HERE MUST BE NAMED BY A VARIABLE IN design.mk ────────────────
+#
+# An .xdc in this directory that no variable names is an ERROR from
+# `make check`, deliberately: the flow this replaces discovered constraints by
+# a glob and silently ignored anything named differently. Add XDC_EXTRA (an
+# ordered list) or XDC_OPTIONAL (a "COND:path" list) rather than dropping a
+# file in and hoping.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+#-----------------------------------------------------------------------------
+
+
+#### 1. THE PRIMARY CLOCK ######################################################
+#
+# The period is in NANOSECONDS and it is the OSCILLATOR's - read the trap
+# above. The port is the same one @BLOCK@.pins.xdc gave a package pin to.
+
+create_clock -name sys_clk -period <<FILL IN: the OSCILLATOR period in ns, from oscillator_hz in the board pack>> [get_ports <<FILL IN: the clock port on TOP>>]
+
+
+#### 2. GENERATED AND SECONDARY CLOCKS #########################################
+#
+# Usually NOTHING GOES HERE. The tool derives MMCM/PLL outputs by itself, and
+# every hand-written definition of a derived clock is arithmetic that can drift
+# from the primitive that actually generates it.
+#
+# Only for a clock the tool cannot derive - divided in the fabric, or arriving
+# through something it cannot see through:
+#
+# create_generated_clock -name <name> -source [get_pins <src pin>] -divide_by <n> [get_pins <dest pin>]
+
+
+#### 3. CLOCK RELATIONSHIPS ####################################################
+#
+# Read the -asynchronous trap above before uncommenting anything here, and
+# write the diagnosis on the line: which two domains, why they are unrelated,
+# and WHERE THE SYNCHRONISER IS.
+#
+# set_clock_groups -asynchronous \
+#     -group [get_clocks <clock a>] \
+#     -group [get_clocks <clock b>]
+
+
+#### 4. IO TIMING ##############################################################
+#
+# AN UNCONSTRAINED PORT IS NOT A FAST PORT, IT IS AN UNTIMED ONE. With no
+# set_input_delay/set_output_delay the tool has no requirement to meet, reports
+# no violation, and the interface either works on the bench or does not.
+#
+# The numbers are properties of what is on the other side of the pin - the
+# device's datasheet, the PCB trace, the connector - so they belong to this
+# target, not to the design.
+#
+# set_input_delay  -clock <clock> -max <ns> [get_ports <port>]
+# set_input_delay  -clock <clock> -min <ns> [get_ports <port>]
+# set_output_delay -clock <clock> -max <ns> [get_ports <port>]
+# set_output_delay -clock <clock> -min <ns> [get_ports <port>]
+#
+# For a port that genuinely has no timing relationship - a button, an LED, a
+# jumper - say so explicitly rather than leaving it unconstrained by omission.
+# The difference matters to the next reader:
+#
+# set_false_path -from [get_ports <the asynchronous input>]
+# set_false_path -to   [get_ports <the indicator output>]
+
+
+#### 5. EXCEPTIONS #############################################################
+#
+# Each one is a claim about the design that the tool cannot verify. Write the
+# claim next to it, with the date and the run it was measured on. An exception
+# with no reason beside it is the first thing the next person deletes to make a
+# number move, and the second thing they put back when the board stops working.
+#
+# set_false_path     -from [get_cells <a>] -to [get_cells <b>]     ;# why
+# set_multicycle_path -setup <n> -from [get_cells <a>] -to [get_cells <b>]
+# set_multicycle_path -hold  [expr {<n> - 1}] -from [get_cells <a>] -to [get_cells <b>]
+#
+# THE HOLD MULTICYCLE IS NOT OPTIONAL. A `-setup N` on its own moves the setup
+# check out by N cycles and LEAVES THE HOLD CHECK WHERE IT WAS, which is one
+# cycle after a launch that no longer happens there. The pair is the
+# constraint; half of it is a different constraint that happens to share a
+# name.
+
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)

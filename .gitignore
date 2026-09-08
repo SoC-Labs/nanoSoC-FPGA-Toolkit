@@ -1,0 +1,47 @@
+# nanoSoC FPGA Toolkit - what never belongs in this repository
+#
+# TWO JOBS, and the second is the one that matters. The first is the ordinary
+# one: keep build output out. The second is that the vendor-collateral scanner
+# (ci/check-vendor-collateral.sh) scans the UNTRACKED corpus as well as the
+# tracked one - that is the half which catches the file that sat in a working
+# tree for three weeks and then went in under `git add -A`. That scan is only
+# meaningful if genuinely ignorable output is genuinely ignored; without this
+# file every stray log in a checkout is reported and the report stops being
+# read. So an entry here is a claim that a path is NOISE, and anything that
+# might be vendor collateral must NOT be listed - being ignored here is exactly
+# how it would reach a commit unseen.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+
+# --- run output -------------------------------------------------------------
+build/
+*.jou
+*.log
+*.str
+.Xil/
+.srcs/
+.cache/
+.hbs/
+.runs/
+vivado_pid*.str
+webtalk*.jou
+webtalk*.log
+hs_err_pid*.log
+
+# --- python -----------------------------------------------------------------
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# --- editor / OS debris -----------------------------------------------------
+*~
+*.swp
+*.bak
+*.orig
+.DS_Store
+
+# --- deliberately NOT ignored ------------------------------------------------
+# *.bit *.bin *.dcp *.xsa *.hwh *.ltx *.xci *.xcix *.edn *.edf
+#   Every one of these is something the scanner exists to catch. Ignoring them
+#   would hide them from the untracked scan, which is the opposite of the point.
+#   If one is in your tree it should be reported, every time, until it is gone.

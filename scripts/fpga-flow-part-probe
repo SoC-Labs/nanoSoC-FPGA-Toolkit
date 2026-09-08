@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+#------------------------------------------------------------------------------
+# fpga-flow-part-probe - ask a PACK whether THIS host can actually read it
+#
+#   fpga-flow-part-probe [-q] [--role part|board] [<pack>]
+#
+#   <pack>  a pack directory, a pack file, or a pack name resolved against
+#           $FPGA_FLOW_DIR/part or $FPGA_DIR/board. Defaults to $FPGA_PART_DIR
+#           or $FPGA_BOARD_DIR, which mk/flow.mk exports.
+#   --role  part or board. Inferred from the pack when the directory holds a
+#           part.tcl or a board.tcl, which is the normal case.
+#   -q      exit status only.
+#
+# WHY THIS EXISTS
+#
+# The question is "is the collateral this build needs on this machine", and the
+# usual way to ask it is a hardcoded `[ -r /some/lab/path ]` in a CI script.
+# That is wrong twice over:
+#
+#   * it is wrong ABOUT THIS HOST. A directory existing is not the same as the
+#     files inside it being readable. An autofs mount point whose map entry is
+#     missing is an empty directory that passes every `test -d` and then fails
+#     inside the tool.
+#   * it is wrong FOR EVERY OTHER HOST. The path belongs to one lab. Written
+#     into CI it is the single line that stops this toolkit being usable
+#     anywhere else.
+#
+# SO DO NOT ASK THE FILESYSTEM. ASK THE PACK. Every pack already declares each
+# file it needs, where it expects it and what it is for; it reads its roots from
+# the environment through part_env / board_env, which RECORDS EVERY RESOLUTION
+# ATTEMPT whether it resolved or not; and part_defer records the values it could
+# not derive here and why. part/pack_api.tcl's <role>_check_files reports all
+# three in one list, because a missing file, an unset site variable and a
+# deferral that cannot resolve are THE SAME PROBLEM to whoever has to fix it.
+# Loading the pack and asking costs milliseconds, launches no tool, takes no
+# licence, and is correct at a site whose collateral is somewhere else entirely.
+#
+# THE ESCAPE HATCH IS SET ON PURPOSE. FPGA_PACK_ALLOW_MISSING_ENV=1 stops an
+# unset site variable from aborting the load - without it, all this could report
+# is "the pack failed to load", which is true and useless. With it, the
+# unresolved value comes back as the literal marker <unset:VAR> carrying the
+# pack's own sentence about what that variable locates, and becomes a FINDING
+# rather than a crash.
+#
+# AND IT LEADS WITH THE VARIABLE NAMES. ONE UNSET VARIABLE EXPLAINS TWENTY
+# MISSING PATHS. The pack's report correctly prints all twenty; the actionable
+# content is the two or three distinct variable names inside them, and that is
+# otherwise the least visible part of the message.
+#
+# A RECORDED GAP IS NOT A FAILURE OF THIS HOST. A pack may declare a value it
+# cannot obtain from anywhere - part_defer -permanent - and those are PRINTED on
+# the success path with the pack's own reason, because CONTRACT.md section 5
+# requires a green verdict to enumerate what it did not measure. They do not
+# change the exit status: if they did, every honest pack would be red for ever
+# and the first fix anybody reached for would be to delete the deferral and
+# write a plausible number instead.
+#
+# Exit status:
+#   0  every value the pack declares resolves on this host (recorded gaps are
+#      printed and do not change this)
+#   1  a file the pack names is unreadable here, a site variable is unset, or a
+#      HOST-CONTINGENT derivation failed - all three are fixable on this machine
+#   2  refused: no pack named, the pack does not exist, or it will not load
+# 130  interrupted
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+#------------------------------------------------------------------------------
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FLOW_DIR="${FPGA_FLOW_DIR:-$(cd "$HERE/.." && pwd)}"
+TCLSH="${TCLSH:-tclsh}"
+
+# Printed by reading this file's own header comment, so help cannot drift from
+# the file. No line numbers: it stops at the first line that is not a comment.
+usage() { sed -n '2,$p' "${BASH_SOURCE[0]}" | sed -n '/^#/!q; s/^# \{0,1\}//p'; }
+
+trap 'exit 130' INT
+
+QUIET=0
+ROLE=""
+PACK=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -q|--quiet) QUIET=1 ;;
+        --role)     shift; ROLE="${1:-}" ;;
+        --role=*)   ROLE="${1#--role=}" ;;
+        -h|--help)  usage; exit 0 ;;
+        -*)         echo "fpga-flow-part-probe: unknown option '$1'" >&2
+                    echo "usage: $0 [-q] [--role part|board] [<pack>]" >&2
+                    exit 2 ;;
+        *)          PACK="$1" ;;
+    esac
+    shift
+done
+
+say() { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+
+command -v "$TCLSH" >/dev/null 2>&1 || {
+    echo "fpga-flow-part-probe: no tclsh, so the pack cannot be asked." >&2
+    echo "  This is NOT a verdict on the collateral - it is the probe failing" >&2
+    echo "  to run, which is a different thing and must not be read as a pass." >&2
+    exit 2
+}
+
+[ -f "$FLOW_DIR/part/pack_api.tcl" ] || {
+    echo "fpga-flow-part-probe: no pack API at $FLOW_DIR/part/pack_api.tcl." >&2
+    echo "  This checkout of the toolkit is incomplete." >&2
+    exit 2
+}
+
+#------------------------------------------------------------------------------
+# WHICH PACK, AND WHICH ROLE.
+#
+# The role is INFERRED FROM THE PACK ITSELF wherever the pack is a directory or
+# a file - a directory holding part.tcl is a part pack, and no amount of
+# guessing from the name is needed. --role settles the remaining case, a bare
+# pack NAME, where the answer is genuinely not in the argument.
+#------------------------------------------------------------------------------
+if [ -z "$PACK" ]; then
+    case "$ROLE" in
+        part)  PACK="${FPGA_PART_DIR:-}" ;;
+        board) PACK="${FPGA_BOARD_DIR:-}" ;;
+        "")    if [ -n "${FPGA_PART_DIR:-}" ]; then PACK="$FPGA_PART_DIR"; ROLE=part
+               elif [ -n "${FPGA_BOARD_DIR:-}" ]; then PACK="$FPGA_BOARD_DIR"; ROLE=board
+               fi ;;
+    esac
+fi
+
+if [ -z "$PACK" ]; then
+    echo "fpga-flow-part-probe: name a pack." >&2
+    echo "  Pass a pack directory, a pack file, or a pack name with --role," >&2
+    echo "  or run where FPGA_PART_DIR / FPGA_BOARD_DIR is exported." >&2
+    echo "  Installed part packs (directories under $FLOW_DIR/part holding a" >&2
+    echo "  part.tcl - the directory is the authority, never a list in here):" >&2
+    found=0
+    for d in "$FLOW_DIR"/part/*/; do
+        [ -f "${d}part.tcl" ] && { echo "      $(basename "$d")" >&2; found=1; }
+    done
+    [ "$found" = 1 ] || echo "      (none)" >&2
+    exit 2
+fi
+
+if [ -z "$ROLE" ]; then
+    if   [ -f "$PACK/part.tcl"  ]; then ROLE=part
+    elif [ -f "$PACK/board.tcl" ]; then ROLE=board
+    elif [ "$(basename -- "$PACK")" = "part.tcl"  ]; then ROLE=part
+    elif [ "$(basename -- "$PACK")" = "board.tcl" ]; then ROLE=board
+    elif [ -e "$PACK" ]; then
+        echo "fpga-flow-part-probe: '$PACK' exists but holds neither a part.tcl" >&2
+        echo "  nor a board.tcl, so it is not a pack." >&2
+        exit 2
+    elif case "$PACK" in */*|.*|/*) true ;; *) false ;; esac; then
+        # PATH-SHAPED AND ABSENT. Say that, rather than "I cannot tell which
+        # role this is" - a relative path resolved against the wrong working
+        # directory is the common case, and a message about roles sends the
+        # reader to look at the wrong thing entirely.
+        echo "fpga-flow-part-probe: no such pack path: $PACK" >&2
+        echo "  (working directory: $PWD)" >&2
+        echo "  Pass an absolute path, or a bare pack NAME with --role - a" >&2
+        echo "  relative path here is resolved against whatever cwd the caller" >&2
+        echo "  happened to have, which is why every call site in this toolkit" >&2
+        echo "  builds paths from \$FPGA_FLOW_DIR." >&2
+        exit 2
+    elif [ -f "$FLOW_DIR/part/$PACK/part.tcl" ]; then
+        ROLE=part
+    elif [ -n "${FPGA_DIR:-}" ] && [ -f "$FPGA_DIR/board/$PACK/board.tcl" ]; then
+        ROLE=board
+    else
+        echo "fpga-flow-part-probe: cannot tell whether '$PACK' is a part pack" >&2
+        echo "  or a board pack, and the two have different schemas - probing" >&2
+        echo "  one as the other would report every key of the wrong table as" >&2
+        echo "  missing. Say which with --role part or --role board." >&2
+        exit 2
+    fi
+fi
+
+case "$ROLE" in
+    part|board) ;;
+    *) echo "fpga-flow-part-probe: --role must be part or board, not '$ROLE'" >&2
+       exit 2 ;;
+esac
+
+#------------------------------------------------------------------------------
+# ASK THE PACK.
+#
+# Exit 3 from the Tcl means the pack did not load: the pack is wrong, or absent,
+# and mounting something will not fix it. Exit 4 means it loaded and this host
+# cannot resolve everything it declares - which is the question being asked.
+#------------------------------------------------------------------------------
+out=$(FPGA_PACK_ALLOW_MISSING_ENV=1 "$TCLSH" <<EOF 2>&1
+source [file join {$FLOW_DIR} part pack_api.tcl]
+if {[catch {pack_load {$ROLE} {$PACK}} err]} {
+    puts "LOADFAIL \$err"
+    exit 3
+}
+if {[pack_check_files {$ROLE} 0]} {
+    puts "COLLATERAL-OK"
+    foreach g [pack_gaps {$ROLE}] {
+        puts "RECORDED GAP  [lindex \$g 0]"
+        puts "              [lindex \$g 1]"
+    }
+    puts [pack_summary {$ROLE}]
+} else {
+    exit 4
+}
+EOF
+)
+rc=$?
+
+case "$rc" in
+0)  # A GREEN PROBE STILL ENUMERATES WHAT IT DID NOT MEASURE. CONTRACT.md
+    # section 5 requires exactly that of every verdict artefact, and a pack's
+    # permanent deferrals are its version of it: values the pack declares it
+    # cannot obtain from any host, with the reason. They are printed here, on
+    # the success path, because that is the only path anybody reads.
+    ngaps=$(printf '%s\n' "$out" | grep -c '^RECORDED GAP')
+    say "$ROLE pack '$(basename -- "$PACK")': every value it declares resolves on $(hostname -s)."
+    if [ "$ngaps" -gt 0 ]; then
+        say ""
+        say "  $ngaps value(s) are RECORDED GAPS - the pack says it cannot obtain"
+        say "  them from any host, and says why. They are not a host problem and"
+        say "  they are not a pass either: nothing measured them."
+    fi
+    say ""
+    say "${out#COLLATERAL-OK}"
+    exit 0 ;;
+3)  echo "$ROLE pack '$PACK' FAILED TO LOAD OR TO VALIDATE." >&2
+    echo "The pack is wrong or absent - this is not a statement about the host," >&2
+    echo "and mounting something will not fix it." >&2
+    printf '%s\n' "$out" >&2
+    exit 2 ;;
+esac
+
+# ONE UNSET VARIABLE EXPLAINS TWENTY MISSING PATHS. Lift the DISTINCT names out
+# of the pack's report and lead with them: that is the entire actionable
+# content, and in the full report it is the least visible part.
+unset_vars=$(printf '%s' "$out" \
+    | grep -o '<unset:[A-Za-z_][A-Za-z0-9_]*>' \
+    | sed 's/<unset:\(.*\)>/\1/' | sort -u)
+
+if [ "$QUIET" = 1 ]; then exit 1; fi
+
+echo "$ROLE pack '$(basename -- "$PACK")': this host cannot resolve everything" >&2
+echo "the pack declares." >&2
+echo >&2
+if [ -n "$unset_vars" ]; then
+    echo "  UNSET SITE VARIABLE(S) - almost certainly the whole story:" >&2
+    for v in $unset_vars; do echo "      $v" >&2; done
+    echo >&2
+    echo "  These name the roots the pack builds every path from, so one unset" >&2
+    echo "  variable accounts for every line below. Set them in the host's login" >&2
+    echo "  profile - the tools need them too, and one definition beats two that" >&2
+    echo "  can disagree - then run this again." >&2
+    echo "  The pack's own sentence about what each one locates is in the" >&2
+    echo "  report below, beside the marker." >&2
+    echo >&2
+else
+    echo "  NO SITE VARIABLE IS UNSET, so this is not a mount problem. What is" >&2
+    echo "  below is a file the pack names and cannot read, or a value it" >&2
+    echo "  DERIVES and could not derive here - see the '(derived)' entries," >&2
+    echo "  which carry the pack's own reason." >&2
+    echo >&2
+fi
+printf '%s\n' "$out" >&2
+exit 1
+
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)

@@ -166,6 +166,20 @@ part-probe-script-present:
 	  echo "           The toolkit checkout at $(FPGA_FLOW_DIR) is incomplete." >&2; \
 	  exit 2; }
 
+# print-check-vars: the same set, machine-readable, one NAME=VALUE per line.
+#
+# Not in `make help`: it exists for scripts/fpga-flow-check's standalone path
+# (`fpga-flow-check <dir>` typed by a human, with no --var). That path used to
+# re-invoke `make check` and forward make's exit status - but GNU make exits 2
+# for ANY failure, so a merely incomplete contract came back as 2, which
+# CONTRACT §10 reserves for refused/unusable input. Rather than guess a mapping,
+# the script now reads THIS and runs the ordinary checks in-process, so the two
+# entry points share one implementation and their exit codes agree by
+# construction instead of by translation.
+.PHONY: print-check-vars
+print-check-vars:
+	@$(foreach v,$(CHECK_VAR_NAMES),printf '%s=%s\n' '$(v)' '$($(v))';)
+
 ## check-vars: what `make check` would hand the checker, without checking.
 ##   The debugging target for "the checker says X is empty and my design.mk
 ##   plainly sets it" - it shows the value AFTER every ?= chain and override

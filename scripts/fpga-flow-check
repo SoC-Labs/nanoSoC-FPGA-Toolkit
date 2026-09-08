@@ -91,6 +91,32 @@ ENV_PREFIX = "FPGACHECK_"
 # script has a sub-second budget.
 SKIP_DIRS = ("build", ".git", "__pycache__", ".Xil", ".jou", "node_modules")
 
+# Files in hooks/ and overrides/ that are DOCUMENTATION, not a failed hook.
+#
+# WHY: `fpga-flow-init` scaffolds hooks/README.md, so before this filter existed
+# EVERY scaffolded project carried a standing "unrecognised file(s) in hooks/ -
+# README.md" warning from its first `make check` onwards. A warning that is
+# always there and always wrong is worse than no warning: it teaches the reader
+# to skim the WARNINGS block, and the run where that block says something real
+# scrolls past unread. This toolkit exists to stop exactly that, so it must not
+# manufacture an instance of it.
+#
+# Kept deliberately narrow - a README, a licence, an editor/OS turd. A `.tcl`
+# whose stem is not a seam is STILL reported, because that is real work silently
+# not running.
+DOC_FILES = ("readme", "license", "licence", "notice", "contributing", "todo")
+DOC_EXTS = ("", ".md", ".rst", ".txt", ".adoc")
+
+
+def is_doc_file(fn):
+    """True for a file that is plainly documentation or editor debris."""
+    if fn.startswith("."):
+        return True                      # .gitkeep, .DS_Store, .swp
+    if fn.endswith("~") or fn.endswith(".bak") or fn.endswith(".orig"):
+        return True
+    stem, ext = os.path.splitext(fn)
+    return stem.lower() in DOC_FILES and ext.lower() in DOC_EXTS
+
 # A scaffolded decision the toolkit cannot make for you. Same spelling as the
 # reference toolkit's marker so one `fpga-flow-init` template style serves both.
 MARKER = re.compile(r"<<\s*FILL\s+IN")
@@ -539,17 +565,29 @@ def xdc_coverage(rep, target_dir):
         return
     claimed = claimed_xdc()
     orphans = []
+    found = 0
     for root, dirs, files in os.walk(target_dir):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for fn in sorted(files):
             if not fn.lower().endswith(".xdc"):
                 continue
+            found += 1
             path = os.path.join(root, fn)
             if os.path.realpath(path) not in claimed:
                 orphans.append(os.path.relpath(path, target_dir))
     if not orphans:
+        # COUNT WHAT WAS FOUND, NOT WHAT WAS CLAIMED. These are different
+        # numbers and the difference is not cosmetic: `claimed` is keyed on
+        # every path any XDC_* variable names, so an unfilled `<<FILL IN>>`
+        # marker in XDC_BASELINE whitespace-splits into eight pseudo-paths and
+        # this line reported "11 file(s) in TARGET_DIR" for a directory holding
+        # three. A reader checking that the number matches their directory -
+        # which is the only reason to print a number here - was told a count
+        # that could not be reconciled with anything, and a count inflated by
+        # phantom entries is a count that cannot notice a real file going
+        # missing. Found on a scaffolded project, 2026-09-08.
         rep.ok("XDC coverage", "%d file(s) in TARGET_DIR, all named by a variable"
-                               % len(claimed))
+                               % found)
         return
     listing = "\n".join("  %s" % o for o in orphans)
     rep.bad("ORPHAN XDC IN TARGET_DIR",
@@ -627,6 +665,8 @@ def check_hooks(rep, hooks_dir, seams, seams_path):
         if os.path.isdir(full):
             unknown.append(fn + "/")
             continue
+        if is_doc_file(fn):
+            continue                     # documentation, not a failed hook
         stem, ext = os.path.splitext(fn)
         if stem in seams and ext == ".tcl":
             good.append(stem)
@@ -667,7 +707,8 @@ def check_overrides(rep, ovr_dir, steps, steps_dir):
     if not ovr_dir or not os.path.isdir(ovr_dir):
         rep.info("overrides", "(none - optional)")
         return
-    files = sorted(f for f in os.listdir(ovr_dir) if os.path.isfile(os.path.join(ovr_dir, f)))
+    files = sorted(f for f in os.listdir(ovr_dir)
+                   if os.path.isfile(os.path.join(ovr_dir, f)) and not is_doc_file(f))
     if not files:
         rep.info("overrides", "(directory present, empty - optional)")
         return
@@ -786,20 +827,58 @@ def standalone():
     d = os.path.abspath(ARGS.positional[0]) if ARGS.positional else os.getcwd()
     for cand in (d, os.path.join(d, "fpga")):
         if os.path.exists(os.path.join(cand, "Makefile")):
-            cmd = ["make", "--no-print-directory", "-C", cand, "check"]
-            if ARGS.quiet:
-                cmd.append("CHECK_ARGS=--quiet")
+            # ASK MAKE FOR THE VALUES, THEN CHECK THEM HERE - do not re-invoke
+            # `make check` and forward its status.
+            #
+            # The reason is an exit code, and it matters because CI reads it.
+            # GNU make exits 2 for ANY failure, so re-invoking made a merely
+            # INCOMPLETE contract come back as 2 - which CONTRACT §10 reserves
+            # for "refused / unusable input / crash" - while the --var path that
+            # make itself uses correctly returned 1. Two entry points to the
+            # same question disagreeing about the answer's severity is the kind
+            # of defect this script exists to find in other people's flows.
+            #
+            # Reading `print-check-vars` instead means both paths run the same
+            # checks in the same process and their exit codes agree by
+            # construction rather than by a mapping table someone has to
+            # maintain. make still does the variable resolution, which is the
+            # part only make can do.
+            cmd = ["make", "--no-print-directory", "-C", cand, "print-check-vars"]
             # A re-entry guard, not paranoia: if checks.mk ever invokes this
             # script without passing any --var, `make check` would call this,
-            # which would call `make check`, forever, and the symptom would be
-            # a hung terminal rather than an error.
+            # which would call make again, forever, and the symptom would be a
+            # hung terminal rather than an error.
             env = dict(os.environ)
             env["FPGA_FLOW_CHECK_REENTRY"] = "1"
             try:
-                return subprocess.call(cmd, env=env)
+                proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
+                                        universal_newlines=True)
+                out, _ = proc.communicate()
             except OSError as e:
                 print("fpga-flow-check: could not run make: %s" % e)
                 return 2
+            if proc.returncode != 0:
+                # make could not even resolve the variables. That is a broken
+                # project or a broken toolkit checkout - not an incomplete
+                # contract - and make has already said so on stderr.
+                print("fpga-flow-check: `make -C %s print-check-vars` failed." % cand)
+                print("  make's own message above says why. Nothing was checked.")
+                return 2
+            n = 0
+            for line in out.splitlines():
+                if "=" not in line:
+                    continue
+                name, _, value = line.partition("=")
+                ARGS.vars[name.strip()] = value
+                n += 1
+            if n == 0:
+                print("fpga-flow-check: `make -C %s print-check-vars` printed no"
+                      " variables." % cand)
+                print("  The toolkit's mk/checks.mk is missing that target, so this")
+                print("  checkout is incomplete. Nothing was checked.")
+                return 2
+            ARGS.supplied = True
+            return run_checks()
     print("fpga-flow-check: no Makefile in %s or %s/fpga" % (d, d))
     print("")
     print("  This script validates a project that has already been scaffolded,")

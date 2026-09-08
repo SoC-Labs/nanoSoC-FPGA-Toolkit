@@ -1,0 +1,185 @@
+#-----------------------------------------------------------------------------
+# fpga/targets/@BOARD@/@BLOCK@.pins.xdc  --  WHERE THE DESIGN MEETS THE BOARD
+#
+# Scaffolded into @PROJECT@ by `fpga-flow-init` on @DATE@.
+# Named by XDC_PINS in fpga/design.mk. READ IN SYNTHESIS **AND** IN
+# IMPLEMENTATION.
+#
+# WHAT BELONGS IN THIS FILE
+#   Which port lands on which package pin, at which IO standard, with which
+#   electrical properties: pull-ups, drive strength, slew, differential
+#   termination, and the placement of anything whose location is a board fact
+#   (an IO buffer, a clock-capable input, a bank-locked primitive).
+#
+# WHAT DOES NOT
+#   * clocks, IO delays and timing exceptions  ->  @BLOCK@.timing.xdc
+#   * DRC severities and configuration properties  ->  @BLOCK@.drc.xdc
+#   * anything true of the BOARD no matter what is built on it - the device,
+#     the oscillator frequency, the bank voltages, the .bin style. Those are
+#     board-pack keys in fpga/board/@BOARD@/board.tcl. A pin ASSIGNMENT is not
+#     a board fact: it is a fact about THIS DESIGN meeting that board, which is
+#     why it lives here in the target directory and not in the pack.
+#
+# ── WHY THE THREE-FILE SPLIT IS NOT OPTIONAL ────────────────────────────────
+#
+# The split is BY WHEN THE FILE IS READ, and each file's contents are the ones
+# that must be true at that point:
+#
+#   THIS FILE   synthesis AND implementation
+#   timing      implementation only  (USED_IN_SYNTHESIS false)
+#   drc         implementation only
+#
+# This one is read in synthesis because synthesis is where the IO buffers are
+# inferred and configured - the standard decides which buffer and carries the
+# electrical properties - and because THE EARLIEST POSSIBLE DISCOVERY OF A
+# RENAMED PORT IS WORTH MORE THAN EVERYTHING ELSE IN THIS FILE. A pin
+# constraint that matches nothing costs you a synthesis, not a ninety-minute
+# implementation and a bench session.
+#
+# The engine sets USED_IN_SYNTHESIS on each file according to WHICH VARIABLE
+# NAMED IT. The file cannot set it for itself, so moving a timing constraint in
+# here does not make it an implementation-only constraint - it makes it a
+# constraint that is now also applied during synthesis, which is a different
+# design.
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAP: VIVADO DROPS A CONSTRAINT THAT MATCHES NOTHING, WITHOUT AN ERROR.
+#
+#   set_property PACKAGE_PIN <pin> [get_ports clk_i]
+#
+#   on a design whose port is called `clk` does not fail. `get_ports` returns
+#   an empty list, the property is applied to nothing, the run continues, and
+#   the pin is unconstrained - so the tool places it wherever it likes and you
+#   find out on the bench.
+#
+#   RENAMING A PORT SILENTLY UNCONSTRAINS EVERY LINE THAT NAMED IT. So does
+#   getting TOP wrong in design.mk, because then NONE of the ports exist and
+#   this ENTIRE FILE applies to nothing - a failure whose log is identical to
+#   a clean run's.
+#
+#   That is what `make xdc-lint` and XDC_BASELINE are for: the lint counts what
+#   each constraint file actually MATCHED and compares it against a committed
+#   baseline, so a constraint that stops matching is a diff rather than a
+#   silence. Set XDC_BASELINE after your first run and commit the baseline
+#   beside this file.
+#
+#   The cheap in-file version of the same guard, for the ports you cannot
+#   afford to lose, is the ASSERTION BLOCK at the bottom of this file.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAP: XDC IS ORDER-DEPENDENT, AND A LATER LINE SILENTLY OVERRIDES AN EARLIER
+#       ONE ON THE SAME OBJECT.
+#
+#   Two `set_property IOSTANDARD` lines for one port is not an error and is not
+#   a warning. The second wins. Constrain each port ONCE, in one place, and
+#   keep this file grouped by interface so a duplicate is visible to a reader.
+#
+#   The order the flow reads the files in is the order design.mk lists them,
+#   and XDC_EXTRA preserves its own list order. Vivado has a SECOND ordering
+#   mechanism - PROCESSING_ORDER on the file object - and if anything sets it,
+#   the list order in design.mk no longer describes the read order and nothing
+#   reconciles the two. Do not use both.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# EVERY .xdc IN THIS DIRECTORY MUST BE NAMED BY A VARIABLE IN design.mk.
+#
+#   An .xdc sitting here that no variable names is an ERROR from `make check`,
+#   deliberately. The flow this replaces discovered constraints by a GLOB, so a
+#   file named anything else was silently invisible: present in the directory,
+#   read by nothing, warned about by nobody. Combined with the trap above,
+#   "never read" and "read and matched nothing" were indistinguishable.
+#
+#   So: to add a constraint file, add a variable that names it - XDC_EXTRA for
+#   an ordered extra, XDC_OPTIONAL for a conditional one. Copying a file in and
+#   expecting it to be picked up is the one thing that will not work.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+#-----------------------------------------------------------------------------
+
+
+#### 1. THE SYSTEM CLOCK INPUT #################################################
+#
+# The one pin every design on this board has. It must be on a clock-capable
+# input; the board pack states the oscillator frequency (oscillator_hz) and
+# @BLOCK@.timing.xdc states the period - THIS file states only where it enters
+# the device.
+
+set_property PACKAGE_PIN <<FILL IN: the package pin the oscillator arrives on>> [get_ports <<FILL IN: the clock port on TOP, as the RTL spells it>>]
+set_property IOSTANDARD  <<FILL IN: the standard for that bank - see io_voltage_by_bank in the board pack>> [get_ports <<FILL IN: the same clock port>>]
+
+
+#### 2. EVERYTHING ELSE ########################################################
+#
+# Uncomment and adapt what this design has. Each shape is here because it is
+# the one people get wrong, and every line is a decision this toolkit cannot
+# make for you.
+
+# ── A SINGLE-ENDED INPUT OR OUTPUT ──────────────────────────────────────────
+# set_property PACKAGE_PIN <pin> [get_ports <port>]
+# set_property IOSTANDARD  <std> [get_ports <port>]
+
+# ── A BUS ───────────────────────────────────────────────────────────────────
+# One line per BIT for the pin (the pins are not contiguous and the tool will
+# not guess), and one wildcard line for the standard. The wildcard is where a
+# renamed bus silently stops matching, so it is a good candidate for the
+# assertion block below.
+#
+# set_property PACKAGE_PIN <pin> [get_ports {<port>[0]}]
+# set_property PACKAGE_PIN <pin> [get_ports {<port>[1]}]
+# set_property IOSTANDARD  <std> [get_ports {<port>[*]}]
+
+# ── A DIFFERENTIAL PAIR ─────────────────────────────────────────────────────
+# Constrain the P side; the N side follows from the package. The STANDARD is
+# what makes it differential, and a differential port constrained with a
+# single-ended standard is an error you want at synthesis, not at the bench.
+#
+# set_property PACKAGE_PIN <p pin> [get_ports <port>_p]
+# set_property IOSTANDARD  <diff std> [get_ports <port>_p]
+# set_property DIFF_TERM   TRUE       [get_ports <port>_p]
+
+# ── ELECTRICAL PROPERTIES ───────────────────────────────────────────────────
+# Only where the board needs them. A pull-up on a bidirectional line that the
+# PCB already pulls up is a fight between two resistors, and one of them is
+# inside the device.
+#
+# set_property PULLUP TRUE [get_ports <port>]
+# set_property DRIVE  <mA> [get_ports <port>]
+# set_property SLEW   <SLOW|FAST> [get_ports <port>]
+
+
+#### 3. THE ASSERTION BLOCK ####################################################
+#
+# WHY THIS IS HERE AND NOT IN A HOOK. Because it is about THESE ports, it
+# belongs beside them, and because an XDC is read by every flow that reads this
+# file - including a GUI session somebody opened by hand, where no hook runs.
+#
+# VERIFY IT ONCE BEFORE RELYING ON IT, AND THAT IS NOT A FORMALITY. The XDC
+# parser accepts a RESTRICTED SUBSET of Tcl and rejects the rest - the same
+# mechanism that rejects `create_waiver` (see @BLOCK@.drc.xdc). Whether `error`
+# is inside that subset on YOUR Vivado has not been measured here, because this
+# toolkit launches no tool yet. So the first time you use this block, plant a
+# port name that does not exist and confirm THE RUN STOPS. A guard nobody has
+# watched fail is not known to work, and a guard the parser silently declined
+# to run is indistinguishable from a design with no missing ports.
+#
+# If your Vivado rejects it, move the assertion into fpga/hooks/pre_impl.tcl,
+# where the full Tcl interpreter is available - you lose only the GUI-session
+# coverage, which is the reason it is offered here first.
+#
+# Uncomment and list the ports this design cannot be built without. The whole
+# point is that a renamed port becomes a STOPPED RUN instead of a constraint
+# that quietly matched nothing.
+#
+# foreach p {<the ports you cannot lose>} {
+#     if {[llength [get_ports -quiet $p]] == 0} {
+#         error "@BLOCK@.pins.xdc: no port '$p' in this design.\
+#                Either the RTL renamed it or TOP in design.mk names the wrong\
+#                module - and in both cases every constraint in this file that\
+#                mentions it has been silently applied to nothing."
+#     }
+# }
+
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
