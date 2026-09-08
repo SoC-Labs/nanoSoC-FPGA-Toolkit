@@ -1,0 +1,1379 @@
+#!/usr/bin/env bash
+#-----------------------------------------------------------------------------
+# fpga-flow-deploy - put a finished bitstream on a real board, and give it back
+#
+#   fpga-flow-deploy preflight [opts]   can this run deploy? Read-only, always
+#   fpga-flow-deploy program   [opts]   lease, program, verify DONE, release
+#   fpga-flow-deploy test      [opts]   dispatch an action and grade it
+#   fpga-flow-deploy collect   [opts]   pull this run's evidence into outputs/
+#   fpga-flow-deploy release   [opts]   give back the lease this run recorded
+#   fpga-flow-deploy status    [opts]   what the hub says right now. Read-only
+#   fpga-flow-deploy run       [opts]   all of the above, under ONE lease
+#
+#   --execute            actually touch the board. WITHOUT IT NOTHING MUTATES
+#   --dry-run            the default for every destructive path
+#   --board <group>      the board GROUP   - lease scope
+#   --target <target>    the TARGET        - program / reset / action scope
+#   --bitstream <path>   what to program
+#   --action <id>        an action from the project's fpgahub.toml
+#   --url <endpoint>     http://host:port, host:port, or unix:/path/to.sock
+#   --ttl <s> --wait <s> --action-timeout <s>
+#   --stage-mode <auto|local|shared|scp> --stage-dir <path> --stage-host <host>
+#   --report-dir --log-dir --out-dir --work-dir --lease-file --block --run-tag
+#   --bin-style --toml --holder --tier <interactive|background>
+#
+# WHY THIS EXISTS: FIVE MEASURED FACTS ABOUT THE HUB, EACH OF WHICH FAILS QUIETLY
+#
+#  1. THE BOARD GROUP AND THE TARGET ARE DIFFERENT NAMESPACES. Leases, queues and
+#     reservations live under /boards/<group>/...; program, reset and actions
+#     live under /targets/<target>/... . A group name on a target route is a 404,
+#     and a 404 reads as a dead board or a broken hub. On this hub a target is
+#     its group's name plus _pl / _ps / _mcc, so the wrong one is a typo away.
+#     BOTH are required here, separately, and preflight refuses without both.
+#
+#  2. `lease acquire --pid <n>` IS INERT FROM THIS HOST. The daemon's dead-PID
+#     reaper skips any lease whose holder string is not the daemon's own
+#     hostname, and the client defaults the holder to the CLIENT's hostname. The
+#     one flag that exists so a dying process frees a board is accepted, stored
+#     and never acted on. This script therefore does NOT send a pid - putting one
+#     in the record would advertise a safety net that is not there - and relies
+#     on the only thing that works: a DISTINCTIVE holder, a SHORT TTL, a
+#     HEARTBEAT at TTL/3, and a trap armed BEFORE the acquire.
+#
+#  3. PROGRAM AND ACTION DISPATCH ARE NOT LEASE-GATED. Neither handler checks
+#     holdership; dispatch even extends a lease without matching a token. The
+#     lease is advisory, and THIS SCRIPT IS THE ENFORCER: it re-asserts, against
+#     the hub, that our token holds the board immediately before it programs, and
+#     refuses if it does not.
+#
+#  4. ACTION DISPATCH IS SYNCHRONOUS BEHIND A 202. The handler awaits the
+#     subprocess, so the run id arrives only once the action has finished. In-
+#     flight visibility needs the event stream subscribed BEFORE the POST - there
+#     is no replay buffer, so a subscription opened afterwards has missed the
+#     run. The stock client's timeout is 30 s and cannot be overridden, so this
+#     script calls REST directly with its own.
+#
+#  5. THE BITSTREAM IS OPENED BY THE DAEMON, BY ABSOLUTE PATH, ON THE DAEMON'S
+#     FILESYSTEM. A path that resolves here and not there is the commonest way
+#     this tier fails, and the resulting error is about a missing file without
+#     saying whose filesystem was searched. Staging is this script's job.
+#
+# IT NEVER REVOKES. Revoke is an admin force-release, final for the holder, and
+# every lease on this hub carries the same `user` - so it cannot tell a stale
+# lease of ours from a colleague's live one. A stuck board waits for its TTL.
+#
+# Exit status:
+#   0  the requested subcommand succeeded
+#   1  a gate failed - we looked, and the answer was bad
+#   2  refused: unusable arguments, missing dependency, unreadable input
+#  75  EX_TEMPFAIL - the board is leased by somebody else. Retry later; this is
+#      not a fault in the design, the bitstream or the flow
+# 130  interrupted (the lease is released on the way out)
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+#-----------------------------------------------------------------------------
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FLOW_DIR="$(cd "$HERE/.." && pwd)"
+
+# The usage text is this file's own header, so help cannot drift from the file
+# (CONTRACT.md section 10).
+usage() { sed -n '3,72p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+if [ -t 1 ]; then
+    _R=$'\033[31m'; _G=$'\033[32m'; _Y=$'\033[33m'; _O=$'\033[0m'
+else
+    _R=""; _G=""; _Y=""; _O=""
+fi
+say()  { printf '   %s\n' "$*"; }
+ok()   { printf '%s  ok %s%s\n' "$_G" "$_O" "$*"; }
+bad()  { printf '%sFAIL%s  %s\n' "$_R" "$_O" "$*" >&2; }
+warn() { printf '%swarn%s  %s\n' "$_Y" "$_O" "$*"; }
+head_() { printf '\n== %s ==\n' "$*"; }
+
+#-----------------------------------------------------------------------------
+# ARGUMENTS
+#
+# Every one is explicit and every one has an empty default, because make resolves
+# the contract and this script does the work (the division mk/checks.mk settled
+# on). A value this script invented would be a second, wronger implementation of
+# a `?=` chain make has already run.
+#-----------------------------------------------------------------------------
+SUB="${1:-}"
+case "$SUB" in
+    -h|--help|help|"") usage; [ -z "$SUB" ] && exit 2; exit 0 ;;
+esac
+shift
+
+BOARD_GROUP=""; TARGET=""; TOML=""; URL=""; BITSTREAM=""; BIN_STYLE=""
+ACTION=""; ACTION_TIMEOUT="900"; TTL="600"; WAIT_S="0"
+STAGE_MODE="auto"; STAGE_DIR=""; STAGE_HOST=""
+BLOCK=""; RUN_TAG=""; REPORT_DIR=""; LOG_DIR=""; OUT_DIR=""; WORK_DIR=""
+LEASE_FILE=""; HOLDER=""; TIER="interactive"
+EXECUTE=0
+PROGRAM_METHOD=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --board)          BOARD_GROUP="${2:-}"; shift 2 ;;
+        --target)         TARGET="${2:-}"; shift 2 ;;
+        --toml)           TOML="${2:-}"; shift 2 ;;
+        --url)            URL="${2:-}"; shift 2 ;;
+        --bitstream)      BITSTREAM="${2:-}"; shift 2 ;;
+        --bin-style)      BIN_STYLE="${2:-}"; shift 2 ;;
+        --action)         ACTION="${2:-}"; shift 2 ;;
+        --action-timeout) ACTION_TIMEOUT="${2:-}"; shift 2 ;;
+        --ttl)            TTL="${2:-}"; shift 2 ;;
+        --wait)           WAIT_S="${2:-}"; shift 2 ;;
+        --stage-mode)     STAGE_MODE="${2:-}"; shift 2 ;;
+        --stage-dir)      STAGE_DIR="${2:-}"; shift 2 ;;
+        --stage-host)     STAGE_HOST="${2:-}"; shift 2 ;;
+        --block)          BLOCK="${2:-}"; shift 2 ;;
+        --run-tag)        RUN_TAG="${2:-}"; shift 2 ;;
+        --report-dir)     REPORT_DIR="${2:-}"; shift 2 ;;
+        --log-dir)        LOG_DIR="${2:-}"; shift 2 ;;
+        --out-dir)        OUT_DIR="${2:-}"; shift 2 ;;
+        --work-dir)       WORK_DIR="${2:-}"; shift 2 ;;
+        --lease-file)     LEASE_FILE="${2:-}"; shift 2 ;;
+        --holder)         HOLDER="${2:-}"; shift 2 ;;
+        --tier)           TIER="${2:-}"; shift 2 ;;
+        --method)         PROGRAM_METHOD="${2:-}"; shift 2 ;;
+        --execute)        EXECUTE=1; shift ;;
+        --dry-run)        EXECUTE=0; shift ;;
+        -h|--help)        usage; exit 0 ;;
+        *) bad "unknown option '$1'"; usage >&2; exit 2 ;;
+    esac
+done
+
+case "$SUB" in
+    preflight|program|test|collect|release|status|run) ;;
+    *) bad "unknown subcommand '$SUB'"; usage >&2; exit 2 ;;
+esac
+
+# DEFAULT EMPTY NUMBERS RATHER THAN LET ARITHMETIC INVENT ONE. An empty --ttl
+# from an unset make variable would otherwise become 0 in the first `$((...))`,
+# and a zero TTL is a lease that expires before it is used.
+for pair in "TTL:600" "WAIT_S:0" "ACTION_TIMEOUT:900"; do
+    n="${pair%%:*}"; d="${pair#*:}"
+    v="${!n}"
+    case "$v" in
+        ''|*[!0-9]*) eval "$n=$d" ;;
+    esac
+done
+
+MODE="dry-run"; [ "$EXECUTE" = "1" ] && MODE="execute"
+
+#-----------------------------------------------------------------------------
+# DEPENDENCIES
+#
+# Checked once, by name, with the reason - rather than letting the first call
+# fail with `command not found`, which on this path reads as the hub being down.
+# python3 is the JSON parser: CONTRACT.md section 10 allows stdlib Python and
+# nothing else, and jq is NOT installed on these hosts (it is what the previous
+# generation of this script depended on, and why it does not run here).
+#-----------------------------------------------------------------------------
+for dep in curl python3; do
+    command -v "$dep" >/dev/null 2>&1 || {
+        bad "missing dependency: $dep"
+        say "curl is the HTTP client; python3 (stdlib only) is the JSON parser."
+        say "jq is deliberately NOT used - it is absent on these hosts, which is"
+        say "why the previous generation of this script could not run here."
+        exit 2; }
+done
+
+#-----------------------------------------------------------------------------
+# THE RECORD
+#
+# Accumulated in memory and written by the EXIT trap, so a run that is killed
+# still leaves a manifest saying how far it got. A deploy that recorded nothing
+# and a deploy that never happened look identical from disk, and ci/deploy-
+# gates.sh has to be able to tell them apart.
+#-----------------------------------------------------------------------------
+MF_KEYS=()
+MF_VALS=()
+mf_set() {
+    local k="$1"; shift
+    local v="$*" i
+    # Tabs and newlines would split the manifest line and silently attach a
+    # value to the wrong key - the same defect ci/lib.sh scrubs for in a verdict.
+    v="${v//$'\t'/ }"; v="${v//$'\n'/ }"; v="${v//$'\r'/ }"
+    # LAST WRITE WINS, IN PLACE, RATHER THAN A SECOND LINE FOR THE SAME KEY. A
+    # step that runs twice - the holdership check runs before the program and
+    # again before the action - would otherwise emit the key twice, and a reader
+    # grepping the manifest would see two answers with nothing saying which is
+    # current. ci_mf takes the first, so an appended CORRECTION would be the one
+    # ignored: exactly the wrong half.
+    for i in "${!MF_KEYS[@]}"; do
+        if [ "${MF_KEYS[$i]}" = "$k" ]; then MF_VALS[$i]="$v"; return 0; fi
+    done
+    MF_KEYS+=("$k"); MF_VALS+=("$v")
+}
+MANIFEST_WRITTEN=0
+mf_write() {
+    [ "$MANIFEST_WRITTEN" = "1" ] && return 0
+    [ -n "$REPORT_DIR" ] || return 0
+    mkdir -p "$REPORT_DIR" 2>/dev/null || return 0
+    local f="$REPORT_DIR/deploy_manifest.txt" i
+    {
+        for i in "${!MF_KEYS[@]}"; do
+            printf '%s %s\n' "${MF_KEYS[$i]}" "${MF_VALS[$i]}"
+        done
+    } > "$f" 2>/dev/null && MANIFEST_WRITTEN=1
+}
+
+T0="$(date +%s)"
+mf_set stage deploy
+mf_set date "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+mf_set host "$(hostname -s 2>/dev/null || echo unknown)"
+mf_set user "${USER:-unknown}"
+mf_set tool fpgahub
+mf_set block "${BLOCK:-UNVERIFIED:not-passed}"
+mf_set run_tag "${RUN_TAG:-UNVERIFIED:not-passed}"
+mf_set deploy.mode "$MODE"
+mf_set deploy.subcommand "$SUB"
+mf_set deploy.board_group "${BOARD_GROUP:-UNVERIFIED:FPGAHUB_BOARD-unset}"
+mf_set deploy.target "${TARGET:-UNVERIFIED:FPGAHUB_TARGET-unset}"
+# RECORDED FROM ARGV, BEFORE ANYTHING RUNS. A run that aborts in preflight
+# never reaches the dispatch, and if this field were only written there, the
+# record would say "no action configured" - which is a statement about the
+# project's settings and would be false. What is true is that an action was
+# configured and this run did not get to it.
+mf_set deploy.test.action "${ACTION:-none}"
+
+#-----------------------------------------------------------------------------
+# THE ENDPOINT
+#
+# Precedence mirrors the stock client's, because a script that resolved the hub
+# differently from the CLI beside it is a script that talks to a different hub
+# than the one somebody just checked by hand:
+#
+#   --url  >  $FPGAHUB_ADDR (TCP wins outright)  >  $FPGAHUB_SOCKET  >  default
+#
+# The unix socket is the trusted transport: the daemon's admin gate lets a
+# unix-socket caller straight through and demands an ADMIN Bearer token from
+# everybody else. Program, reset and action dispatch are all admin-gated, so a
+# TCP deploy without FPGAHUB_TOKEN answers 401 - and a `write` role is not
+# enough either.
+#-----------------------------------------------------------------------------
+HUB_SOCKET=""
+HUB_BASE=""
+HUB_TRANSPORT=""
+CURL_XPORT=()
+
+resolve_endpoint() {
+    local spec="$URL"
+    [ -z "$spec" ] && spec="${FPGAHUB_ADDR:-}"
+    if [ -n "$spec" ]; then
+        case "$spec" in
+            unix:*)   HUB_SOCKET="${spec#unix:}"; HUB_TRANSPORT=unix ;;
+            http://*|https://*) HUB_BASE="${spec%/}"; HUB_TRANSPORT=tcp ;;
+            /*)       HUB_SOCKET="$spec"; HUB_TRANSPORT=unix ;;
+            *:*)      HUB_BASE="http://$spec"; HUB_TRANSPORT=tcp ;;
+            *)        HUB_BASE="http://$spec:7245"; HUB_TRANSPORT=tcp ;;
+        esac
+    else
+        HUB_SOCKET="${FPGAHUB_SOCKET:-/run/fpgahub/fpgahub.sock}"
+        HUB_TRANSPORT=unix
+    fi
+    if [ "$HUB_TRANSPORT" = "unix" ]; then
+        # The host part is ignored for a unix-socket request but curl still needs
+        # a syntactically complete URL.
+        HUB_BASE="http://localhost"
+        CURL_XPORT=(--unix-socket "$HUB_SOCKET")
+    else
+        CURL_XPORT=()
+        if [ -n "${FPGAHUB_TLS_DIR:-}" ] && [ -d "${FPGAHUB_TLS_DIR}" ]; then
+            HUB_BASE="${HUB_BASE/http:/https:}"
+            CURL_XPORT=(--cacert "$FPGAHUB_TLS_DIR/ca.crt"
+                        --cert   "$FPGAHUB_TLS_DIR/client.crt"
+                        --key    "$FPGAHUB_TLS_DIR/client.key")
+        fi
+    fi
+    mf_set deploy.hub.transport "$HUB_TRANSPORT"
+    # THE ENDPOINT IS DIGESTED, NOT NAMED. CONTRACT.md section 5: a manifest gets
+    # pasted into bug reports, and a socket path or a hub hostname is
+    # inventory-shaped disclosure. `fpga-flow-deploy status` prints the live one
+    # to whoever is entitled to ask.
+    local ep="$HUB_SOCKET$HUB_BASE"
+    mf_set deploy.hub.endpoint_sha256 \
+        "$(printf '%s' "$ep" | sha256sum 2>/dev/null | cut -c1-16 || echo UNVERIFIED:no-sha256sum)"
+    mf_set deploy.hub.admin_token "$([ -n "${FPGAHUB_TOKEN:-}" ] && echo present || echo absent)"
+}
+
+#-----------------------------------------------------------------------------
+# HTTP
+#
+# One function, so the timeout, the auth header and the transport are decided in
+# one place. The body and the status code come back separately: a handler that
+# 400s still returns JSON worth reading, and a caller that only looked at the
+# status would throw away the sentence naming the cause.
+#-----------------------------------------------------------------------------
+HTTP_STATUS=""
+HTTP_BODY=""
+CURL_PID=""
+
+## stop_request - kill an in-flight HTTP request. On the signal path the release
+## must not queue behind a program POST that nobody is waiting for any more.
+stop_request() {
+    [ -n "$CURL_PID" ] || return 0
+    kill "$CURL_PID" 2>/dev/null
+    CURL_PID=""
+}
+
+## http <METHOD> <path under /api/v1> [json body] [timeout seconds]
+##
+## THE REQUEST RUNS IN THE BACKGROUND AND IS `wait`ED FOR, WHICH LOOKS LIKE
+## ceremony and is the only reason Ctrl-C gives the board back.
+##
+## Bash does not run a trap handler while a FOREGROUND child is running: it
+## defers it until the child exits. A program POST is minutes and an action
+## dispatch is however long the action takes, so with a plain `out="$(curl ...)"`
+## a SIGINT during either one would sit unhandled until curl finished - and the
+## lease would be held for all of it. `wait` is interruptible, so a signal is
+## delivered immediately and the release goes out at once.
+##
+## MEASURED, NOT REASONED: the first version of this script used command
+## substitution, and a SIGINT delivered to the driver alone LEAKED THE LEASE -
+## no release request, exit 0. It only appeared to work when the test signalled
+## the whole process group, because that killed curl too. CI kills a process
+## group; a person typing `kill %1` does not.
+http() {
+    local method="$1" path="$2" body="${3:-}" tmo="${4:-30}"
+    local out rc tmp
+    local args=(-sS -X "$method" --max-time "$tmo" "${CURL_XPORT[@]}"
+                -w $'\n__HTTP_STATUS__%{http_code}')
+    [ -n "${FPGAHUB_TOKEN:-}" ] && args+=(-H "Authorization: Bearer $FPGAHUB_TOKEN")
+    if [ -n "$body" ]; then
+        args+=(-H 'Content-Type: application/json' --data-binary "$body")
+    fi
+    tmp="$(mktemp "${TMPDIR:-/tmp}/fpga-flow-deploy.XXXXXX")" || {
+        HTTP_STATUS="no-tmpfile"; HTTP_BODY=""; return 1; }
+    curl "${args[@]}" "$HUB_BASE/api/v1$path" > "$tmp" 2>&1 &
+    CURL_PID=$!
+    wait "$CURL_PID"
+    rc=$?
+    CURL_PID=""
+    out="$(cat "$tmp" 2>/dev/null)"
+    rm -f "$tmp"
+    if [ "$rc" -ne 0 ]; then
+        HTTP_BODY="$out"
+        # curl 28 is a timeout. It is called out by name because on the dispatch
+        # path it does NOT mean the action failed - the action is still running
+        # on the board and we have merely stopped listening.
+        if [ "$rc" = "28" ]; then HTTP_STATUS="timeout"; else HTTP_STATUS="curl-$rc"; fi
+        return 1
+    fi
+    HTTP_STATUS="${out##*__HTTP_STATUS__}"
+    HTTP_BODY="${out%$'\n'__HTTP_STATUS__*}"
+    case "$HTTP_STATUS" in 2??) return 0 ;; *) return 1 ;; esac
+}
+
+## jget <dotted.path> [default] - read one value out of $HTTP_BODY.
+## stdlib json, no jq. A missing key yields the default rather than an error,
+## because a handler that omits an optional field is not a broken response.
+jget() {
+    local path="$1" dflt="${2:-}"
+    printf '%s' "$HTTP_BODY" | python3 -c '
+import json, sys
+path, dflt = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(dflt); raise SystemExit(0)
+for part in path.split("."):
+    if isinstance(d, dict) and part in d:
+        d = d[part]
+    elif isinstance(d, list) and part.isdigit() and int(part) < len(d):
+        d = d[int(part)]
+    else:
+        print(dflt); raise SystemExit(0)
+if isinstance(d, bool):
+    print("yes" if d else "no")
+elif d is None:
+    print(dflt)
+elif isinstance(d, (dict, list)):
+    print(json.dumps(d))
+else:
+    print(d)
+' "$path" "$dflt" 2>/dev/null
+}
+
+## jhas_substr <dotted.path> <needle> - 0 when that string field contains it
+jhas_substr() {
+    local v; v="$(jget "$1")"
+    case "$v" in *"$2"*) return 0 ;; *) return 1 ;; esac
+}
+
+## json_str <s> - one JSON string literal, escaped by python rather than by hand
+json_str() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+
+#-----------------------------------------------------------------------------
+# THE LEASE, AND THE TRAP THAT GIVES IT BACK
+#
+# THE TRAP IS ARMED BEFORE THE ACQUIRE, NOT AFTER IT. Between sending an acquire
+# and reading its token there is a window in which the daemon has granted a lease
+# we do not yet know the token for; arming afterwards would make that window
+# unrecoverable. Arming first does not close it - a kill in that exact window
+# still leaks - but it shrinks it to the round-trip, and the TTL closes the rest.
+# The residual window is written down in docs/DEPLOY.md rather than papered over.
+#
+# THE HOLDER IS DISTINCTIVE ON PURPOSE. The `user` field on this hub is the same
+# string for everybody who works here, so it identifies nothing. The holder is
+# the only handle a person has on a lease that has outlived its run - and since
+# the dead-PID reaper skips any lease whose holder is not the daemon's own
+# hostname, leases from here DO outlive their runs whenever a heartbeat stops.
+#-----------------------------------------------------------------------------
+LEASE_TOKEN=""
+LEASE_ACQUIRED=0
+LEASE_RELEASED=0
+HB_PID=""
+
+make_holder() {
+    [ -n "$HOLDER" ] && return 0
+    local h b r
+    h="$(hostname -s 2>/dev/null || echo unknown)"
+    b="${BLOCK:-noblock}"; r="${RUN_TAG:-norun}"
+    HOLDER="fpga-flow-${b}-${r}-${h}-$$-$(date +%s)"
+    # One character class, so a board name or a run tag with a slash in it cannot
+    # turn the holder into something that reads as a path.
+    HOLDER="$(printf '%s' "$HOLDER" | tr -c 'A-Za-z0-9._-' '-')"
+}
+
+write_lease_file() {
+    [ -n "$LEASE_FILE" ] || return 0
+    mkdir -p "$(dirname "$LEASE_FILE")" 2>/dev/null || return 0
+    # THE TOKEN GOES TO DISK THE INSTANT IT IS PARSED, before any work, so that
+    # `fpga-flow-deploy release` can give the board back after a kill -9 that no
+    # trap can catch. 0600: a token is a capability.
+    ( umask 077
+      printf 'FPGAHUB_GROUP=%s\nFPGAHUB_HOLDER=%s\nFPGAHUB_TOKEN_LEASE=%s\nFPGAHUB_TTL=%s\n' \
+             "$BOARD_GROUP" "$HOLDER" "$LEASE_TOKEN" "$TTL" > "$LEASE_FILE" ) 2>/dev/null
+}
+clear_lease_file() { [ -n "$LEASE_FILE" ] && rm -f "$LEASE_FILE" 2>/dev/null; return 0; }
+
+## lease_release - token-scoped, idempotent, and NEVER a revoke.
+lease_release() {
+    [ "$LEASE_RELEASED" = "1" ] && return 0
+    [ -n "$LEASE_TOKEN" ] || return 0
+    LEASE_RELEASED=1
+    local body
+    body="{\"holder\":$(json_str "$HOLDER"),\"token\":$(json_str "$LEASE_TOKEN")}"
+    if http DELETE "/boards/$BOARD_GROUP/lease" "$body" 15; then
+        local rel; rel="$(jget released "[]")"
+        if [ "$rel" = "[]" ] || [ "$rel" = "no" ]; then
+            mf_set deploy.release.result not-held
+            warn "release: the hub had no lease of ours to release - it had already gone"
+        else
+            mf_set deploy.release.result ok
+            ok "lease released ($rel)"
+        fi
+        clear_lease_file
+    else
+        mf_set deploy.release.result "http-$HTTP_STATUS"
+        mf_set deploy.release.error "$(printf '%s' "$HTTP_BODY" | head -c 300)"
+        bad "COULD NOT RELEASE the lease on '$BOARD_GROUP' (HTTP $HTTP_STATUS)."
+        say "The board stays held until its TTL of ${TTL}s runs out. Nothing else"
+        say "will free it: the dead-PID reaper skips leases held from this host."
+        say "Retry with:  make deploy-release"
+        say "DO NOT revoke it - revoke is final for the holder and cannot tell"
+        say "our stale lease from a colleague's live one."
+    fi
+}
+
+stop_heartbeat() {
+    [ -n "$HB_PID" ] || return 0
+    kill "$HB_PID" 2>/dev/null
+    wait "$HB_PID" 2>/dev/null
+    HB_PID=""
+}
+
+SSE_PID=""
+stop_sse() {
+    [ -n "$SSE_PID" ] || return 0
+    kill "$SSE_PID" 2>/dev/null
+    wait "$SSE_PID" 2>/dev/null
+    SSE_PID=""
+}
+
+on_exit() {
+    local rc=$?
+    stop_request
+    stop_sse
+    stop_heartbeat
+    lease_release
+    mf_set runtime_s "$(( $(date +%s) - T0 ))"
+    mf_write
+    return $rc
+}
+on_signal() {
+    local sig="$1" code="$2"
+    printf '\n'
+    warn "$sig received - releasing the board before exiting"
+    mf_set deploy.interrupted "$sig"
+    stop_request
+    stop_sse
+    stop_heartbeat
+    lease_release
+    mf_set runtime_s "$(( $(date +%s) - T0 ))"
+    mf_write
+    # `trap - EXIT` first, so the EXIT handler does not run a second time and
+    # overwrite this exit code with its own.
+    trap - EXIT
+    exit "$code"
+}
+
+# ARMED HERE, BEFORE ANY SUBCOMMAND RUNS AND THEREFORE BEFORE ANY ACQUIRE.
+trap on_exit EXIT
+trap 'on_signal INT 130'  INT
+trap 'on_signal TERM 143' TERM
+
+## lease_acquire - returns 0 granted, 75 queued/busy, 2 refused
+lease_acquire() {
+    make_holder
+    mf_set deploy.lease.holder "$HOLDER"
+    mf_set deploy.lease.ttl_s "$TTL"
+    mf_set deploy.lease.tier "$TIER"
+
+    if [ "$EXECUTE" != "1" ]; then
+        say "WOULD acquire: POST /boards/$BOARD_GROUP/lease"
+        say "               holder=$HOLDER user=${USER:-unknown} ttl_seconds=$TTL tier=$TIER"
+        say "               (no client_pid: the reaper skips leases held from this"
+        say "                host, so a pid in the record would advertise a safety"
+        say "                net that does not exist)"
+        mf_set deploy.lease.acquired no
+        mf_set deploy.lease.why "dry-run"
+        return 0
+    fi
+
+    local body
+    body="{\"holder\":$(json_str "$HOLDER"),\"user\":$(json_str "${USER:-unknown}")"
+    body="$body,\"ttl_seconds\":$TTL,\"tier\":$(json_str "$TIER")}"
+
+    local deadline; deadline=$(( $(date +%s) + WAIT_S ))
+    while :; do
+        if ! http POST "/boards/$BOARD_GROUP/lease" "$body" 30; then
+            mf_set deploy.lease.acquired no
+            mf_set deploy.lease.why "http-$HTTP_STATUS"
+            bad "lease acquire failed (HTTP $HTTP_STATUS): $(printf '%s' "$HTTP_BODY" | head -c 300)"
+            return 2
+        fi
+        local kind; kind="$(jget kind unknown)"
+        case "$kind" in
+            granted)
+                LEASE_TOKEN="$(jget token)"
+                if [ -z "$LEASE_TOKEN" ]; then
+                    mf_set deploy.lease.acquired no
+                    mf_set deploy.lease.why "granted-without-token"
+                    bad "the hub said 'granted' and returned no token. Without one this"
+                    say "run can neither prove it holds the board nor release it."
+                    return 2
+                fi
+                LEASE_ACQUIRED=1
+                write_lease_file
+                mf_set deploy.lease.acquired yes
+                mf_set deploy.lease.token_prefix "${LEASE_TOKEN:0:8}"
+                mf_set deploy.lease.expires_at "$(jget leases.0.expires_at "$(jget lease.expires_at UNVERIFIED:not-reported)")"
+                ok "lease granted on group '$BOARD_GROUP' (holder $HOLDER, ttl ${TTL}s)"
+                start_heartbeat
+                return 0 ;;
+            queued)
+                local pos; pos="$(jget position '?')"
+                if [ "$WAIT_S" -le 0 ] || [ "$(date +%s)" -ge "$deadline" ]; then
+                    mf_set deploy.lease.acquired no
+                    mf_set deploy.lease.why "queued-position-$pos"
+                    mf_set deploy.program.attempted no
+                    mf_set deploy.program.why "the board group is leased by somebody else (queue position $pos)"
+                    warn "the board group '$BOARD_GROUP' is held by somebody else (queue position $pos)."
+                    lease_queue_cancel
+                    return 75
+                fi
+                say "queued at position $pos; re-polling (up to ${WAIT_S}s)"
+                sleep 15 ;;
+            *)
+                mf_set deploy.lease.acquired no
+                mf_set deploy.lease.why "unexpected-kind-$kind"
+                bad "unexpected acquire response kind '$kind'"
+                return 2 ;;
+        esac
+    done
+}
+
+# A QUEUE ENTRY LEFT BEHIND IS AS RUDE AS A HELD LEASE: it takes the board the
+# moment the current holder finishes, for a run that gave up minutes ago. This is
+# best-effort and SAYS SO when it fails, with the command to type - guessing
+# silently that it worked is how a phantom entry gets blamed on the hub.
+lease_queue_cancel() {
+    local body; body="{\"holder\":$(json_str "$HOLDER")}"
+    if http DELETE "/boards/$BOARD_GROUP/queue" "$body" 15; then
+        say "queue entry cancelled"
+        mf_set deploy.lease.queue_cancelled yes
+    else
+        mf_set deploy.lease.queue_cancelled "UNVERIFIED:http-$HTTP_STATUS"
+        warn "could not cancel our queue entry (HTTP $HTTP_STATUS). If it survives it"
+        say "will take the board as soon as the current holder finishes. Cancel it:"
+        say "  fpgahub board lease cancel $BOARD_GROUP --holder $HOLDER"
+    fi
+}
+
+## start_heartbeat - TTL/3, in the background.
+##
+## TTL/3 rather than TTL/2 so that ONE lost heartbeat is survivable: at TTL/2 a
+## single dropped request leaves no second chance before expiry, and this hub's
+## heartbeat can transiently 403 during a queue promotion.
+start_heartbeat() {
+    local interval=$(( TTL / 3 ))
+    [ "$interval" -lt 20 ] && interval=20
+    mf_set deploy.lease.heartbeat_interval_s "$interval"
+    (
+        # The child must not inherit the parent's traps: a heartbeat process that
+        # ran the release handler on its own exit would give the board away in
+        # the middle of the run.
+        trap - EXIT INT TERM
+        while sleep "$interval"; do
+            local hb
+            hb="{\"holder\":$(json_str "$HOLDER"),\"token\":$(json_str "$LEASE_TOKEN"),\"ttl_seconds\":$TTL}"
+            curl -sS -X POST --max-time 15 "${CURL_XPORT[@]}" \
+                 ${FPGAHUB_TOKEN:+-H "Authorization: Bearer $FPGAHUB_TOKEN"} \
+                 -H 'Content-Type: application/json' --data-binary "$hb" \
+                 "$HUB_BASE/api/v1/boards/$BOARD_GROUP/lease/heartbeat" \
+                 >/dev/null 2>&1 || true
+        done
+    ) &
+    HB_PID=$!
+    # THE HEARTBEAT STAYS A SUBSHELL because it loops, so stop_heartbeat reaps
+    # the loop and may leave one in-flight heartbeat curl behind it. That one is
+    # capped at 15s, writes to /dev/null and holds no descriptor of ours, so it
+    # is harmless - unlike the event stream, whose orphan held the run's stdout.
+    say "heartbeat every ${interval}s (pid $HB_PID)"
+}
+
+#-----------------------------------------------------------------------------
+# ENFORCEMENT: DO WE ACTUALLY HOLD THIS BOARD?
+#
+# THE HUB WILL NOT ANSWER THIS FOR US. The program handler and the action
+# handler check a board exists and an admin token is present, and neither looks
+# at a lease. So the question has to be asked explicitly, and it has to be asked
+# WITH OUR TOKEN - `GET /boards/<g>/lease` returns holder and expiry but never
+# the token, so a holder-string comparison is all it can support, and two runs
+# from this host can produce the same holder string if somebody sets --holder.
+#
+# `GET /boards/<g>/lease/wait?token=...&timeout=1` is the only token-scoped
+# question the API answers: 200 means our token holds the board now, 408 means it
+# does not. That is the check, and a failure to reach it is UNVERIFIED, not a
+# pass.
+#-----------------------------------------------------------------------------
+assert_held() {
+    if [ "$EXECUTE" != "1" ]; then
+        mf_set deploy.lease.held_at_program no
+        mf_set deploy.lease.held_why "dry-run: no lease was taken"
+        return 0
+    fi
+    if [ -z "$LEASE_TOKEN" ]; then
+        mf_set deploy.lease.held_at_program no
+        mf_set deploy.lease.held_why "no token"
+        mf_set deploy.program.attempted no
+        mf_set deploy.program.why "refused: this run holds no lease on the board group"
+        bad "refusing to touch '$TARGET': this run holds no lease on group '$BOARD_GROUP'."
+        say "The hub would ALLOW it - neither program nor action dispatch checks"
+        say "holdership - which is exactly why this refusal exists here."
+        return 1
+    fi
+    if http GET "/boards/$BOARD_GROUP/lease/wait?token=$LEASE_TOKEN&timeout=1" "" 20; then
+        mf_set deploy.lease.held_at_program yes
+        ok "lease confirmed held by our token immediately before touching the board"
+        return 0
+    fi
+    if [ "$HTTP_STATUS" = "408" ]; then
+        mf_set deploy.lease.held_at_program no
+        mf_set deploy.lease.held_why "token does not hold the board (HTTP 408)"
+        mf_set deploy.program.attempted no
+        mf_set deploy.program.why "refused: our token no longer holds the board"
+        bad "our token does NOT hold group '$BOARD_GROUP' any more - the lease"
+        say "expired, or an admin revoked it. Refusing to program a board we do"
+        say "not hold. Somebody else may be using it right now."
+        return 1
+    fi
+    mf_set deploy.lease.held_at_program "UNVERIFIED:holdership-check-http-$HTTP_STATUS"
+    mf_set deploy.lease.held_why "the holdership check itself did not answer"
+    mf_set deploy.program.attempted no
+    mf_set deploy.program.why "refused: holdership could not be confirmed, and an unanswered check is not a pass"
+    bad "could not confirm holdership (HTTP $HTTP_STATUS). Refusing rather than"
+    say "assuming: an unanswered check is not a pass."
+    return 1
+}
+
+#-----------------------------------------------------------------------------
+# STAGING (fact 5)
+#-----------------------------------------------------------------------------
+SERVER_PATH=""
+
+stage_bitstream() {
+    local mode="$STAGE_MODE"
+    if [ -z "$BITSTREAM" ]; then
+        mf_set deploy.bitstream.path "UNVERIFIED:no bitstream configured"
+        bad "no bitstream. DEPLOY_BITSTREAM is discovered from OUT_DIR/BLOCK.bit;"
+        say "an empty one means the bitstream stage has not produced a file yet."
+        return 1
+    fi
+    if [ ! -s "$BITSTREAM" ]; then
+        mf_set deploy.bitstream.path "$BITSTREAM"
+        if [ -e "$BITSTREAM" ]; then
+            bad "$BITSTREAM is ZERO BYTES - the shape Vivado leaves when"
+            say "write_bitstream opened its output and then aborted."
+        else
+            bad "no bitstream at $BITSTREAM"
+        fi
+        return 1
+    fi
+    mf_set deploy.bitstream.path "$BITSTREAM"
+    mf_set deploy.bitstream.bytes "$(stat -c %s "$BITSTREAM" 2>/dev/null || echo UNVERIFIED:stat-failed)"
+    mf_set deploy.bitstream.sha256 \
+        "$(sha256sum "$BITSTREAM" 2>/dev/null | cut -d' ' -f1 || echo UNVERIFIED:no-sha256sum)"
+    # BIN_STYLE is not used to program a .bit over JTAG, but it is recorded here
+    # because a board that comes up dead after a deploy is far more often a .bin
+    # converted in the wrong family style than a bad bitstream, and the run that
+    # deployed is the run somebody will read first.
+    mf_set deploy.bin_style "${BIN_STYLE:-UNVERIFIED:unset}"
+
+    if [ "$mode" = "auto" ]; then
+        # A unix-socket connection can only reach a daemon on this machine, so
+        # the daemon's filesystem is ours. That is a deduction from the
+        # transport, not a guess about hostnames.
+        if [ "$HUB_TRANSPORT" = "unix" ]; then mode=local; else mode=refuse; fi
+    fi
+
+    case "$mode" in
+        local)
+            SERVER_PATH="$(cd "$(dirname "$BITSTREAM")" && pwd)/$(basename "$BITSTREAM")"
+            mf_set deploy.stage.mode local ;;
+        shared)
+            if [ -z "$STAGE_DIR" ]; then
+                bad "FPGAHUB_STAGE_MODE=shared needs FPGAHUB_STAGE_DIR - the path"
+                say "THE DAEMON sees. It is not necessarily the path we see."
+                mf_set deploy.stage.mode "UNVERIFIED:shared-without-stage-dir"
+                return 1
+            fi
+            mkdir -p "$STAGE_DIR" 2>/dev/null
+            cp -f "$BITSTREAM" "$STAGE_DIR/" || { bad "could not copy into $STAGE_DIR"; return 1; }
+            SERVER_PATH="$STAGE_DIR/$(basename "$BITSTREAM")"
+            mf_set deploy.stage.mode shared ;;
+        scp)
+            if [ -z "$STAGE_HOST" ] || [ -z "$STAGE_DIR" ]; then
+                bad "FPGAHUB_STAGE_MODE=scp needs both FPGAHUB_STAGE_HOST and FPGAHUB_STAGE_DIR"
+                mf_set deploy.stage.mode "UNVERIFIED:scp-without-host-or-dir"
+                return 1
+            fi
+            if [ "$EXECUTE" != "1" ]; then
+                say "WOULD scp $BITSTREAM to $STAGE_HOST:$STAGE_DIR/"
+            else
+                command -v scp >/dev/null 2>&1 || { bad "scp is not installed"; return 1; }
+                scp -q "$BITSTREAM" "$STAGE_HOST:$STAGE_DIR/" || { bad "scp to $STAGE_HOST failed"; return 1; }
+            fi
+            SERVER_PATH="$STAGE_DIR/$(basename "$BITSTREAM")"
+            mf_set deploy.stage.mode scp ;;
+        refuse|*)
+            mf_set deploy.stage.mode "UNVERIFIED:auto-over-tcp"
+            bad "the hub is reached over TCP, so its filesystem is NOT this one, and"
+            say "the program endpoint takes a path the DAEMON opens. There is no"
+            say "upload on that endpoint. Choose one:"
+            say "  FPGAHUB_STAGE_MODE=shared FPGAHUB_STAGE_DIR=<path the daemon sees>"
+            say "  FPGAHUB_STAGE_MODE=scp    FPGAHUB_STAGE_HOST=<host> FPGAHUB_STAGE_DIR=<dir>"
+            say "  or run the deploy on the daemon host over its unix socket."
+            return 1 ;;
+    esac
+    mf_set deploy.stage.server_path "$SERVER_PATH"
+    say "server-side image path: $SERVER_PATH"
+    return 0
+}
+
+#-----------------------------------------------------------------------------
+# SUBCOMMANDS
+#-----------------------------------------------------------------------------
+
+do_preflight() {
+    local rc=0
+    head_ "preflight - can this run deploy at all? (read-only)"
+
+    if [ -z "$BOARD_GROUP" ] || [ -z "$TARGET" ]; then
+        bad "both FPGAHUB_BOARD (the GROUP) and FPGAHUB_TARGET (the TARGET) are required."
+        say "They are DIFFERENT namespaces and do not overlap:"
+        say "  leases, queues, reservations   /boards/<group>/..."
+        say "  program, reset, actions        /targets/<target>/..."
+        say "On this hub a target is its group's name plus _pl, _ps or _mcc."
+        say "Got: group='${BOARD_GROUP:-unset}' target='${TARGET:-unset}'"
+        return 2
+    fi
+    say "group  (lease scope)   $BOARD_GROUP"
+    say "target (program scope) $TARGET"
+
+    # THE GROUP RESOLVES. Asked through the lease route, which is the group
+    # namespace - asking /targets/<group> would 404 for the right reason and the
+    # wrong one at once.
+    if http GET "/boards/$BOARD_GROUP/lease" "" 15; then
+        local h; h="$(jget lease.holder "$(jget leases.0.holder '')")"
+        if [ -n "$h" ]; then
+            say "group is currently held by '$h'"
+            mf_set deploy.preflight.group_holder "$h"
+        else
+            say "group is free"
+            mf_set deploy.preflight.group_holder none
+        fi
+        mf_set deploy.preflight.group_resolved yes
+    else
+        mf_set deploy.preflight.group_resolved "UNVERIFIED:http-$HTTP_STATUS"
+        bad "board GROUP '$BOARD_GROUP' does not resolve on this hub (HTTP $HTTP_STATUS)."
+        say "If this name has a _pl/_ps suffix it is a TARGET, not a group."
+        rc=1
+    fi
+
+    # THE TARGET RESOLVES.
+    if http GET "/targets/$TARGET" "" 15; then
+        mf_set deploy.preflight.target_resolved yes
+        say "target resolves"
+    else
+        mf_set deploy.preflight.target_resolved "UNVERIFIED:http-$HTTP_STATUS"
+        bad "TARGET '$TARGET' does not resolve (HTTP $HTTP_STATUS)."
+        say "A board GROUP on a target route is a 404 that reads as a dead board."
+        rc=1
+    fi
+
+    # THE PROGRAM METHOD. THIS IS THE KR260 GAP, AND IT IS FOUND HERE ON PURPOSE
+    # rather than at the POST: with no [program] block the server answers HTTP
+    # 400 with a message about a missing method, minutes into a deploy, and that
+    # reads as a rejected bitstream. It is a hub configuration gap.
+    if http GET "/targets/$TARGET/program" "" 15; then
+        local methods; methods="$(jget methods "[]")"
+        if [ "$methods" = "[]" ] || [ -z "$methods" ]; then
+            mf_set deploy.preflight.program_method none
+            bad "target '$TARGET' has NO program method configured on the hub."
+            say "A program request will be refused with HTTP 400 by the SERVER."
+            say "This is not a board fault and not a bad bitstream: nobody has"
+            say "configured a [boards.$TARGET.program.*] block."
+            say "Every KR260 target is in this state today - see docs/DEPLOY.md."
+            rc=1
+        else
+            local m; m="$(jget methods.0.name "$(jget methods.0.plugin unknown)")"
+            mf_set deploy.preflight.program_method "$m"
+            mf_set deploy.preflight.program_methods "$methods"
+            say "program method: $m"
+        fi
+    else
+        mf_set deploy.preflight.program_method "UNVERIFIED:http-$HTTP_STATUS"
+        bad "could not read the program methods for '$TARGET' (HTTP $HTTP_STATUS)"
+        rc=1
+    fi
+
+    # THE ACTION, IF ONE IS CONFIGURED. Checked against the hub's own list rather
+    # than against the project's fpgahub.toml: the daemon binds a manifest per
+    # target, and a project file that is not the bound one is a file nobody runs.
+    if [ -n "$ACTION" ]; then
+        if http GET "/targets/$TARGET/actions" "" 15; then
+            if jhas_substr actions "\"$ACTION\""; then
+                mf_set deploy.preflight.action_declared yes
+                say "action '$ACTION' is declared on this target"
+            else
+                mf_set deploy.preflight.action_declared no
+                bad "action '$ACTION' is NOT among the actions this hub has bound to"
+                say "'$TARGET'. A project fpgahub.toml that the daemon has not been"
+                say "pointed at (boards.<t>.manifest_path) is a file nobody runs."
+                rc=1
+            fi
+        else
+            mf_set deploy.preflight.action_declared "UNVERIFIED:http-$HTTP_STATUS"
+            warn "could not list actions on '$TARGET' (HTTP $HTTP_STATUS)"
+        fi
+    else
+        mf_set deploy.test.action none
+        say "no action configured: this deploy would program and test NOTHING"
+    fi
+
+    stage_bitstream || rc=1
+
+    # ADMIN AUTH. Program, reset and dispatch are admin-gated; the unix socket is
+    # trusted and TCP is not. A `write` role token is not enough. Better to say so
+    # now than to collect a 401 after the lease is taken.
+    if [ "$HUB_TRANSPORT" = "tcp" ] && [ -z "${FPGAHUB_TOKEN:-}" ]; then
+        bad "this hub is reached over TCP and FPGAHUB_TOKEN is unset. Program,"
+        say "reset and action dispatch are admin-gated: they will answer 401."
+        say "Only a unix-socket caller is trusted without a token, and a token"
+        say "with role 'write' is not sufficient - it must be 'admin'."
+        rc=1
+    fi
+
+    [ "$rc" = "0" ] && ok "preflight: this run could deploy"
+    return $rc
+}
+
+do_status() {
+    head_ "status - what the hub says now (read-only)"
+    say "endpoint     $([ "$HUB_TRANSPORT" = unix ] && echo "unix:$HUB_SOCKET" || echo "$HUB_BASE")"
+    say "group        ${BOARD_GROUP:-(none)}"
+    say "target       ${TARGET:-(none)}"
+    if [ -n "$BOARD_GROUP" ]; then
+        if http GET "/boards/$BOARD_GROUP/lease" "" 15; then
+            printf '   lease        %s\n' "$HTTP_BODY"
+        else
+            printf '   lease        HTTP %s %s\n' "$HTTP_STATUS" "$(printf '%s' "$HTTP_BODY" | head -c 200)"
+        fi
+    fi
+    if [ -n "$TARGET" ]; then
+        if http GET "/targets/$TARGET/status" "" 15; then
+            printf '   target       %s\n' "$(printf '%s' "$HTTP_BODY" | head -c 600)"
+        else
+            printf '   target       HTTP %s\n' "$HTTP_STATUS"
+        fi
+    fi
+    if [ -n "$LEASE_FILE" ] && [ -r "$LEASE_FILE" ]; then
+        say "this run recorded a lease at $LEASE_FILE - 'make deploy-release' gives it back"
+    fi
+    return 0
+}
+
+do_program() {
+    head_ "program"
+    stage_bitstream || return 1
+    assert_held || return 1
+
+    if [ "$EXECUTE" != "1" ]; then
+        say "WOULD program: POST /targets/$TARGET/program"
+        say "               bitstream=$SERVER_PATH"
+        say "               method=${PROGRAM_METHOD:-<hub default>} confirm=true"
+        say "               force=false skip_if_loaded=FALSE"
+        say ""
+        say "  skip_if_loaded is sent FALSE on purpose. The hub's skip compares the"
+        say "  candidate file's sha256 against the fingerprint it recorded last time"
+        say "  it believed a program succeeded, plus the lease token. Neither term"
+        say "  reads the device, and a reset does NOT clear either - so a PL blanked"
+        say "  by a reboot or a POR is still 'already loaded' to the daemon, and the"
+        say "  deploy would return ok having programmed nothing."
+        mf_set deploy.program.attempted no
+        mf_set deploy.program.why "dry-run"
+        return 0
+    fi
+
+    local body
+    body="{\"bitstream\":$(json_str "$SERVER_PATH"),\"confirm\":true,\"force\":false,\"skip_if_loaded\":false"
+    [ -n "$PROGRAM_METHOD" ] && body="$body,\"method\":$(json_str "$PROGRAM_METHOD")"
+    body="$body}"
+
+    mf_set deploy.program.attempted yes
+    say "programming $TARGET ..."
+    # Its own generous timeout: a JTAG program of a large device is minutes, and
+    # the stock client's un-overridable 30 s is exactly the hazard this avoids.
+    http POST "/targets/$TARGET/program" "$body" "$ACTION_TIMEOUT"
+    local prc=$?
+    mf_set deploy.program.http_status "$HTTP_STATUS"
+
+    if [ "$prc" -ne 0 ]; then
+        mf_set deploy.program.error "$(printf '%s' "$HTTP_BODY" | head -c 400)"
+        bad "program failed: HTTP $HTTP_STATUS"
+        say "$(printf '%s' "$HTTP_BODY" | head -c 400)"
+        case "$HTTP_STATUS" in
+            400) say ""
+                 say "HTTP 400 here is most often a target with no program method."
+                 say "Run 'make deploy-status' or the preflight, which asks first." ;;
+            401|403) say ""
+                 say "Admin-gated. Over TCP this needs an ADMIN Bearer token." ;;
+        esac
+        return 1
+    fi
+
+    mf_set deploy.program.ok "$(jget ok UNVERIFIED:not-reported)"
+    mf_set deploy.program.plugin "$(jget plugin UNVERIFIED:not-reported)"
+    mf_set deploy.program.fingerprint "$(jget fingerprint UNVERIFIED:not-reported)"
+    mf_set deploy.program.part "$(jget part UNVERIFIED:not-reported)"
+    mf_set deploy.program.message "$(jget message '')"
+
+    # THE DAEMON'S SKIP PATH RETURNS ok:true HAVING PROGRAMMED NOTHING, and the
+    # only thing that betrays it is the message prefix - the response's `plugin`
+    # field is recomputed from config afterwards and names the real plugin.
+    if jhas_substr message "skip:"; then
+        mf_set deploy.program.skipped yes
+        bad "the daemon SKIPPED programming - it believes this image is already loaded."
+        say "$(jget message)"
+        say "We sent skip_if_loaded=false, so this should not have happened; treat"
+        say "it as a hub-side finding rather than a deploy that worked."
+        return 1
+    fi
+    mf_set deploy.program.skipped no
+
+    # THE DONE READBACK. There is no boolean for it anywhere in the response: the
+    # programming Tcl prints PROGRAM_VERIFIED when it read DONE back, and the
+    # plugin appends the literal ' (DONE unverified)' to the message when it did
+    # not. POSITIVE EVIDENCE ONLY - the absence of the suffix is not proof, since
+    # a plugin that never emits either string would otherwise read as verified.
+    local out; out="$(jget stdout_tail '')"
+    case "$out" in
+        *"PROGRAM_VERIFIED"*)
+            mf_set deploy.verify.program_verified yes
+            mf_set deploy.verify.done_property present
+            ok "DONE asserted - the device is configured" ;;
+        *"exposes no DONE_PIN"*)
+            mf_set deploy.verify.done_property none
+            mf_set deploy.verify.program_verified "UNVERIFIED:device exposes no DONE_PIN property"
+            warn "this device exposes NO DONE property. The program request completed"
+            say "and NOTHING read back off the device. That is not a pass: whether"
+            say "the fabric is configured is unknown, and a measurement taken from"
+            say "this board cannot be attributed to this bitstream." ;;
+        *)
+            if jhas_substr message "(DONE unverified)"; then
+                mf_set deploy.verify.program_verified no
+                mf_set deploy.verify.done_property "UNVERIFIED:not reported"
+                mf_set deploy.verify.detail "message carries the (DONE unverified) suffix"
+                bad "the plugin reports DONE UNVERIFIED"
+            else
+                mf_set deploy.verify.program_verified \
+                    "UNVERIFIED:no PROGRAM_VERIFIED and no (DONE unverified) in the response"
+                mf_set deploy.verify.done_property "UNVERIFIED:not reported"
+                warn "no DONE evidence either way in the response (plugin $(jget plugin '?'))."
+                say "stdout_tail is the last 4000 characters only, so a chatty program"
+                say "run can push the line out of it. Not treated as a pass."
+            fi ;;
+    esac
+
+    ok "program request accepted (HTTP $HTTP_STATUS, fingerprint $(jget fingerprint '?'))"
+    return 0
+}
+
+do_test() {
+    head_ "test"
+    if [ -z "$ACTION" ]; then
+        mf_set deploy.test.action none
+        warn "no DEPLOY_ACTION configured: nothing was run on the board."
+        say "The board has an image on it. That is a deploy, not a test."
+        return 0
+    fi
+    mf_set deploy.test.action "$ACTION"
+    mf_set deploy.test.timeout_s "$ACTION_TIMEOUT"
+    # SET BEFORE THE FIRST THING THAT CAN REFUSE, and flipped to yes only once
+    # the POST has actually gone out. Without this flag "no final state" is
+    # ambiguous between an action that timed out - which means it is STILL
+    # RUNNING on the board - and one that was never sent. Those two want
+    # opposite responses from the reader.
+    mf_set deploy.test.dispatched no
+    assert_held || return 1
+
+    local sse_log="${LOG_DIR:+$LOG_DIR/deploy_sse.jsonl}"
+    mf_set deploy.test.event_log "${sse_log:-UNVERIFIED:no log dir}"
+
+    if [ "$EXECUTE" != "1" ]; then
+        say "WOULD subscribe: GET /events?types=action.start,action.log,action.end&board=$TARGET&action_id=$ACTION"
+        say "                 -> ${sse_log:-<no log dir>}"
+        say "WOULD dispatch:  POST /targets/$TARGET/actions/$ACTION  (timeout ${ACTION_TIMEOUT}s)"
+        say ""
+        say "  The subscription goes FIRST and that ordering is load-bearing: the"
+        say "  event bus has no replay buffer, so a stream opened after the POST has"
+        say "  already missed the run. And the POST is synchronous behind its 202 -"
+        say "  the run id comes back only when the action has finished - so the"
+        say "  stream is the only in-flight record there is."
+        say "  status_url in the response is IGNORED: it is emitted as /boards/...,"
+        say "  a path that does not exist, and following it is a guaranteed 404."
+        return 0
+    fi
+
+    # 1. SUBSCRIBE FIRST, AND WAIT UNTIL THE STREAM IS ACTUALLY OPEN. The daemon
+    #    writes ':connected' as its first frame, so that line is the proof - not
+    #    the fact that curl was started, which says nothing about whether the
+    #    subscription was registered before the POST went out.
+    if [ -n "$sse_log" ]; then
+        mkdir -p "$LOG_DIR" 2>/dev/null
+        : > "$sse_log"
+        # LAUNCHED AS A SIMPLE COMMAND, NOT WRAPPED IN ( ... ) &, and the
+        # difference is not style. A subshell wrapper makes SSE_PID the SHELL's
+        # pid, so `kill $SSE_PID` reaps the wrapper and leaves the curl
+        # GRANDCHILD running - which then holds the stream, and the run's own
+        # stdout, until its --max-time expires. Measured: it stranded a process
+        # per run and made a finished invocation look like it had hung. As a
+        # simple command bash forks and execs curl directly, so SSE_PID is curl
+        # and stop_sse actually stops it. A background simple command in a
+        # non-interactive shell also inherits no EXIT trap - which is what the
+        # wrapper's `trap -` was there for in the first place.
+        curl -sS -N --max-time "$(( ACTION_TIMEOUT + 60 ))" "${CURL_XPORT[@]}" \
+             ${FPGAHUB_TOKEN:+-H "Authorization: Bearer $FPGAHUB_TOKEN"} \
+             "$HUB_BASE/api/v1/events?types=action.start,action.log,action.end&board=$TARGET&action_id=$ACTION" \
+             >> "$sse_log" 2>&1 &
+        SSE_PID=$!
+        local waited=0
+        while [ "$waited" -lt 50 ]; do
+            grep -q ':connected' "$sse_log" 2>/dev/null && break
+            sleep 0.1; waited=$((waited + 1))
+        done
+        if grep -q ':connected' "$sse_log" 2>/dev/null; then
+            mf_set deploy.test.stream_open_before_post yes
+            say "event stream open before dispatch"
+        else
+            mf_set deploy.test.stream_open_before_post no
+            warn "the event stream did not confirm itself open within 5s. Dispatching"
+            say "anyway, but there will be no in-flight record if this action is long."
+        fi
+    fi
+
+    # 2. DISPATCH, with OUR timeout.
+    say "dispatching action '$ACTION' (timeout ${ACTION_TIMEOUT}s) ..."
+    mf_set deploy.test.dispatched yes
+    http POST "/targets/$TARGET/actions/$ACTION" '{"force_prereqs":false}' "$ACTION_TIMEOUT"
+    local drc=$?
+    mf_set deploy.test.http_status "$HTTP_STATUS"
+
+    if [ "$drc" -eq 0 ]; then
+        # THE 202 ALREADY CARRIES THE TERMINAL STATE. The handler awaits the
+        # subprocess, so `state` here is the finished state, not 'queued'.
+        mf_set deploy.test.run_id "$(jget run_id UNVERIFIED:not-reported)"
+        mf_set deploy.test.state "$(jget state UNVERIFIED:not-reported)"
+        mf_set deploy.test.detail "$(printf '%s' "$HTTP_BODY" | head -c 300)"
+        # status_url IS DELIBERATELY NOT FOLLOWED. The daemon builds it as
+        # /api/v1/boards/<t>/actions/<run>, and no /boards/.../actions route
+        # exists - it is a guaranteed 404. The real one is under /targets/.
+        mf_set deploy.test.status_url_followed "no (the hub emits a /boards/ path that 404s)"
+        local st; st="$(jget state '')"
+        if [ "$st" = "ok" ]; then ok "action '$ACTION' -> ok"; return 0; fi
+        bad "action '$ACTION' -> ${st:-unknown}"
+        return 1
+    fi
+
+    # 3. THE TIMEOUT PATH. Our client stopped listening; THE ACTION DID NOT STOP.
+    #    The stream is what saves this: action.start carries the run_id, so even
+    #    without a response we can name the run and ask for its status by the
+    #    path we construct ourselves.
+    if [ "$HTTP_STATUS" = "timeout" ]; then
+        warn "the dispatch request timed out after ${ACTION_TIMEOUT}s."
+        say "THE ACTION HAS NOT BEEN STOPPED - dispatch is synchronous, and we have"
+        say "merely stopped waiting. Recovering the run id from the event stream."
+        local rid=""
+        if [ -n "$sse_log" ] && [ -s "$sse_log" ]; then
+            rid="$(python3 - "$sse_log" <<'PY'
+import json, sys
+run_id = ""
+for line in open(sys.argv[1], errors="replace"):
+    if not line.startswith("data:"):
+        continue
+    try:
+        d = json.loads(line[5:].strip()).get("data", {})
+    except Exception:
+        continue
+    if d.get("run_id"):
+        run_id = d["run_id"]
+print(run_id)
+PY
+)"
+        fi
+        if [ -n "$rid" ]; then
+            mf_set deploy.test.run_id "$rid"
+            say "run id from the stream: $rid - polling the status route we construct"
+            if http GET "/targets/$TARGET/actions/$rid" "" 30; then
+                mf_set deploy.test.state "$(jget state UNVERIFIED:not-reported)"
+                mf_set deploy.test.detail "recovered after a client timeout"
+                local st; st="$(jget state '')"
+                [ "$st" = "ok" ] && { ok "action '$ACTION' -> ok (recovered)"; return 0; }
+                bad "action '$ACTION' -> ${st:-unknown} (recovered after timeout)"
+                return 1
+            fi
+        fi
+        mf_set deploy.test.state "UNVERIFIED:client timeout after ${ACTION_TIMEOUT}s, action may still be running"
+        bad "no final state. Raise DEPLOY_ACTION_TIMEOUT_S, and read $sse_log."
+        return 1
+    fi
+
+    mf_set deploy.test.state "UNVERIFIED:dispatch HTTP $HTTP_STATUS"
+    mf_set deploy.test.detail "$(printf '%s' "$HTTP_BODY" | head -c 300)"
+    bad "dispatch failed: HTTP $HTTP_STATUS $(printf '%s' "$HTTP_BODY" | head -c 200)"
+    case "$HTTP_STATUS" in
+        409) say "409 is action_busy - something is already running on this target." ;;
+        403) say "403 - the daemon has allow_manifest_exec off, or the token is not admin." ;;
+        422) say "422 - the manifest rejected the action or its prerequisites." ;;
+    esac
+    return 1
+}
+
+# COLLECT IS SEPARATE FROM TEST, AND NEEDS NO LEASE, so that a run whose action
+# FAILED still gets its evidence gathered - the failing run is the one whose logs
+# are worth having, and it is the one most likely to have exited early.
+#
+# WHAT IT CANNOT DO: fetch files off the board. The hub exposes an action's log
+# through the event stream and its state through the run route; there is no
+# artefact-download endpoint. Anything the design produces has to be carried out
+# by the action itself.
+do_collect() {
+    head_ "collect"
+    if [ -z "$OUT_DIR" ]; then
+        warn "no --out-dir: nothing to collect into"
+        return 0
+    fi
+    mkdir -p "$OUT_DIR" 2>/dev/null || { bad "cannot create $OUT_DIR"; return 1; }
+    local n=0
+    if [ -n "$LOG_DIR" ] && [ -s "$LOG_DIR/deploy_sse.jsonl" ]; then
+        cp -f "$LOG_DIR/deploy_sse.jsonl" "$OUT_DIR/" 2>/dev/null && n=$((n+1))
+    fi
+    local rid; rid=""
+    local i
+    for i in "${!MF_KEYS[@]}"; do
+        [ "${MF_KEYS[$i]}" = "deploy.test.run_id" ] && rid="${MF_VALS[$i]}"
+    done
+    if [ -n "$rid" ] && [ "$EXECUTE" = "1" ] && [ -n "$TARGET" ]; then
+        case "$rid" in UNVERIFIED*) ;; *)
+            if http GET "/targets/$TARGET/actions/$rid" "" 30; then
+                printf '%s\n' "$HTTP_BODY" > "$OUT_DIR/run-$rid.json" && n=$((n+1))
+            fi ;;
+        esac
+    fi
+    mf_set deploy.collect.dir "$OUT_DIR"
+    mf_set deploy.collect.files "$n"
+    say "collected $n file(s) into $OUT_DIR"
+    say "the hub has no artefact-download endpoint: anything the design produced"
+    say "must be carried out by the action itself"
+    return 0
+}
+
+# THE RECOVERY PATH for a run killed between the acquire and its trap firing -
+# `kill -9`, an OOM kill, a rebooted runner. It reads the token this run wrote to
+# disk the instant it was granted, and releases THAT and nothing else.
+do_release() {
+    head_ "release"
+    if [ -n "$LEASE_TOKEN" ]; then
+        lease_release; return 0
+    fi
+    if [ -z "$LEASE_FILE" ] || [ ! -r "$LEASE_FILE" ]; then
+        say "no recorded lease at ${LEASE_FILE:-<unset>} - nothing of ours to release."
+        say "If a board is stuck, WAIT FOR ITS TTL or ask its holder. Do not revoke:"
+        say "every lease here carries the same user, so a revoke cannot tell a stale"
+        say "lease of ours from a colleague's live one."
+        return 0
+    fi
+    # shellcheck disable=SC1090
+    . "$LEASE_FILE"
+    BOARD_GROUP="${FPGAHUB_GROUP:-$BOARD_GROUP}"
+    HOLDER="${FPGAHUB_HOLDER:-$HOLDER}"
+    LEASE_TOKEN="${FPGAHUB_TOKEN_LEASE:-}"
+    if [ -z "$LEASE_TOKEN" ]; then
+        bad "$LEASE_FILE has no token in it"
+        return 2
+    fi
+    if [ "$EXECUTE" != "1" ]; then
+        say "WOULD release: DELETE /boards/$BOARD_GROUP/lease  holder=$HOLDER token=${LEASE_TOKEN:0:8}..."
+        LEASE_TOKEN=""      # so the EXIT trap does not release it for real
+        return 0
+    fi
+    LEASE_ACQUIRED=1
+    lease_release
+    return 0
+}
+
+do_run() {
+    local rc=0
+    do_preflight || {
+        rc=$?
+        mf_set deploy.aborted_at preflight
+        mf_set deploy.program.attempted no
+        mf_set deploy.program.why "preflight refused - no lease was taken and no board was touched"
+        return $rc
+    }
+    if [ "$EXECUTE" = "1" ]; then
+        lease_acquire
+        local lrc=$?
+        if [ "$lrc" = "75" ]; then
+            warn "NOT DEPLOYED: the board is in use. This is not a fault in the design."
+            return 75
+        fi
+        [ "$lrc" = "0" ] || return "$lrc"
+    else
+        lease_acquire
+    fi
+    do_program || rc=1
+    if [ "$rc" = "0" ]; then
+        do_test || rc=1
+    else
+        warn "skipping the action: the board was not successfully programmed, so"
+        say "anything it did would be attributable to whatever was on it before."
+        mf_set deploy.test.dispatched no
+        mf_set deploy.test.why "the board was not successfully programmed, so the action was not sent"
+        mf_set deploy.test.state "UNVERIFIED:not dispatched - program did not succeed"
+    fi
+    do_collect || true
+    # The lease goes back through the EXIT trap, not from here, so that it is
+    # released on every path out of this function including the ones that return
+    # early above.
+    return $rc
+}
+
+#-----------------------------------------------------------------------------
+resolve_endpoint
+
+if [ "$EXECUTE" != "1" ] && [ "$SUB" != "status" ] && [ "$SUB" != "preflight" ]; then
+    printf '\n%s\n' "DRY RUN. Nothing below mutates a board. Add --execute (or"
+    printf '%s\n\n' "DEPLOY_EXECUTE=1 through make) to arm it."
+fi
+
+RC=0
+case "$SUB" in
+    preflight) do_preflight; RC=$? ;;
+    status)    do_status;    RC=$? ;;
+    program)
+        do_preflight || { RC=$?; mf_set deploy.aborted_at preflight; \
+                          mf_set deploy.program.attempted no; \
+                          mf_set deploy.program.why "preflight refused - nothing was leased or programmed"; }
+        if [ "$RC" = "0" ]; then
+            if [ "$EXECUTE" = "1" ]; then lease_acquire; RC=$?; fi
+            [ "$RC" = "0" ] && { do_program; RC=$?; }
+        fi ;;
+    test)
+        # PREFLIGHT RUNS HERE TOO, and not only under `run`. Dispatching an action
+        # at a target nobody has resolved is the 404-that-reads-as-a-dead-board
+        # trap in its purest form; and without it the deploy.preflight gate would
+        # correctly report UNVERIFIED for a field this invocation never measured,
+        # so a standalone `make deploy-test` could never come back green.
+        do_preflight || { RC=$?; mf_set deploy.aborted_at preflight; \
+                          mf_set deploy.program.attempted no; \
+                          mf_set deploy.program.why "preflight refused - nothing was leased or dispatched"; }
+        if [ "$RC" = "0" ] && [ "$EXECUTE" = "1" ] && [ -z "$LEASE_TOKEN" ]; then
+            lease_acquire; RC=$?
+        fi
+        [ "$RC" = "0" ] && { do_test; RC=$?; } ;;
+    collect)   do_collect;   RC=$? ;;
+    release)   do_release;   RC=$? ;;
+    run)       do_run;       RC=$? ;;
+esac
+
+# GIVE THE BOARD BACK BEFORE GRADING, NOT IN THE TRAP.
+#
+# The trap is the safety net and stays armed; this is the ordinary path, and the
+# order matters for a reason that is not tidiness. deploy.release is one of the
+# six gates, and the gates read the manifest - so if the release only happened in
+# the EXIT handler, which runs AFTER this line, every perfectly finished deploy
+# would be graded with no release recorded, report UNVERIFIED, and exit non-zero.
+# A gate that is red on a healthy run is a gate people learn to ignore.
+#
+# It also gets the board back a few seconds earlier, which on a shared bench is
+# the difference between a colleague's job starting and their job queueing.
+# lease_release is idempotent, so the trap firing afterwards changes nothing.
+stop_sse
+stop_heartbeat
+lease_release
+
+# THE VERDICTS. Written from the manifest by ci/deploy-gates.sh, which is a
+# SECOND implementation of the judgement - this script records facts, that one
+# grades them, and neither can quietly agree with itself.
+mf_set runtime_s "$(( $(date +%s) - T0 ))"
+mf_write
+# ONLY THE SUBCOMMANDS THAT MAKE A CLAIM ARE GRADED. `collect` and `release` are
+# utilities - grading the whole six-gate ladder after a lease release would
+# report on a program and a test that this invocation never attempted, and a
+# verdict about something that was not tried is noise that trains people to skip
+# the output. `status` writes no manifest at all.
+case "$SUB" in
+  preflight|program|test|run) GRADE=1 ;;
+  *)                          GRADE=0 ;;
+esac
+if [ "$GRADE" = "1" ] && [ -x "$FLOW_DIR/ci/deploy-gates.sh" ] && [ -n "$REPORT_DIR" ]; then
+    "$FLOW_DIR/ci/deploy-gates.sh" \
+        --manifest "$REPORT_DIR/deploy_manifest.txt" \
+        --gate-file "$REPORT_DIR/deploy_gate.txt" || {
+            # A gate failure makes the run bad even when every request succeeded:
+            # a deploy that programmed a board it did not hold is not a deploy
+            # anybody may quote, and only the gates can see that.
+            [ "$RC" = "0" ] && RC=1; }
+fi
+
+exit "$RC"
+
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)

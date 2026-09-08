@@ -380,18 +380,14 @@ set ::pack_schema_spec(part) {
 
     ## --- configuration ------------------------------------------------------
     #
-    # CONTRACT.md section 8 lists these three as part-pack keys. They are
-    # registered here so a pack CAN state them, but read the descriptions: two
-    # of the three are board facts wearing a device's clothes, and the packs in
-    # this toolkit deliberately leave them unset. part/README.md section 5 has
-    # the argument.
-    cfgbvs                no  str   config
-        {CFGBVS: VCCO or GND. It follows how bank 0 is WIRED ON THE BOARD, so a
-         part pack can only state it for a device where one value is the only
-         legal one. Left unset here.}
-    config_voltage        no  num   config
-        {CONFIG_VOLTAGE in volts. Same argument: it is the bank 0 supply, which
-         is a PCB fact. Left unset here.}
+    # cfgbvs and config_voltage USED TO BE HERE and are now BOARD keys. Both
+    # follow how bank 0 is WIRED, which is a fact about a PCB, not about a die.
+    # CONTRACT.md section 8 was corrected on 2026-09-08 and this table was not,
+    # which left them registered in the part role and absent from the board
+    # role - and because an unknown key is a hard error, the consequence was
+    # that NOTHING COULD STATE THEM AT ALL. All three shipped packs had already
+    # declined to set them, so the gap was invisible until a board pack tried.
+    # Moved 2026-09-08. part/README.md section 5 made the same argument first.
     bitstream_compress    no  bool  config
         {Whether to write a compressed bitstream. A build SETTING, not a device
          fact - it changes the file, not the silicon. Left unset here.}
@@ -472,6 +468,15 @@ set ::pack_schema_spec(board) {
          XDC states an IOSTANDARD per port; this states what the board can
          actually drive, so a mismatch is catchable before the bitstream rather
          than with a scope.}
+    cfgbvs                no  str   config
+        {CFGBVS: VCCO or GND. It states how config bank 0 is WIRED on this
+         board, which is why it is a board key and not a part key. Wrong or
+         unset, the DRC that checks it (CFGBVS-1) is only a WARNING, so the
+         symptom is a warning nobody can clear rather than a failure.}
+    config_voltage        no  num   config
+        {CONFIG_VOLTAGE in volts - the bank 0 supply on this board. Stated
+         together with cfgbvs or not at all; one without the other describes
+         half a decision.}
     connectors            no  list  board
         {{name description} pairs. Free-form and for humans: the note that stops
          the next person tracing a header with a multimeter.}

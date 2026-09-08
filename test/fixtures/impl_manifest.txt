@@ -1,0 +1,55 @@
+# A CLEAN impl MANIFEST. Fixture for test/shell/t_assert_stage.sh.
+#
+# ci/assert-stage.sh judges a finished stage BY READING THIS FILE - never by
+# re-scraping the tool's own reports, because a second fuzzier opinion competing
+# with the authoritative one is how a case-sensitive grep undercounted DRC by 7%
+# for weeks in the reference project and nothing disagreed with it.
+#
+# So this file is the interface under test, and it is written out in full rather
+# than generated: a reader has to be able to see which field each gate reads.
+# The shape is CONTRACT.md section 5 - header, provenance, directories, both git
+# shas, step_files, hooks_run, then the measurements.
+#
+# `dcp_bytes 4096` is load-bearing. The suite writes a 4096-byte checkpoint
+# beside it and ci/assert-stage.sh cross-checks the two, because a manifest and
+# a checkpoint that disagree are not from the same run.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+
+date                     2026-09-08T09:14:52Z
+runtime_s                4127
+stage                    impl
+run_tag                  t_assert_stage
+host                     fixture-host
+user                     fixture
+tool                     Vivado
+tool_version             v2024.1
+log_file                 logs/impl.log
+
+prov.part.name           demo_part
+prov.part.pack_sha256    0000000000000000000000000000000000000000000000000000000000000000
+prov.board.name          demo_board
+prov.board.pack_sha256   1111111111111111111111111111111111111111111111111111111111111111
+
+work_dir                 <run>/work
+in_work_dir              <run>/work
+log_dir                  <run>/logs
+report_dir               <run>/reports
+out_dir                  <run>/outputs
+part                     demo_part
+board                    demo_board
+
+project_git_sha          a1b2c3d4e5f60718293a4b5c6d7e8f9012345678
+project_git_dirty        no
+toolkit_git_sha          9876543210fedcba9876543210fedcba98765432
+toolkit_git_dirty        no
+
+step_files               impl_setup=toolkit report_setup=toolkit
+hooks_run                pre_impl(2s)
+
+wns                      0.213
+whs                      0.045
+unrouted_nets            0
+dcp_bytes                4096
+
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)

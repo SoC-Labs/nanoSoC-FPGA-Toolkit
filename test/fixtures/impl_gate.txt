@@ -1,0 +1,19 @@
+IMPL gate, 2026-09-08T09:14:52Z
+design demo_block, run tag t_assert_stage, board demo_board, part demo_part
+This is a verdict on what THIS RUN measured on THIS design at THIS setting. It
+is not a statement that the design is correct, and the last two sections below
+are the ones worth reading on a green run.
+
+HARD FAILURES: none
+
+BUDGETS EXCEEDED
+
+DECLARED ELSEWHERE - MEASURED HERE, OWNED BY SOMEBODY ELSE
+  - clock-domain crossings, owner=demo_block design owner: 12 unsynchronised, reports/cdc.rpt
+
+NOT covered by ANY run of this flow, at any setting:
+  - power, at any corner - no activity file is produced anywhere in this flow
+  - anything about the physical board: signal integrity, supplies, connectors
+  - whether the firmware image baked into the bitstream is the intended one
+
+Copyright (C) 2026, SoC Labs (www.soclabs.org)

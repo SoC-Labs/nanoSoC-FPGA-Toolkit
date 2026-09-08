@@ -559,6 +559,59 @@ def claimed_xdc():
     return claimed
 
 
+
+def walk_flist(path, _seen=None, _depth=0):
+    """Follow a filelist AND its `-f` includes. Returns (entries, unreadable, chain).
+
+    WHY THIS EXISTS, measured on the first real project to adopt this toolkit:
+    the previous version dropped every line beginning `-`, which is every `-f`
+    include. A master flist of a dozen `-f` lines and five sources of its own
+    therefore reported `ok, 5 source line(s)` while roughly two thousand SoC and
+    interconnect sources contributed NOTHING and nothing said so. Both generated
+    sub-lists were absent - which is the normal state before the project's own
+    generate step has run - and the contract check went green.
+
+    That is CONTRACT rule 2 violated inside the checker itself: a verdict
+    invented from data it could not read. An unreadable include is a hard
+    failure here, not a warning, because the failure it hides is silent all the
+    way down - synthesis builds an almost-empty design and reports success.
+    """
+    if _seen is None:
+        _seen = set()
+    entries, unreadable, chain = [], [], []
+    real = os.path.realpath(expand(path))
+    if real in _seen or _depth > 32:
+        return entries, unreadable, chain          # cycle or runaway: not our verdict
+    _seen.add(real)
+    text = read_text(path)
+    if text is None:
+        return entries, unreadable, chain
+    chain.append(path)
+    here = os.path.dirname(os.path.abspath(expand(path)))
+    lines = (text or "").splitlines()
+    for n, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("//"):
+            continue
+        if line.startswith("-f"):
+            inc = line[2:].strip()
+            if not inc:                            # `-f` on its own line
+                continue
+            inc_x = expand(inc)
+            if not os.path.isabs(inc_x):
+                inc_x = os.path.join(here, inc_x)
+            if read_text(inc_x) is None:
+                unreadable.append((inc, path, n))
+            else:
+                e, u, c = walk_flist(inc_x, _seen, _depth + 1)
+                entries.extend(e); unreadable.extend(u); chain.extend(c)
+            continue
+        if line.startswith("-") or line.startswith("+"):
+            continue                               # a switch, not a source
+        entries.append(line)
+    return entries, unreadable, chain
+
+
 def xdc_coverage(rep, target_dir):
     if not target_dir or not os.path.isdir(target_dir):
         rep.info("XDC coverage", "(no TARGET_DIR - nothing to cross-check)")
@@ -986,16 +1039,32 @@ def run_checks():
     if need(rep, "RTL_FLIST", flist,
             "The single input that decides what design gets built. One path per\n"
             "line; -f includes another list; ${VAR} and $(VAR) are expanded."):
-        text = read_text(flist)
-        entries = [l for l in meaningful_lines(text or "", "#/")
-                   if not l.startswith("-")]
+        entries, unreadable, chain = walk_flist(flist)
+        if unreadable:
+            detail = "\n".join("  %s\n      named at %s:%d" % (i, src, ln)
+                               for i, src, ln in unreadable)
+            rep.bad("UNREADABLE -f INCLUDE",
+                    "%d list(s) could not be read" % len(unreadable),
+                    "A `-f` line names another filelist and this one could not be\n"
+                    "opened, so every source it would have contributed is INVISIBLE\n"
+                    "to this check:\n" + detail + "\n"
+                    "Any count below covers the lists that WERE readable and nothing\n"
+                    "else. This is a failure rather than a warning because of the\n"
+                    "shape it takes: a master list of a dozen `-f` lines and five\n"
+                    "sources of its own reports `ok, 5 source line(s)` while two\n"
+                    "thousand files contribute nothing, and synthesis then builds an\n"
+                    "almost-empty design and calls it a success. A generated\n"
+                    "sub-list that has not been generated yet is the usual cause,\n"
+                    "which is what RTL_FLIST_GEN is for.",
+                    "RTL_FLIST")
         if not entries:
             rep.bad("RTL_FLIST", flist + "   (NO ENTRIES)",
                     "The file is not empty but every line is a comment, a blank or\n"
                     "a switch, so it names NO SOURCE FILES. `test -s` passes on it\n"
                     "and synthesis reads an empty design.", "RTL_FLIST")
         elif not ARGS.quiet:
-            rep.ok("  flist entries", "%d source line(s)" % len(entries))
+            extra = "" if len(chain) < 2 else "  across %d list(s)" % len(chain)
+            rep.ok("  flist entries", "%d source line(s)%s" % (len(entries), extra))
 
     xdc_pins = get("XDC_PINS")
     if need(rep, "XDC_PINS", xdc_pins,

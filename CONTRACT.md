@@ -654,9 +654,15 @@ These were measured on 2026-09-08 and are not negotiable design inputs.
 5. **`.bin` conversion is board-family dependent** — Zynq-7000 needs a byte
    swap, ZynqMP needs a header strip. Interchanging them corrupts the load.
    Hence `BIN_STYLE` is a required board-pack key.
-6. **Installed Vivado on this host is only 2021.1 and 2024.1**, though the
-   modulefiles advertise 2024.1/2025.2/2026.1. `doctor` reports what is on the
-   filesystem, never what a modulefile claims.
+6. **`doctor` reports what is on the FILESYSTEM, never what a modulefile
+   claims — and it must search where the modulefiles point, not a hardcoded
+   root.** Corrected 2026-09-08: this clause used to assert that only 2021.1 and
+   2024.1 were installed. That was wrong, and wrong in an instructive way — it
+   was written by looking only in `/apps/Xilinx/Vivado`, while 2025.2 and 2026.1
+   live under `/research/CAD/Xilinx/Vivado`. `fpga-flow-doctor` derives its
+   search roots from the modulefiles and had all four right the whole time; the
+   contract was the thing that had guessed. Do not re-introduce a hardcoded
+   vendor root here or anywhere else.
 7. **fpgahub's board-group and target namespaces do not overlap.** Leases,
    queues and reservations address the board group; program, reset and actions
    address a target. Conflating them returns 404.
@@ -735,8 +741,9 @@ Phase 1 is done when, with **no EDA tool installed or launched**:
 4. `make check` on a **real** project manifest describing
    `kr260-eth-chiplet` resolves every input that today's `tidelink/fpga` build
    consumes, and exits 0.
-5. `make doctor` reports host capability honestly, including that Vivado 2025.2
-   and 2026.1 are advertised by modulefiles and absent from the filesystem.
+5. `make doctor` reports host capability honestly: every Vivado the
+   modulefiles advertise is checked against the filesystem, wherever it actually
+   lives, and any advertised-but-absent version is named.
 6. `make part-probe` / `make board-probe` load and validate the packs.
 7. `test/run.sh` passes, and every assertion in it is paired with a mutation
    proof that the assertion goes red on a planted fault.

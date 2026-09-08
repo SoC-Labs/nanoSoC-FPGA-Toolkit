@@ -725,12 +725,54 @@ proc prov_write {path} {
 #
 # The override directory is scanned too, and LAST, so an overridden step's knobs
 # are reported from the file that would actually be sourced.
+
+## prov_knob_value <value>
+## A knob value that LOOKS like a path is put through the site-path rule; one
+## that does not is passed through unchanged.
+##
+## Deliberately conservative about what "looks like a path" means: a token
+## starting with / or ~, or containing a / with no whitespace around it. A knob
+## holding a list of paths is handled token by token, because FLIST_INCDIRS is
+## exactly that and digesting the whole list as one string would destroy a value
+## a reader legitimately needs. An effort level, a directive name or a number is
+## untouched - digesting those would make the manifest unreadable for no gain.
+proc prov_knob_value {v} {
+    if {[string first "UNVERIFIED:" $v] == 0} { return $v }
+    if {$v eq ""} { return [prov_value $v] }
+    set out {}
+    set changed 0
+    foreach tok [split $v " "] {
+        if {$tok eq ""} { continue }
+        if {[string index $tok 0] eq "/" || [string index $tok 0] eq "~" \
+            || ([string first "/" $tok] > 0)} {
+            set d [prov_site_path $tok]
+            if {$d ne $tok} { set changed 1 }
+            lappend out $d
+        } else {
+            lappend out $tok
+        }
+    }
+    if {!$changed && [llength $out] == 0} { return [prov_value $v] }
+    return [join $out " "]
+}
+
 proc prov_knobs {fh} {
     set resolved {}
     foreach k $::flow(knobs) {
         set v "UNVERIFIED:registered-but-unset"
         catch { set v [set ::$k] }
-        mf $fh knob.$k [prov_value $v]
+        # A KNOB VALUE CAN BE A PATH, so it goes through the site-path rule like
+        # every other path in this file.
+        #
+        # It did not, until 2026-09-08, and this file's own header said it must:
+        # "prov_site_path is the ONE place that decision is made; nothing else in
+        # the flow may write a path into a manifest." Block 7 wrote knob values
+        # raw. Several toolkit knobs hold paths by design - FLIST_INCDIRS,
+        # FLIST_DEFINES, SYNTH_EXTRA_ARGS, IMPL_INCREMENTAL_DCP - so with
+        # FLIST_INCDIRS pointing at a vendor mount, that mount point appeared in
+        # clear about forty lines below a block that had carefully digested
+        # exactly the same shape of path. Found by t_provenance.sh.
+        mf $fh knob.$k [prov_knob_value $v]
         lappend resolved $k
     }
 
