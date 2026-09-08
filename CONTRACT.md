@@ -114,6 +114,17 @@ Defaults are shown as `?=`. A project override always wins. **A configured-but-
 missing optional input is an error, not a shrug** — if the project named a file,
 `make check` requires it to exist and be non-empty.
 
+**Corollary, found by integration testing on 2026-09-08 and binding on every
+future default: a default that names a CONVENTIONAL path must DISCOVER, not
+ASSERT.** Write it `?= $(wildcard <path>)`. A bare `?= <path>` is
+indistinguishable, by the time the checker sees it, from the project having
+named that file — so the engine's own convenience default becomes a required
+input, and a project with no deploy configured cannot pass `make check` until it
+creates an empty file it never asked for. With `$(wildcard)` an absent file
+leaves the variable empty and it reports as `--`; a project that names a path
+explicitly still gets the "you named it, so it must exist" treatment, which is
+the behaviour that was wanted in the first place.
+
 **Identity**
 ```
 DESIGN_NAME     ?= $(BLOCK)          # block-design name, when a BD is used
@@ -228,7 +239,7 @@ MSG_GATE_ALLOWLIST    ?=              # EMPTY default. See §7.
 ```
 FPGAHUB_BOARD   ?=                    # the board GROUP  (lease scope)
 FPGAHUB_TARGET  ?=                    # the TARGET       (program scope)
-FPGAHUB_TOML    ?= $(FPGA_DIR)/fpgahub.toml
+FPGAHUB_TOML    ?= $(wildcard $(FPGA_DIR)/fpgahub.toml)   # discovered, see below
 BIN_STYLE       ?=                    # zynq7 | zynqmp — NOT interchangeable
 ```
 

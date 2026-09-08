@@ -498,7 +498,16 @@ MSG_GATE_ALLOWLIST    ?=
 # asked the wrong namespace" (CONTRACT.md section 9.7).
 FPGAHUB_BOARD   ?=
 FPGAHUB_TARGET  ?=
-FPGAHUB_TOML    ?= $(FPGA_DIR)/fpgahub.toml
+# DISCOVERED, NOT ASSERTED - note the $(wildcard). This default names a
+# CONVENTIONAL path, and `make check` treats a non-empty optional as something
+# the project asked for and therefore requires to exist. A bare
+# `?= $(FPGA_DIR)/fpgahub.toml` therefore made every project that has no deploy
+# configured fail its contract check until it created an empty fpgahub.toml.
+# With $(wildcard) the variable is empty when the file is absent - reported as
+# `--`, not configured - and a project that names a path EXPLICITLY still gets
+# the "you named it, so it must exist" treatment, which is the behaviour that
+# was wanted. Any future default naming a conventional path must do the same.
+FPGAHUB_TOML    ?= $(wildcard $(FPGA_DIR)/fpgahub.toml)
 # The two accepted values are declared by the board pack schema (section 8) and
 # are NOT enumerated here, for the same reason PLATFORM is not. They are not
 # interchangeable: one needs a byte swap and the other a header strip, and using
