@@ -79,6 +79,8 @@ opt BD_WRITE_TCL        1    ;# 1 = also write a regenerating .tcl beside the .b
 opt BD_UPGRADE_IP       1    ;# 1 = upgrade_ip on the BD's IP before validating
 opt BD_ALLOW_ZERO_CELLS 0    ;# 1 = an EMPTY block design is not a hard failure
 opt BD_ADD_HEADERS      1    ;# 1 = add the include path's headers to the project. See section 3.1
+opt BD_GENERATE_TARGET  all  ;# generate_target <this> on the .bd. "" = do not generate. See section 6.5
+opt BD_GENERATE_JOBS    0    ;# >0 = -jobs N on generate_target (0 = let Vivado decide)
 
 
 ################################################################################
@@ -211,6 +213,13 @@ set PROJ_DIR  [file join $WORK_DIR bd_project]
 set PROJ_NAME "${block_name}_bd"
 set part_for_project [flow_env FPGA_PART [part part_name]]
 
+# DECLARED AT THE TOP LEVEL, not inside the BD_CREATE_PROJECT branch: the
+# handoff written in section 7.5 records the repositories the block design was
+# assembled from, and with BD_CREATE_PROJECT=0 that branch never runs. An
+# undefined variable there would be a Tcl error AFTER the block design was
+# built - the most expensive possible place for one.
+set repos {}
+
 if {$BD_CREATE_PROJECT} {
     step "create the block-design project"
     if {![flow_have create_project]} {
@@ -253,7 +262,6 @@ if {$BD_CREATE_PROJECT} {
     # path FIRST: a project that packages its own core and also has it in a
     # shared repository must get the one this run just built, or the block design
     # is assembled from an IP nothing in this run produced.
-    set repos {}
     if {[file isdirectory [file join $OUT_DIR ip]]} { lappend repos [file join $OUT_DIR ip] }
     foreach r [split [flow_env FPGA_IP_REPOS]] {
         if {[string trim $r] eq ""} { continue }
@@ -279,6 +287,34 @@ if {$BD_READ_SOURCES} {
     step "read the source list the flist stage wrote"
     source $SOURCES_TCL
     say "fileset holds [llength [get_files -quiet]] file(s)"
+
+    # AUTOMATIC COMPILE ORDER, THEN AN EXPLICIT update_compile_order. MEASURED
+    # 2026-09-08, and it is the difference between a BD that builds and one that
+    # black-boxes half of itself:
+    #
+    #     CRITICAL WARNING: [filemgmt 56-176] Module references are not supported
+    #                       in manual compile order mode and will be ignored.
+    #     CRITICAL WARNING: [BD 41-1726] Unable to resolve module-source for
+    #                       block '/phy_clk_div2_0'.
+    #
+    # `create_bd_cell -type module -reference <mod>` re-parses the module out of
+    # the project's file list, and Vivado will only do that in AUTOMATIC
+    # compile-order mode against a file already in sources_1. sources.tcl issues
+    # read_verilog/read_vhdl, which in a project can leave the fileset in manual
+    # mode, and Vivado's answer to a module reference it cannot resolve is a
+    # BLACK BOX and a warning - not an error.
+    #
+    # The legacy reference flow does the same thing in the same place and says so
+    # (build_design.tcl:250-253: "Module references only resolve in
+    # automatic-compile-order mode against a file already in sources_1").
+    if {[flow_have current_fileset]} {
+        try_step "automatic compile order" {
+            set_property source_mgmt_mode All [current_project]
+            update_compile_order -fileset [current_fileset]
+            say "source_mgmt_mode All; compile order updated - a BD module reference"
+            say "  re-parses out of the project file list and needs both"
+        }
+    }
 }
 
 
@@ -504,6 +540,8 @@ flow_hook post_bd
 set wrapper ""
 set bd_tcl_out ""
 set bd_copy ""
+set bd_synth_hdl ""
+set bd_generated_target "(none)"
 
 if {![llength $hard]} {
     step "save, wrap and record"
@@ -525,6 +563,102 @@ if {![llength $hard]} {
         } else {
             say "bd: $bd_file (already at the contract path)"
         }
+    }
+
+    ############################################################################
+    # 6.5 THE OUTPUT PRODUCTS - WITHOUT THESE THE .bd IS NOT SYNTHESISABLE
+    #
+    # MEASURED 2026-09-08 ON THIS PROJECT, and it is the defect that stopped the
+    # first real BD design this toolkit was pointed at:
+    #
+    #     ERROR: [Synth 8-439] module 'tidelink_design' not found
+    #            [.../tidelink_design_wrapper.v:90]
+    #     ERROR: [Synth 8-6156] failed synthesizing module 'tidelink_design_wrapper'
+    #
+    # A .bd IS NOT HDL. It is a description of a design from which Vivado
+    # GENERATES the HDL, the IP instances, the simulation model and the
+    # instantiation template - and it generates none of them until it is asked.
+    # `generate_target` appeared NOWHERE in this toolkit before this line; the
+    # legacy reference flow calls it (build_design.tcl:455,
+    # `generate_target all [get_files ${design_name}.bd]`) and its project
+    # therefore carries
+    #
+    #     <proj>.gen/sources_1/bd/<name>/synth/<name>.v
+    #
+    # which is the module the board-level top instantiates. Without it that
+    # instance is an unresolved module, which Vivado reports as an error at the
+    # TOP - a very long way from the stage that failed to produce the file.
+    #
+    # IT HAS TO HAPPEN HERE AND IT CANNOT HAPPEN IN STAGE 4. Generation resolves
+    # the BD's IP against the ip_repo_paths, the board part, the IP cache and the
+    # module-reference sources - every one of which is set up in THIS stage's
+    # project. Doing it in an in-memory synthesis session was tried and measured:
+    # the design has no part yet, so `zynq_ultra_ps_e:3.5 does not support the
+    # current part 'xc7vx485tffg1157-1'` and every IP in the design fails to
+    # resolve.
+    #
+    # AFTER save_bd_design AND AFTER THE synth_checkpoint_mode IN SECTION 6.
+    # Generation reads that property: with `None` it writes the whole design out
+    # as RTL for one global synthesis pass, and with Hybrid/Singular it writes
+    # per-IP output products for out-of-context synthesis. Generating first and
+    # setting the property afterwards produces output products for the other
+    # mode, silently.
+    #
+    # NOT WRAPPED IN try_step. A BD whose output products failed to generate is
+    # a BD nothing downstream can synthesise, and `generate_target` is one of
+    # the commands that reports an ERROR and lets the script continue.
+    ############################################################################
+    if {$BD_GENERATE_TARGET ne "" && $bd_file ne "" && [flow_have generate_target]} {
+        step "generate_target $BD_GENERATE_TARGET - the BD's output products"
+        set gen_args [list $BD_GENERATE_TARGET [get_files "$DESIGN_NAME.bd"]]
+        if {[string is integer -strict $BD_GENERATE_JOBS] && $BD_GENERATE_JOBS > 0} {
+            lappend gen_args -jobs $BD_GENERATE_JOBS
+        }
+        set t0 [clock seconds]
+        if {[catch {generate_target {*}$gen_args} e]} {
+            lappend hard "generate_target $BD_GENERATE_TARGET failed on '$DESIGN_NAME': $e.\
+                          The .bd would still be written and would still satisfy every\
+                          file assertion in this flow, and synthesis would then fail at\
+                          the BOARD TOP with 'module $DESIGN_NAME not found' - a long way\
+                          from here. A .bd is not HDL; this is the command that makes it\
+                          into some."
+        } else {
+            say "generated ([expr {[clock seconds] - $t0}]s)"
+        }
+
+        # THE ARTEFACT THAT PROVES IT. `generate_target` returns nothing useful
+        # and exits 0 on a design whose IP did not resolve, so the question is
+        # asked of the FILESYSTEM: is there a synthesisable HDL file named after
+        # this block design?
+        #
+        # Vivado composes that path from the project layout and the answer moved
+        # between releases (<proj>.srcs before 2019.2, <proj>.gen after), so it
+        # is SEARCHED for rather than spelled out - and searched under the
+        # project directory only, which is inside this run's work tree.
+        foreach ext {v vhd} {
+            if {$bd_synth_hdl ne ""} { break }
+            foreach c [lsort [glob -nocomplain -directory $PROJ_DIR \
+                          */sources_1/bd/$DESIGN_NAME/synth/$DESIGN_NAME.$ext \
+                          */bd/$DESIGN_NAME/synth/$DESIGN_NAME.$ext]] {
+                if {[file exists $c] && [file size $c]} { set bd_synth_hdl [file normalize $c] ; break }
+            }
+        }
+        if {$bd_synth_hdl eq "" && ![llength $hard]} {
+            lappend hard "generate_target $BD_GENERATE_TARGET reported no error and NO\
+                          synthesisable HDL for '$DESIGN_NAME' exists under [prov_site_path $PROJ_DIR].\
+                          Looked for */bd/$DESIGN_NAME/synth/$DESIGN_NAME.{v,vhd}. That file is\
+                          what the board-level top instantiates; without it the next stage\
+                          fails at elaboration with 'module $DESIGN_NAME not found' and the\
+                          cause is two stages upstream."
+        } elseif {$bd_synth_hdl ne ""} {
+            set bd_generated_target $BD_GENERATE_TARGET
+            say "synthesisable HDL: $bd_synth_hdl ([file size $bd_synth_hdl] bytes)"
+        }
+    } elseif {$BD_GENERATE_TARGET eq ""} {
+        warn "BD_GENERATE_TARGET is empty: the block design's output products were"
+        warn "  NOT generated. A .bd is not HDL. Unless something else in this"
+        warn "  project generates them, the next stage cannot synthesise this"
+        warn "  design and will fail at the board-level top."
     }
 
     # THE WRAPPER. A block design is not an HDL module; the wrapper is what the
@@ -557,6 +691,104 @@ if {![llength $hard]} {
     }
 }
 
+
+################################################################################
+# 7.5 THE HANDOFF - work/bd_handoff.tcl
+#
+# CONTRACT.md section 5: "Handoff is by artefact name inside work/, never
+# renamed." For a block design the NAME IS NOT ENOUGH, and this file is the
+# artefact that makes the contract satisfiable rather than the sentence that
+# breaks it.
+#
+# WHY A BARE .bd CANNOT BE THE HANDOFF. Measured: stage 4 read
+# work/<DESIGN_NAME>.bd - a byte copy of the real file, at the path section 4
+# asserts - and got a design with no IP in it. A .bd names its IP by VLNV and
+# its output products by RELATIVE LOCATION inside the project that owns them.
+# Copied away from that project it is a manifest pointing at nothing: the
+# generated synth/<name>.v, the per-IP directories and the .xci files are all
+# left behind. The copy satisfies `test -s` and every assertion in the flow, and
+# the design it describes is not reachable from it. That is the exact shape of
+# failure this toolkit exists to refuse.
+#
+# THE TWO ANSWERS, AND WHY THIS ONE.
+#
+#   (a) COPY THE PRODUCTS. Carry synth/<name>.v plus every IP output product
+#       into work/ and have stage 4 read them as plain sources. Rejected: the
+#       set is not knowable from outside the tool. It differs with
+#       synth_checkpoint_mode (RTL for None, .dcp stubs plus .xci for
+#       Hybrid/Singular), it includes per-IP constraint files that must be read
+#       with their scope, and a list that is short by one file produces a BLACK
+#       BOX - no error, no LUTs, every budget green. Reproducing Vivado's own
+#       file resolution in Tcl is a second implementation of it, and the copy
+#       that is wrong is always the one you are not reading.
+#
+#   (b) HAND OVER THE PROJECT, WHICH IS WHAT THIS DOES. The canonical .bd stays
+#       where the tool owns it - inside this stage's project, inside this run's
+#       work directory - with its output products beside it, and the handoff
+#       artefact is a small generated SCRIPT naming it. Stage 4 sources that
+#       script and Vivado does its own file resolution, which is the only
+#       implementation of it that is guaranteed to agree with itself.
+#
+# THE COPY AT THE CONTRACT PATH STAYS, and is now honestly labelled. make and
+# ci/assert-stage.sh assert on work/<DESIGN_NAME>.bd; it remains the stage's
+# named artefact and it remains a real, openable .bd. What it is NOT is the
+# thing the next stage reads, and the manifest records both paths so nobody has
+# to infer which is which.
+#
+# EVERYTHING THE SCRIPT NAMES IS INSIDE THIS RUN'S WORK DIRECTORY. Section 5
+# forbids a stage addressing another run's work dir, and the paths written here
+# are composed from $WORK_DIR by construction. They are ABSOLUTE because stage 4
+# runs with its cwd set to its own work directory, which is a different
+# directory when IN_RUN_TAG differs from RUN_TAG - and that case is the whole
+# reason IN_RUN_TAG exists.
+################################################################################
+
+set bd_handoff ""
+if {![llength $hard] && $bd_file ne ""} {
+    set bd_handoff [file join $WORK_DIR bd_handoff.tcl]
+    set fh [open $bd_handoff w]
+    puts $fh "################################################################################"
+    puts $fh "# bd_handoff.tcl - GENERATED by flow/vivado/3_bd.tcl. Do not edit."
+    puts $fh "#"
+    puts $fh "# The stage-3 -> stage-4 handoff for a block design. Sourced by"
+    puts $fh "# flow/vivado/4_synth.tcl at global scope, INSTEAD of read_bd on the copy at"
+    puts $fh "# the contract path - that copy is separated from its output products and"
+    puts $fh "# reading it yields a design with no IP in it."
+    puts $fh "#"
+    puts $fh "# Read the long note in 3_bd.tcl section 7.5 before changing anything here."
+    puts $fh "################################################################################"
+    puts $fh ""
+    puts $fh "set ::BD_HANDOFF(design_name)      [list $DESIGN_NAME]"
+    puts $fh "set ::BD_HANDOFF(bd)               [list $bd_file]"
+    puts $fh "set ::BD_HANDOFF(bd_contract_copy) [list $bd_copy]"
+    puts $fh "set ::BD_HANDOFF(project)          [list $PROJ_DIR]"
+    puts $fh "set ::BD_HANDOFF(synth_hdl)        [list $bd_synth_hdl]"
+    puts $fh "set ::BD_HANDOFF(generated_target) [list $bd_generated_target]"
+    puts $fh "set ::BD_HANDOFF(synth_checkpoint_mode) [list $synth_mode]"
+    puts $fh "set ::BD_HANDOFF(wrapper)          [list $wrapper]"
+    puts $fh ""
+    puts $fh "# The IP repositories the block design was ASSEMBLED from. Re-declared here"
+    puts $fh "# because the reading stage resolves the same VLNVs again, and a repository"
+    puts $fh "# that was on the path when the BD was built and is not on the path when it"
+    puts $fh "# is read gives an unresolved IP - which is a black box, a warning, and no"
+    puts $fh "# error at all."
+    puts $fh "set ::BD_HANDOFF(ip_repo_paths) [list $repos]"
+    puts $fh ""
+    puts $fh "# NO `info commands read_bd` GUARD, AND THAT IS MEASURED, NOT AN OMISSION."
+    puts $fh "# Vivado 2024.1 does not list read_bd in `info commands` - it is resolved"
+    puts $fh "# through the tool's own autoload path, not registered up front - so a guard"
+    puts $fh "# written that way refuses inside the very tool that implements the command."
+    puts $fh "# Measured 2026-09-08: the guard fired in a live Vivado synthesis session."
+    puts $fh "# A tool that really has no read_bd fails on the call below, naming it."
+    puts $fh "if {!\[file exists \$::BD_HANDOFF(bd)\]} {"
+    puts $fh "    error \"the block design named by this handoff is gone: \$::BD_HANDOFF(bd)\""
+    puts $fh "}"
+    puts $fh "read_bd \$::BD_HANDOFF(bd)"
+    close $fh
+    say "handoff: $bd_handoff"
+    say "  it names the .bd INSIDE the project, where its output products are."
+}
+
 # --- THE ARTEFACT ASSERTION --------------------------------------------------
 #
 # ON THE ARTEFACT, NEVER ON EXIT STATUS (CONTRACT.md rule 0).
@@ -585,6 +817,14 @@ if {$overlays_applied} {
                        design the previous one left, so their ORDER is part of the\
                        design. The sequence is recorded in the manifest; whether it is\
                        the intended one is not checked here"
+}
+if {$bd_synth_hdl ne ""} {
+    lappend delegated "the CONTENT of the generated HDL, owner=Vivado's own IP\
+                       generators: the '$bd_generated_target' target produced\
+                       [prov_site_path $bd_synth_hdl] and this stage checked that it\
+                       exists and is non-empty. Nothing here elaborates it, and an IP\
+                       that generated a stub because its licence or its part was wrong\
+                       produces a file of exactly this shape"
 }
 if {$synth_mode ne "unmeasured"} {
     lappend delegated "synth_checkpoint_mode '$synth_mode', owner=synth: it decides whether\
@@ -618,7 +858,14 @@ prov_gate bd bd \
         "whether the BD's IP is LICENSED for bitstream generation. A core can be\
          instantiated, validated and synthesised and still refuse at write_bitstream" \
         "whether the wrapper is what TOP instantiates. The wrapper's module name is\
-         recorded here; nothing checks that the board-level top names it" ]
+         recorded here; nothing checks that the board-level top names it" \
+        "whether the .bd COPY at the contract path is usable on its own. It is not,\
+         and it is not meant to be: a .bd names its IP and its output products by\
+         location inside the project that owns them, so the copy is an assertion\
+         target and work/bd_handoff.tcl is the handoff. Section 7.5" \
+        "whether the generated HDL MATCHES the .bd. generate_target ran against the\
+         design in memory and save_bd_design wrote the same design, but nothing\
+         here re-reads the file and compares" ]
 
 set manifest [prov_manifest bd]
 prov_stage_fields $manifest [list \
@@ -638,6 +885,10 @@ prov_stage_fields $manifest [list \
     bd_global_synth    $BD_GLOBAL_SYNTH \
     synth_checkpoint_mode $synth_mode \
     bd_wrapper         [expr {$wrapper eq "" ? "(none)" : [prov_site_path $wrapper]}] \
+    bd_generate_target $bd_generated_target \
+    bd_synth_hdl       [expr {$bd_synth_hdl eq "" ? "UNVERIFIED:no-synthesisable-hdl-generated" : [prov_site_path $bd_synth_hdl]}] \
+    bd_synth_hdl_bytes [expr {($bd_synth_hdl ne "" && [file exists $bd_synth_hdl]) ? [file size $bd_synth_hdl] : "unmeasured"}] \
+    bd_handoff         [expr {($bd_handoff ne "" && [file exists $bd_handoff]) ? [prov_site_path $bd_handoff] : "UNVERIFIED:no-handoff-written"}] \
     bd_regen_tcl       [expr {($bd_tcl_out ne "" && [file exists $bd_tcl_out]) ? [prov_site_path $bd_tcl_out] : "(none)"}] \
     validated          [expr {$BD_VALIDATE ? "yes" : "no (BD_VALIDATE=0)"}] \
     sources_read       [expr {$BD_READ_SOURCES ? "yes" : "no"}] \
@@ -654,5 +905,7 @@ if {[llength $hard]} {
 say "bd complete: '$DESIGN_NAME', $bd_cells cell(s), $overlays_applied overlay(s) applied"
 say "  bd      [expr {$bd_copy eq "" ? "(none)" : $bd_copy}]"
 say "  wrapper [expr {$wrapper eq "" ? "(none)" : $wrapper}]"
+say "  hdl     [expr {$bd_synth_hdl eq "" ? "(none)" : $bd_synth_hdl}]"
+say "  handoff [expr {$bd_handoff eq "" ? "(none)" : $bd_handoff}]"
 
 # Copyright (C) 2026, SoC Labs (www.soclabs.org)

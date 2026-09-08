@@ -475,6 +475,55 @@ def expand(s):
 # an untouched scaffold, because a scaffolded file EXISTS. Only opening it can.
 # ---------------------------------------------------------------------------
 
+def bd_tcl_contract(rep, path):
+    """BD_TCL's contract is "sourcing this creates the block design", and until
+    2026-09-08 this script checked only that the file existed.
+
+    It reported `ok BD_TCL` for a file whose only top-level construct was
+    `proc create_root_design { parentCell }` - a LIBRARY that defines a proc and
+    builds nothing. The bd stage then ran, sourced it, found no block design and
+    hard-failed, ninety seconds and one Vivado launch later. That is a defect
+    this check can see for free, by reading the file.
+
+    ONE-DIRECTIONAL, like the flist stage's TOP scan. `create_bd_design` present
+    is not a proof - it may sit inside a proc nothing calls, or behind an `if`.
+    ABSENT, with nothing sourced, IS a fact: a file that does not call it and
+    does not hand off to a file that might cannot create a block design."""
+    text = read_text(path)
+    if text is None:
+        return
+    body = "\n".join(meaningful_lines(text, comment_chars="#"))
+    if re.search(r"\bcreate_bd_design\b", body):
+        rep.ok("  BD_TCL calls", "create_bd_design")
+        return
+
+    sources_something = re.search(r"^\s*source\s+\S", body, re.M)
+    defines_root = re.search(r"^\s*proc\s+create_root_design\b", body, re.M)
+    calls_root = re.search(r"^\s*create_root_design\b", body, re.M)
+
+    why = ("BD_TCL's contract is that SOURCING IT CREATES THE BLOCK DESIGN\n"
+           "(CONTRACT §3.3); flow/vivado/3_bd.tcl sources it and then asserts that a\n"
+           "block design named DESIGN_NAME exists. This file contains no\n"
+           "create_bd_design.\n")
+    if defines_root and not calls_root:
+        why += ("It DEFINES `proc create_root_design` and never calls it. That is a\n"
+                "block-design LIBRARY, not a script that builds one - the caller is\n"
+                "expected to supply `create_bd_design <name>` and `create_root_design \"\"`\n"
+                "itself. Point BD_TCL at a project file that does those two things and\n"
+                "sources this one.\n")
+    why += ("Vivado reports a failed create_bd_design as an ERROR and still exits 0, so\n"
+            "without this check the first thing that notices is the bd stage's own\n"
+            "artefact assertion - after a tool launch and a licence.")
+
+    if sources_something:
+        rep.warn("BD_TCL", path + "   (no create_bd_design; it sources other files)",
+                 why + "\nThis is a WARNING and not an error only because the file sources\n"
+                       "something else, which this check does not follow. If the sourced\n"
+                       "file creates the design, ignore it.")
+    else:
+        rep.bad("BD_TCL creates no block design", path, why, "BD_TCL")
+
+
 def placeholders(rep, fpga_dir, build_dir):
     if not fpga_dir or not os.path.isdir(fpga_dir):
         return
@@ -1205,7 +1254,8 @@ def run_checks():
     # --- IP / BD -------------------------------------------------------------
     optional_list(rep, "IP_REPOS", lst("IP_REPOS"), "no external IP repositories")
     optional(rep, "PACKAGE_TCL", get("PACKAGE_TCL"), "no IP packaging step")
-    optional(rep, "BD_TCL", get("BD_TCL"), "no block design")
+    if optional(rep, "BD_TCL", get("BD_TCL"), "no block design"):
+        bd_tcl_contract(rep, get("BD_TCL"))
     optional_list(rep, "BD_OVERLAY_TCL", lst("BD_OVERLAY_TCL"),
                   "no overlays over the base BD", ordered=True)
     if get("BD_OVERLAY_TCL") and not get("BD_TCL"):

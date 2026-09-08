@@ -193,7 +193,12 @@ if {$SYNTH_SOURCES_TCL eq ""} {
     # meant "work it out".
     set SYNTH_SOURCES_TCL [file join $IN_WORK_DIR sources.tcl]
 }
-set BD_FILE [file join $IN_WORK_DIR ${DESIGN_NAME}.bd]
+set BD_FILE     [file join $IN_WORK_DIR ${DESIGN_NAME}.bd]
+# BD_HANDOFF_TCL, not BD_HANDOFF: the handoff script's own contract is to set
+# the ARRAY ::BD_HANDOFF, and a stage-script scalar of that name at global scope
+# makes the first element assignment fail with "variable isn't array" - measured
+# 2026-09-08. The path and the payload are two things and they get two names.
+set BD_HANDOFF_TCL [file join $IN_WORK_DIR bd_handoff.tcl]
 
 if {$TOP eq ""} {
     flow_refuse "TOP is not set." \
@@ -209,6 +214,7 @@ if {$TOP eq ""} {
 # every budget in the contract.
 set have_sources [expr {[file exists $SYNTH_SOURCES_TCL] && [file size $SYNTH_SOURCES_TCL] > 0}]
 set have_bd      [expr {$SYNTH_READ_BD && [file exists $BD_FILE]}]
+set have_handoff [expr {$have_bd && [file exists $BD_HANDOFF_TCL] && [file size $BD_HANDOFF_TCL] > 0}]
 
 if {!$have_sources && !$have_bd} {
     stage_stop synth "no design to synthesise: neither a materialised source list nor a block design" [list \
@@ -259,6 +265,10 @@ if {$have_bd} {
     prov_pin bd $BD_FILE "synth-read"
     lappend ::PROV_FILES bd $BD_FILE
 }
+if {$have_handoff} {
+    prov_pin bd_handoff $BD_HANDOFF_TCL "synth-read"
+    lappend ::PROV_FILES bd_handoff $BD_HANDOFF_TCL
+}
 set __i 0
 foreach f $XDC_PINS {
     incr __i
@@ -285,6 +295,82 @@ unset __i
 
 step "read the design"
 
+################################################################################
+# 4.0 THE PART GOES ON THE DESIGN BEFORE ANYTHING IS READ
+#
+# MEASURED 2026-09-08, and it is why the first block design this toolkit was
+# pointed at could not be read at all:
+#
+#     ERROR: [BD 41-1712] The specified IP 'xilinx.com:ip:zynq_ultra_ps_e:3.5'
+#                         does not support the current part 'xc7vx485tffg1157-1'
+#     ERROR: [BD 41-595]  Failed to add ip repository block <zynq_ultra_ps_e_0>
+#
+# xc7vx485tffg1157-1 is Vivado's DEFAULT Virtex-7. Nothing had asked for it: with
+# no project open, the first read_* command creates an in-memory project at the
+# tool's default part, and this stage passed the real part only later, on the
+# `synth_design -part` command line. `Loading part xck26-sfvc784-2LV-c` did not
+# appear in the log until 3880 lines after the block design had been read and
+# every IP in it had failed to resolve against a device from a different family.
+#
+# An IP resolves against the part that is set WHEN IT IS READ. So the project is
+# created here, explicitly, with the part - before the IP catalogue, before the
+# sources, and before the block design.
+#
+# THE -part ON synth_design STAYS. It is the stage's own (section 7) and it now
+# agrees with this one by construction, both being $PART_STR. Two spellings of
+# one decision that cannot disagree are cheaper than a reader having to work out
+# which of them won.
+#
+# -in_memory: this is a CHECKPOINT flow. It writes no .xpr, nothing appears on
+# disk that the run tree does not already own, and `current_fileset` exists -
+# which is what the shipped pre_synth hook needs to read GENERIC and
+# VERILOG_DEFINE back off the design it is about to synthesise.
+################################################################################
+
+if {[flow_have create_project]} {
+    create_project -in_memory -part $PART_STR
+    say "in-memory project: part $PART_STR, set BEFORE any source or BD is read"
+
+    # THE BOARD PART, WHEN THE PROJECT DECLARED ONE. A block design built
+    # against a board preset carries board-level interface properties, and
+    # reading it back with no board part set makes Vivado resolve them against
+    # nothing. It is a WARNING here rather than a refusal: the bd stage already
+    # refuses on a board part it cannot install (3_bd.tcl section 3), so by the
+    # time a BD exists this has been checked once against the same catalogue.
+    set __bp [flow_env FPGA_BOARD_PART]
+    if {$__bp ne ""} {
+        set __brp {}
+        foreach r [split [flow_env FPGA_BOARD_REPO_PATHS]] {
+            if {[string trim $r] ne ""} { lappend __brp [file normalize [string trim $r]] }
+        }
+        if {[llength $__brp]} { catch { set_property board_part_repo_paths $__brp [current_project] } }
+        if {[catch {set_property board_part $__bp [current_project]} __e]} {
+            warn "board_part '$__bp' would not set on the in-memory design: $__e"
+            warn "  A block design built against that preset is about to be read"
+            warn "  without it. Board repo paths tried: [expr {[llength $__brp] ? [join $__brp { }] : {(none set)}}]"
+        } else {
+            say "board_part: $__bp"
+        }
+        unset -nocomplain __brp __e
+    }
+    unset -nocomplain __bp
+
+    # The IP cache, when the project named one. It does nothing in a global
+    # (synth_checkpoint_mode None) BD flow and saves a per-IP out-of-context
+    # synthesis in every other one.
+    set __cache [flow_env FPGA_IP_CACHE_DIR]
+    if {$__cache ne "" && [flow_have config_ip_cache]} {
+        file mkdir $__cache
+        catch { config_ip_cache -use_cache_location $__cache }
+        say "ip cache: $__cache"
+    }
+    unset -nocomplain __cache
+} else {
+    warn "this tool has no create_project, so the part cannot be set before the"
+    warn "  sources are read. Any IP in this design will resolve against the"
+    warn "  tool's default part."
+}
+
 set IP_REPOS $SYNTH_IP_REPO_PATHS
 if {$IP_REPOS eq ""} {
     foreach d [split [flow_env FPGA_IP_REPOS]] {
@@ -300,6 +386,14 @@ if {[llength $IP_REPOS]} {
     say "ip repositories: [llength $IP_REPOS]"
     foreach d $IP_REPOS { say "  $d" }
     if {[catch {
+        # ON THE PROJECT AND ON THE FILESET. ip_repo_paths exists on both
+        # objects and the two are not the same setting; with an in-memory
+        # project open (section 4.0) it is the PROJECT one the IP catalogue
+        # rebuild reads, and with no project it is the fileset one. Setting only
+        # the object that happens to answer leaves the other empty, and an IP
+        # repository that is not on the path is an unresolved module - a black
+        # box, a warning, and no error.
+        catch { set_property ip_repo_paths $IP_REPOS [current_project] }
         set_property ip_repo_paths $IP_REPOS [current_fileset]
         update_ip_catalog
     } __e]} {
@@ -323,15 +417,60 @@ if {$have_sources} {
     if {[info exists flist_files]} { say "source files declared by the flist: $flist_files" }
 }
 
-if {$have_bd} {
-    say "block design: $BD_FILE"
-    if {[catch {read_bd $BD_FILE} __e]} {
-        die "read_bd failed on $BD_FILE: $__e" \
-            "  The bd stage wrote this file and this stage cannot read it back." \
-            "  Continuing would synthesise the design WITHOUT the block design," \
-            "  which produces a smaller, cleaner, wrong result."
+################################################################################
+# 4.1 THE BLOCK DESIGN COMES IN THROUGH THE HANDOFF, NOT THROUGH THE COPY
+#
+# CONTRACT.md section 5 says handoff is by artefact name inside work/. For a
+# block design the name alone is not enough, and this is where that was
+# measured:
+#
+#   work/<DESIGN_NAME>.bd is a BYTE COPY of the real file, placed at the path
+#   section 4 asserts. A .bd names its IP by VLNV and its output products by
+#   location INSIDE THE PROJECT THAT OWNS THEM. Read away from that project it
+#   describes a design whose parts are all somewhere else - and read_bd does not
+#   fail on that, it produces a design with the IP missing.
+#
+# So the bd stage writes work/bd_handoff.tcl: a generated script naming the .bd
+# where the tool put it, with its generated synth/<name>.v and its IP output
+# products beside it. Sourced AT GLOBAL SCOPE, for the same reason sources.tcl
+# is: it sets ::BD_HANDOFF, which the manifest below records.
+#
+# THE FALLBACK IS A REFUSAL, NOT A SHRUG. A bd stage that wrote no handoff is
+# either older than this contract or did not reach its final section, and in
+# both cases the bare copy is the lossy path that produced a design with no IP
+# in it. Reading it anyway would give a smaller, cleaner, wrong netlist - and
+# every budget in this flow would pass.
+################################################################################
+
+if {$have_handoff} {
+    say "block design (handoff): $BD_HANDOFF_TCL"
+    if {[catch {source $BD_HANDOFF_TCL} __e]} {
+        die "the block-design handoff failed: $__e" \
+            "  file: $BD_HANDOFF_TCL" \
+            "  It was written by the bd stage and it names the .bd inside that" \
+            "  stage's project, where its generated HDL and IP output products" \
+            "  are. Continuing would synthesise the design WITHOUT the block" \
+            "  design, which produces a smaller, cleaner, wrong result." \
+            "  Re-run 'make bd' in run tag '[flow_env FPGA_IN_RUN_TAG [flow_env FPGA_RUN_TAG]]'."
     }
     unset -nocomplain __e
+    if {[info exists ::BD_HANDOFF(bd)]} { say "  .bd: $::BD_HANDOFF(bd)" }
+    if {[info exists ::BD_HANDOFF(synth_hdl)] && $::BD_HANDOFF(synth_hdl) ne ""} {
+        say "  generated HDL: $::BD_HANDOFF(synth_hdl)"
+    }
+} elseif {$have_bd} {
+    stage_stop synth "a block design with no handoff record - the copy at the contract path is not synthesisable on its own" [list \
+        "the bd stage left no handoff record." \
+        "  block design : $BD_FILE" \
+        "  looked for   : $BD_HANDOFF_TCL" \
+        "  That .bd is the COPY mk/flow.mk asserts on. A .bd names its IP and" \
+        "  its output products by location inside the project that generated" \
+        "  them, so the copy on its own describes a design whose every part is" \
+        "  somewhere else - and read_bd does not fail on that. It returns a" \
+        "  design with the IP missing, which synthesises to a smaller, cleaner," \
+        "  wrong netlist that passes every budget in this flow." \
+        "  flow/vivado/3_bd.tcl section 7.5 writes the handoff. Re-run 'make bd'." \
+        "  Set SYNTH_READ_BD=0 if this design genuinely has no block design."]
 }
 
 # TOP_HDL IS READ AFTER THE FLIST (CONTRACT.md section 3.3). It is the
@@ -724,6 +863,17 @@ prov_stage_field dcp_bytes       [expr {[file exists $DCP]      ? [file size $DC
 prov_stage_field utilization_rpt [expr {[file exists $UTIL_RPT] ? [file size $UTIL_RPT] : ""}]
 prov_stage_field source_files    [expr {[info exists flist_files] ? $flist_files : ""}]
 prov_stage_field generics        [expr {[llength $GENERICS] ? [join $GENERICS {,}] : "(none)"}]
+
+# WHERE THE BLOCK DESIGN CAME IN, if one did. Two runs that read the same .bd
+# name through two different handoffs are two different designs, and the copy at
+# the contract path is NOT the file that was read (section 4.1).
+prov_stage_field bd_source [expr {$have_handoff ? "handoff" : ($have_bd ? "UNVERIFIED:bare-copy-no-handoff" : "(none)")}]
+prov_stage_field bd_read   [expr {($have_handoff && [info exists ::BD_HANDOFF(bd)]) \
+                                    ? [prov_site_path $::BD_HANDOFF(bd)] : "(none)"}]
+prov_stage_field bd_synth_hdl [expr {($have_handoff && [info exists ::BD_HANDOFF(synth_hdl)] \
+                                      && $::BD_HANDOFF(synth_hdl) ne "") \
+                                    ? [prov_site_path $::BD_HANDOFF(synth_hdl)] : "(none)"}]
+prov_stage_field part_set_before_read [expr {[flow_have create_project] ? $PART_STR : "UNVERIFIED:no-create_project"}]
 
 foreach k $::prov_stage_order { say [format "  %-22s %s" $k [prov_stage_get $k]] }
 

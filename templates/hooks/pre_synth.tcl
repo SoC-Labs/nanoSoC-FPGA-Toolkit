@@ -85,6 +85,16 @@
 #   set by an earlier hook or a step override. The global wins; both spellings
 #   are RTL_ASSERT_TABLE, so a message can name one variable and mean both.
 #
+#   ONE TABLE PER SEAM, WHEN THE SEAMS ASK DIFFERENT QUESTIONS.
+#   RTL_ASSERT_TABLE_<SEAM> - RTL_ASSERT_TABLE_POST_BD, RTL_ASSERT_TABLE_PRE_SYNTH
+#   - is read first and RTL_ASSERT_TABLE is the fallback for every seam that has
+#   no table of its own. This exists because a row is not evaluable everywhere:
+#   an `ip` row naming a block-design cell can only be answered where a block
+#   design is open, and a `define` row can only be answered where the synthesis
+#   fileset exists. One shared table made whichever seam ran first refuse on the
+#   other seam's row. The variable actually used is printed and lands in the
+#   record as `table_variable`.
+#
 #   ONE ROW PER EXPECTATION. Fill in the two markers below and delete this
 #   commented block once the real declaration is in design.mk - `make check`
 #   greps for the markers and they are how a fresh scaffold reports that this
@@ -108,9 +118,21 @@
 #             macro reaching an FPGA build swaps a memory wrapper for one that
 #             instantiates a foundry macro the fabric does not have, and the
 #             failure is a black box in the netlist rather than an error
-#     ip      an IP instance name. Reads CONFIG.<name> on that IP instead of
-#             the fileset property - the mechanism that SURVIVES packaging, so
-#             this is the strong form of the assertion in a packaged flow
+#     ip      an IP instance name, or a BLOCK-DESIGN CELL name. Reads
+#             CONFIG.<name> on that object instead of the fileset property - the
+#             mechanism that SURVIVES packaging, so this is the strong form of
+#             the assertion in a packaged flow.
+#
+#             IT NEEDS A SEAM WHERE THAT OBJECT EXISTS, and in a checkpoint flow
+#             pre_synth is not one: measured 2026-09-08, `get_ips` returns
+#             NOTHING at that seam on a block-design design, because the BD's IP
+#             objects belong to the project the bd stage built and this session
+#             only read the design back out of it. The lookup tries, in order,
+#             `get_ips <name>`, the BD-qualified `get_ips *_<name>_*` (an IP
+#             inside a block design is named <bd>_<cell>_<n>), and
+#             `get_bd_cells /<name>`; when none of them answers it refuses and
+#             names the seam. A row with an `ip` key on a BD cell belongs in
+#             RTL_ASSERT_TABLE_POST_BD, at fpga/hooks/post_bd.tcl.
 #     why     free text. Printed and recorded. Write it: a row whose reason is
 #             not written down is a row the next person deletes to get a build
 #
@@ -157,11 +179,24 @@
 #   Copyright (C) 2026, SoC Labs (www.soclabs.org)
 ################################################################################
 
-# The seam is THIS FILE'S OWN NAME, so `cp pre_synth.tcl pre_bd.tcl` runs the
-# same assertion at another point and every message it prints names that point.
+# The seam is THIS FILE'S OWN NAME, so copying this file to another seam's name
+# runs the same assertion at that point and every message it prints names it.
 # Captured at file scope: `info script` is only meaningful while the file is
 # being sourced.
-set _rtl_assert_seam [file rootname [file tail [info script]]]
+#
+# ::RTL_ASSERT_SEAM OVERRIDES IT, and that is the OTHER way to run this check at
+# a second seam - a three-line hook that sets the variable and sources this file,
+# instead of a copy of it. Added 2026-09-08 because the copy is 700 lines and
+# two copies of a check drift: the one that is wrong is always the one you are
+# not reading. The name still has to BE a seam - flow_utils.tcl's
+# flow_seam_assert refuses anything else - so this cannot invent a point that
+# does not exist.
+set _rtl_assert_seam ""
+if {[info exists ::RTL_ASSERT_SEAM] && [string trim $::RTL_ASSERT_SEAM] ne ""} {
+    set _rtl_assert_seam [string trim $::RTL_ASSERT_SEAM]
+} else {
+    set _rtl_assert_seam [file rootname [file tail [info script]]]
+}
 if {$_rtl_assert_seam eq ""} { set _rtl_assert_seam hook }
 
 # Every proc is prefixed rtl_assert_ for the reason flow_utils.tcl gives at its
@@ -174,16 +209,32 @@ if {$_rtl_assert_seam eq ""} { set _rtl_assert_seam hook }
 # A Tcl global wins over the environment. `opt` is called either way so the
 # resolved table lands in the run manifest with every other knob: the manifest
 # then records WHAT THIS RUN WAS GRADED AGAINST, not merely that it was graded.
-proc rtl_assert_declared {} {
-    set saved ""
-    set have 0
-    if {[info exists ::RTL_ASSERT_TABLE]} {
-        set saved $::RTL_ASSERT_TABLE
-        set have 1
+# PER-SEAM FIRST, THEN THE GENERAL TABLE. Added 2026-09-08, because one table
+# read at two seams cannot be right at both: a row whose `ip` key names a block
+# design cell can only be evaluated where a block design is open (post_bd), and
+# a row about a synthesis define can only be evaluated where the synthesis
+# fileset exists (pre_synth). Sharing one table made whichever seam ran first
+# refuse on the other seam's row.
+#
+#     RTL_ASSERT_TABLE_<SEAM>   e.g. RTL_ASSERT_TABLE_POST_BD - this seam only
+#     RTL_ASSERT_TABLE          every seam that has no table of its own
+#
+# The variable that was used is REPORTED and recorded, so a reader of the record
+# never has to work out which of the two was in force.
+proc rtl_assert_declared {seam} {
+    set names [list "RTL_ASSERT_TABLE_[string toupper $seam]" RTL_ASSERT_TABLE]
+    foreach n $names {
+        set saved ""
+        set have 0
+        if {[info exists ::$n]} {
+            set saved [set ::$n]
+            set have 1
+        }
+        opt $n ""
+        if {$have && [string trim $saved] ne ""} { set ::$n $saved }
+        if {[string trim [set ::$n]] ne ""} { return [list $n [string trim [set ::$n]]] }
     }
-    opt RTL_ASSERT_TABLE ""
-    if {$have && [string trim $saved] ne ""} { set ::RTL_ASSERT_TABLE $saved }
-    return [string trim $::RTL_ASSERT_TABLE]
+    return [list [lindex $names 0] ""]
 }
 
 # --- 2. THE LOUD REFUSAL ------------------------------------------------------
@@ -197,7 +248,8 @@ proc rtl_assert_unconfigured {seam} {
         [list "# RTL_ASSERT_TABLE is not declared in this run." \
               "# Nothing was compared. This file is the record that nothing was."]
     flow_refuse \
-        "NOT CHECKING: no RTL_ASSERT_TABLE is declared, so this hook asserted NOTHING." \
+        "NOT CHECKING: no RTL_ASSERT_TABLE_[string toupper $seam] and no RTL_ASSERT_TABLE" \
+        "  is declared, so this hook asserted NOTHING." \
         "  fpga/hooks/${seam}.tcl ran and found no table, and a hook that finds no" \
         "  expectations and passes quietly reads exactly like a hook that checked" \
         "  everything and was happy. So it refuses instead." \
@@ -352,24 +404,119 @@ proc rtl_assert_pairs {fs prop} {
     return [list $raw $out]
 }
 
-# CONFIG.<name> on a named IP - the form that survives ipx::package_project.
-# Returns {found value} or {0 ""}.
-proc rtl_assert_ip_config {ip name} {
-    if {![flow_have get_ips]} {
-        die "row names ip '$ip' but this tool has no get_ips." \
-            "  The IP form of this assertion cannot be evaluated here."
-    }
-    set obj ""
-    catch { set obj [get_ips -quiet $ip] }
-    if {$obj eq ""} {
-        die "row names ip '$ip', which is not in this project." \
-            "  A row about an IP that is not there cannot pass or fail honestly," \
-            "  so it stops the run. Check the instance name with: get_ips"
-    }
+# CONFIG.<name> on one object. The property is the same on an IP instance and on
+# a block-design cell, and that is the point: CONFIG.* is what survives
+# ipx::package_project, whichever object carries it.
+proc rtl_assert_config_of {obj name where} {
     set v ""
-    if {[catch { set v [get_property -quiet CONFIG.$name $obj] }]} { return [list 0 ""] }
-    if {[string trim $v] eq ""} { return [list 0 ""] }
-    return [list 1 $v]
+    if {[catch { set v [get_property -quiet CONFIG.$name $obj] }]} { return [list 0 "" $where] }
+    if {[string trim $v] eq ""} { return [list 0 "" $where] }
+    return [list 1 $v $where]
+}
+
+# THE `ip` KEY, AND THE THREE PLACES AN ANSWER CAN LIVE. Rewritten 2026-09-08
+# after it was measured unusable on every block-design design.
+#
+# WHAT WENT WRONG. The row said `ip nanosoc_eth_chiplet_0` - the name the block
+# design gives the cell - and the hook refused: "row names ip
+# 'nanosoc_eth_chiplet_0', which is not in this project". Correcting it to the
+# Vivado IP object's real name, tidelink_design_nanosoc_eth_chiplet_0_0, refused
+# identically, because at the pre_synth seam of a checkpoint flow `get_ips`
+# returns NOTHING AT ALL: the block design's IP objects live in the separate
+# project the bd stage built, and this session read the design back from it.
+#
+# So the key is not "unusable for BD designs" - it is answerable at a DIFFERENT
+# SEAM, and it now looks in all three places an answer can be, in the order that
+# makes the strongest claim first:
+#
+#   1. get_ips <name>          an IP instance named exactly as the row spells it
+#   2. get_ips *_<name>_*      the BD-QUALIFIED spelling. An IP instantiated
+#                              inside a block design is named <bd>_<cell>_<n>,
+#                              so the cell name the project author knows is a
+#                              substring of the object name and never equal to
+#                              it. Ambiguity here is FATAL, not a guess.
+#   3. get_bd_cells /<name>    the block-design cell itself, which is where the
+#                              value is SET (`set_property CONFIG.<x> {v}` in
+#                              the BD Tcl) and is answerable at post_bd.
+#
+# WHEN NONE OF THEM ANSWERS the refusal names the seam and says which seam can:
+# a row about an object that is not there cannot pass or fail honestly, and a
+# message that only says "not in this project" sends the reader to check a name
+# that was never the problem.
+proc rtl_assert_ip_config {ip name seam} {
+    set tried {}
+
+    if {[flow_have get_ips]} {
+        set obj ""
+        catch { set obj [get_ips -quiet $ip] }
+        if {[llength $obj] == 1} {
+            return [rtl_assert_config_of [lindex $obj 0] $name "CONFIG.$name on ip $ip"]
+        }
+        lappend tried "get_ips $ip"
+
+        set obj ""
+        catch { set obj [get_ips -quiet "*_${ip}_*"] }
+        if {[llength $obj] > 1} {
+            die "row names ip '$ip' and [llength $obj] IP objects match the" \
+                "  block-design spelling *_${ip}_*:" \
+                "    [join $obj {, }]" \
+                "  Picking one would be a guess about which instance the row" \
+                "  meant, and the two can hold different CONFIG values. Name the" \
+                "  object exactly."
+        }
+        if {[llength $obj] == 1} {
+            set o [lindex $obj 0]
+            say "  ip '$ip' resolved to the block-design IP object '$o'"
+            return [rtl_assert_config_of $o $name "CONFIG.$name on ip $o (BD-qualified from '$ip')"]
+        }
+        lappend tried "get_ips *_${ip}_*"
+    } else {
+        lappend tried "get_ips (this tool has no get_ips)"
+    }
+
+    if {[flow_have get_bd_cells]} {
+        set cur ""
+        catch { set cur [current_bd_design -quiet] }
+        if {$cur ne ""} {
+            set obj ""
+            catch { set obj [get_bd_cells -quiet "/$ip"] }
+            if {[llength $obj] == 1} {
+                say "  ip '$ip' resolved to the block-design CELL '/$ip' in '$cur'"
+                return [rtl_assert_config_of [lindex $obj 0] $name \
+                            "CONFIG.$name on bd_cell /$ip in block design $cur"]
+            }
+            lappend tried "get_bd_cells /$ip (block design '$cur' is open)"
+        } else {
+            lappend tried "get_bd_cells /$ip (NO block design is open in this session)"
+        }
+    } else {
+        lappend tried "get_bd_cells (this tool has no get_bd_cells)"
+    }
+
+    # NO lmap: it is Tcl 8.6 and the tool's interpreter is 8.5 - see the note
+    # above rtl_assert_run's failure formatter. A hook that only works on the
+    # newest Vivado is a hook that stops working on the machine with the licence.
+    set tried_lines {}
+    foreach t $tried { lappend tried_lines "    $t" }
+    die "row names ip '$ip', and nothing in this session answers to it at seam '$seam'." \
+        "  Tried, in order:" \
+        {*}$tried_lines \
+        "" \
+        "  A row about an object that is not there cannot pass or fail honestly," \
+        "  so it stops the run rather than reporting a clean sheet it never read." \
+        "" \
+        "  WHERE THIS KEY CAN BE ANSWERED. `ip` reads CONFIG.<name>, which lives" \
+        "  on an IP instance or on a block-design cell. In a CHECKPOINT flow the" \
+        "  synthesis session has neither: the block design's IP objects belong to" \
+        "  the project the bd stage built, and this session read the design back" \
+        "  out of it. Move the row to fpga/hooks/post_bd.tcl - the bd stage owns" \
+        "  that project and the block design is open there - by declaring it in" \
+        "  RTL_ASSERT_TABLE_POST_BD." \
+        "" \
+        "  Or drop the `ip` key from the row. Without it the same name is looked" \
+        "  up as a GENERIC or a VERILOG_DEFINE on the fileset, which is a weaker" \
+        "  claim (CONTRACT.md section 9.2: defines do not survive packaging) and" \
+        "  is reported as one."
 }
 
 # --- 5. THE RECORD ------------------------------------------------------------
@@ -416,9 +563,10 @@ proc rtl_assert_report {seam verdict lines} {
 proc rtl_assert_run {seam} {
     step "RTL parameter/define assertion ($seam)"
 
-    set table [rtl_assert_declared]
+    foreach {tvar table} [rtl_assert_declared $seam] break
     if {$table eq ""} { rtl_assert_unconfigured $seam ; return 0 }
     set rows [rtl_assert_parse $table]
+    say "table: $tvar ([llength $rows] row(s))"
 
     lassign [rtl_assert_fileset] fs fsname
     lassign [rtl_assert_pairs $fs GENERIC]        generic_raw generic
@@ -433,7 +581,8 @@ proc rtl_assert_run {seam} {
         [format "%-24s %s" generic $generic_raw] \
         [format "%-24s %s" verilog_define $define_raw] \
         [format "%-24s %s" declared_rtl_params [flow_env FPGA_RTL_PARAMS "(none)"]] \
-        [format "%-24s %s" declared_rtl_defines [flow_env FPGA_RTL_DEFINES "(none)"]]]
+        [format "%-24s %s" declared_rtl_defines [flow_env FPGA_RTL_DEFINES "(none)"]] \
+        [format "%-24s %s" table_variable $tvar]]
 
     # THE DECLARED-VERSUS-TOOL CENSUS. design.mk said one thing; the fileset
     # holds another. This is the shape the packaging defect takes, so it is
@@ -463,8 +612,7 @@ proc rtl_assert_run {seam} {
         array set r $row
 
         if {$r(ip) ne ""} {
-            lassign [rtl_assert_ip_config $r(ip) $r(name)] found value
-            set where "CONFIG.$r(name) on ip $r(ip)"
+            lassign [rtl_assert_ip_config $r(ip) $r(name) $seam] found value where
         } elseif {$r(kind) eq "param"} {
             set found [dict exists $generic $r(name)]
             set value ""
