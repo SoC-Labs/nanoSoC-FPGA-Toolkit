@@ -221,6 +221,24 @@ ci_head() { printf '\n== %s ==\n' "$*"; }
 _ci_record() {
     local status="$1" id="$2"; shift 2
     local detail="$*"
+    # THE ID IS SANITISED TOO, and it was not until 2026-09-08.
+    #
+    # Only the detail was scrubbed, on the reasoning that a gate id is a
+    # controlled string an author types. It is not: ids are COMPOSED -
+    # `ci_fail "route.$(basename "$f")"` - so a filename with a tab in it puts a
+    # tab in the id, and the row becomes five columns with the id split across
+    # 3 and 4. The consequence is worse than the wrapped detail this function
+    # already guarded against: a reader and every downstream parser then attach
+    # a verdict to a gate that does not exist, silently. Found by t_verdicts.sh,
+    # which carried it as a known defect until this line existed.
+    #
+    # An id with whitespace in it is already a bug in the caller, so the
+    # substitution never fires in a healthy run - but "never fires" and "cannot
+    # produce a wrong answer" are different claims, and only the second one is
+    # worth having in the function that writes the record CI reads.
+    id="${id//$'\t'/ }"
+    id="${id//$'\n'/ }"
+    id="${id//$'\r'/ }"
     detail="${detail//$'\t'/ }"
     detail="${detail//$'\n'/ }"
     detail="${detail//$'\r'/ }"

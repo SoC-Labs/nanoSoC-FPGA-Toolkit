@@ -698,8 +698,12 @@ house voice and it is load-bearing documentation.
 Phase 1 is done when, with **no EDA tool installed or launched**:
 
 1. `make help` prints a curated, ordered target list.
-2. `make env` prints engine / this run / project contract in three blocks, with
-   `(none)` rendered explicitly rather than as a blank.
+2. `make env` prints engine / this run / project contract, with `(none)`
+   rendered explicitly rather than as a blank. Those three blocks are required;
+   the recipe also prints a fourth, `gates and post-stage targets`, which is
+   additive and fine. The test asserts the three required ones and does not
+   forbid more - a contract that pinned the exact block COUNT would make adding
+   a section a breaking change for no reader's benefit.
 3. `make check` on a project scaffolded by `fpga-flow-init` reports its
    `<<FILL IN>>` markers and exits non-zero.
 4. `make check` on a **real** project manifest describing

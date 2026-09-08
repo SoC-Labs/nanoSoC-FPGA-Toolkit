@@ -327,18 +327,21 @@ fi
 #=============================================================================
 # 5. A KNOWN DEFECT: THE GATE ID IS NOT SANITISED, ONLY THE DETAIL
 #
-# _ci_record strips tab, newline and CR from the DETAIL and nothing strips them
-# from the GATE ID. Ids are normally literals, so this is not firing today - but
-# ids are also composed (`ci_fail "route.$(basename "$f")"` is the obvious
-# shape), and a composed id carrying a tab produces a FIVE-column row with the
-# verdict still in column 2 and the id split across 3 and 4. Every awk that
-# reads $4 as the detail then reads half an id.
+# _ci_record must strip tab, newline and CR from the GATE ID as well as from the
+# detail. Ids are normally literals - but they are also COMPOSED
+# (`ci_fail "route.$(basename "$f")"` is the obvious shape), and a composed id
+# carrying a tab produced a FIVE-column row with the verdict still in column 2
+# and the id split across 3 and 4. Every awk reading $4 as the detail then read
+# half an id, and the verdict attached to a gate that does not exist.
 #
-# Recorded rather than fixed: this file does not own ci/lib.sh. If somebody
-# sanitises the id, this marker goes RED and must be deleted - which is the
-# point of recording it this way rather than in a comment.
+# HISTORY, kept because it is the harness working: this shipped as a
+# t_known_defect - this suite does not own ci/lib.sh, so it recorded the defect
+# instead of fixing it. When ci/lib.sh was fixed the marker went RED by itself
+# ("KNOWN-DEFECT marker is STALE - this now PASSES. Delete the marker") and was
+# promoted to the ordinary assertion below. A defect marker that outlives its
+# defect is how a suite starts lying; this one refused to.
 #=============================================================================
-t_head "known defect: only the detail is sanitised"
+t_head "the gate id is sanitised too, not just the detail"
 
 ## id_is_sanitised <toolkit>  - exits 0 when a tab in the ID is neutralised
 id_is_sanitised() {
@@ -347,8 +350,28 @@ id_is_sanitised() {
     awk -F'\t' 'NF != 4 { bad=1 } END { exit bad }' "$vd/verdicts.tsv" 2>/dev/null
 }
 
-t_known_defect verdicts.tsv.id_unsanitised \
-    "a gate id containing a tab still produces a five-column row - _ci_record sanitises the detail only" \
+t_check verdicts.tsv.id_sanitised \
+    "a gate id carrying a tab still yields a four-column row, so no verdict attaches to a gate that does not exist" \
     id_is_sanitised "$FLOW_DIR"
+
+# The mutation proof. Put the defect back in a throwaway copy and this must go
+# red - otherwise the assertion above passes for some reason other than the
+# sanitiser, and would keep passing if the sanitiser were removed again.
+#
+# Written wrong the first time, and kept as a warning: the first draft passed
+# `$FLOW_DIR` to t_mutant as if it were the sandbox. t_mutant refuses that
+# (correctly - it will not copy over the real checkout), returned 2 and printed
+# NOTHING, so the command under test ran against an empty path, failed for that
+# reason, and t_check_fail reported `ok`. A green mutation proof that proves
+# nothing is worse than no mutation proof, because it is counted.
+M="$(t_mutant "$SB" id-unsanitised)"
+if t_replace_line "$M" ci/lib.sh '    id="${id//$'"'"'\t'"'"'/ }"' '    : # id tab sanitiser REMOVED by mutation'; then
+    t_check_fail verdicts.tsv.id_sanitised.mutation \
+        "with the id tab sanitiser removed, the assertion above goes red" \
+        id_is_sanitised "$M"
+else
+    t_skip verdicts.tsv.id_sanitised.mutation \
+        "could not plant the fault: the id tab-sanitiser line in _ci_record() has changed shape"
+fi
 
 t_summary

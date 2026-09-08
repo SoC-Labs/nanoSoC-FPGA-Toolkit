@@ -32,13 +32,21 @@ its maturity costs someone a week.
 | Layer | State |
 |---|---|
 | `CONTRACT.md` — the interface | written |
-| `mk/` — the make engine | under construction |
-| `flow/` — the Tcl stage layer | under construction |
-| `part/` — part packs | under construction |
-| `scripts/` — check, doctor, init, packs | under construction |
-| `ci/` — gates and verdicts | under construction |
-| `test/` — mutation-proof harness | under construction |
+| `mk/` — the make engine | written; guards and `help`/`env`/`check` exercised |
+| `flow/common/` — boot, flist reader, manifests | written; flist reader exercised against a real 13-file, 585-source flist |
+| `flow/vivado/` — the stage scripts | **not written** — no stage can run |
+| `flow/steps/` — overridable steps | written, never executed |
+| `part/` — part packs | written; three packs load and validate |
+| `scripts/` — check, doctor, init, packs, hooks | written and exercised |
+| `ci/` — gates, verdicts, tiers, scanner | written; scanner proven both directions |
+| `test/` — mutation-proof harness | 63 assertions, green, every one mutation-proved |
 | A real bitstream from this flow | **not attempted** |
+
+`test/run.sh` is green, and that is a claim about the contract layer only.
+**No stage has been run against Vivado**, because `flow/vivado/*.tcl` does not
+exist yet — `make synth` will tell you so and take no licence. Phase-1
+acceptance items 4 and 6 (a real project manifest; `part-probe`/`board-probe`
+against a real board pack) are not met.
 
 ---
 
