@@ -462,13 +462,39 @@ contract value, exported to the Tcl layer, and registered through `opt` so they
 land in the run manifest. A hook configured by an environment variable nobody
 recorded produces a result nobody can reproduce.
 
-### 6.1.3 Open: intra-stage seam ordering
+### 6.1.3 Intra-stage seam ordering — SETTLED 2026-09-08
 
-**Unresolved, and the templates deliberately refuse to guess.** Whether
-`post_impl` fires before or after the stage writes its checkpoint decides
-whether a change made there reaches the bitstream but not the checkpoint — i.e.
-whether the artefact and the record can disagree. §4 and §5 do not fix it. It
-must be fixed when `flow/vivado/*.tcl` lands, and the answer written here.
+**Every `post_*` seam fires BEFORE the stage writes its artefacts, and the
+stage's gate is computed AFTER the seam.** The one exception is
+`post_bitstream`, which is terminal by definition and may not change the design.
+
+The reasoning, and it is forced rather than chosen:
+
+- A stage hands off to the next one **through a file** — `impl` writes a routed
+  checkpoint, `bitstream` reads it. If `post_impl` fired *after*
+  `write_checkpoint`, a hook that changed the design would change nothing that
+  survives: the checkpoint on disk predates the edit, the next stage reads that
+  checkpoint, and the edit is silently discarded. The hook would appear to run,
+  be recorded in `hooks_run`, and have no effect.
+- Firing before the write gives the opposite and correct property: the
+  checkpoint **records what the hook did**, and every downstream stage inherits
+  it because it inherits the checkpoint.
+- The gate must then be computed after the seam, or it grades a design that no
+  longer exists. A verdict on the pre-hook netlist attached to a post-hook
+  artefact is exactly the artefact-and-record disagreement this rule exists to
+  prevent.
+
+The ASIC toolkit gets this wrong in the one place it matters and documents the
+cost: its `post_route` fires after stream-out, a project added pads there, and
+it streamed a GDS with no pad ring while every gate passed. Same failure, other
+direction — there the hook changed the design and the artefact did not follow;
+here it would be the artefact and the hook's effect vanishing. Both come from a
+seam on the wrong side of a write.
+
+`post_bitstream` keeps the ASIC trap, explicitly and by design: the `.bit` is
+already written, a hook there cannot change what ships, and
+`templates/hooks/README.md` says so. It is for publishing, recording and
+notifying.
 
 `post_bitstream` carries the reference toolkit's `post_route` trap: the
 bitstream is already written. A hook there cannot change the design. Say so in
@@ -715,3 +741,52 @@ Phase 1 is done when, with **no EDA tool installed or launched**:
 7. `test/run.sh` passes, and every assertion in it is paired with a mutation
    proof that the assertion goes red on a planted fault.
 8. Nothing in this repository names a board, a pin, or a project path.
+
+---
+
+## 12. Stage scripts — `flow/vivado/*.tcl`
+
+Six files, one per stage, named `1_flist 2_package_ip 3_bd 4_synth 5_impl
+6_bitstream`. `mk/flow.mk` invokes them through `vivado_stage`, which exports
+`FPGA_STAGE`, `FPGA_STAGE_T0`, `FPGA_LOG_FILE` and `FPGA_TOOL_HINT` on top of
+the standing `FPGA_*` set.
+
+### 12.1 The skeleton every stage follows
+
+```tcl
+source [file join $env(FPGA_FLOW_DIR) flow common flow_utils.tcl]
+flow_boot                                  ;# env, part pack, board pack, config
+opt STAGE_KNOB default ;# what it does     ;# knobs, at the left margin
+flow_hook pre_<stage>                      ;# seam
+... the work, in flow_step units where a project may reasonably override ...
+flow_hook post_<stage>                     ;# seam, BEFORE the writes (§6.1.3)
+... write artefacts ...
+<stage>_gate                               ;# the verdict, AFTER the seam
+prov_write_manifest                        ;# last
+```
+
+### 12.2 Rules
+
+1. **Assert on artefacts.** A stage ends by checking that what it was supposed
+   to write is on disk and says what it should. Never `if {[catch ...]}` around
+   a Vivado command as the only check — Vivado exits 0 on a failed route.
+2. **Every knob is an `opt`**, at the left margin, so `make help-knobs` and the
+   manifest both find it without a hand-maintained list.
+3. **A step a project might reasonably replace goes through `flow_step`**, and
+   its file goes in `flow/steps/`. The five that exist are the starting set.
+4. **The engine sets the XDC read window** from the variable that named the
+   file (§3.3) — the project never sets `USED_IN_SYNTHESIS`.
+5. **`XDC_POST_ROUTE` is `source`d after `route_design`**, never `read_xdc`'d.
+6. **Nothing reaches out of the project.** No `../..`, no `$env(HOME)`.
+7. **A stage that is not configured writes a manifest saying so** and exits 0.
+   `ci/assert-stage.sh` distinguishes "not configured" from "configured and
+   produced nothing"; it can only do that if the first case leaves a record.
+8. **`RTL_DEFINES_INBODY` is delivered by materialising modified copies** into
+   `$WORK_DIR`, never by `set_property verilog_define` — see §9.2.
+
+### 12.3 The gate file
+
+Each stage writes `$REPORT_DIR/<stage>_gate.txt` in the §5 structure. `impl`'s
+is required; the others are written when the stage has something to grade.
+`HARD FAILURES: none` is the exact string `mk/flow.mk` greps for, so it is
+load-bearing punctuation.
