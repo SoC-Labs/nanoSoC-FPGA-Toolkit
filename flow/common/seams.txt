@@ -1,0 +1,22 @@
+# flow/common/seams.txt - THE list of flow-hook seams. One name per line.
+#
+# THIS IS THE ONLY COPY. The flow engine reads it, `fpga-flow-check` reads it,
+# and `make help` reads it. Nothing may hardcode a second copy: the reference
+# ASIC toolkit hardcodes a five-entry step whitelist against a seven-file
+# directory, so two real extension points are undocumented and warn spuriously.
+#
+# A project hook is $(HOOKS_DIR)/<name>.tcl. A file in hooks/ whose name is not
+# on this list NEVER RUNS - `make check` warns and names it.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+pre_flist
+post_flist
+pre_package_ip
+post_package_ip
+pre_bd
+post_bd
+pre_synth
+post_synth
+pre_impl
+post_impl
+post_bitstream
