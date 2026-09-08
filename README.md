@@ -19,50 +19,45 @@ include $(FPGA_FLOW_DIR)/mk/flow.mk     # everything about the FLOW
 
 ## Status — what has and has not been built
 
-**Phase 1 (the contract layer) is largely built and its suite is green. Nothing
-here has produced a bitstream.** No stage has been run against Vivado — the
-Vivado stage scripts are not written yet, so there is nothing to run. The
-phase-1 acceptance list in [`CONTRACT.md`](CONTRACT.md) §11 is **not** complete:
-items 4 and 6 need a real project manifest and a real board pack, and neither
-exists.
+**The flow runs RTL to bitstream. It cannot yet build the design it exists to
+build.** Both halves of that sentence matter; the table below is written so
+neither can be quoted without the other.
 
-Read the table as three different claims, because they are: *written* means the
-code exists, *exercised* means someone ran it and it did what it says, and
-*proven* means a test would go red if it stopped.
-
-This is a deliberate echo of the reference toolkit's own README, which draws a
-hard line between *written*, *executed*, and *proven*. A toolkit that overstates
-its maturity costs someone a week.
+Read it as three different claims, because they are: *written* means the code
+exists, *exercised* means someone ran it and it did what it says, and *proven*
+means a test would go red if it stopped. This is a deliberate echo of the
+reference ASIC toolkit's README, which draws the same hard line — a toolkit that
+overstates its maturity costs someone a week.
 
 | Layer | State |
 |---|---|
 | `CONTRACT.md` — the interface | written |
-| `mk/` — the make engine | written; guards and `help`/`env`/`check` exercised |
-| `flow/common/` — boot, flist reader, manifests | written; flist reader exercised against a real 13-file, 585-source flist |
-| `flow/vivado/` — the stage scripts | **not written** — no stage can run |
-| `flow/steps/` — overridable steps | written, never executed |
-| `part/` — part packs | written; three packs load and validate |
+| `mk/` — the make engine | proven (27 assertions); `help`/`env`/`check` exercised |
+| `flow/common/` — boot, flist reader, manifests | proven (85 assertions); flist reader exercised on the real 596-source chiplet flist |
+| `flow/vivado/` — the six stage scripts | **written and RUN under Vivado 2024.1** |
+| `flow/steps/` — overridable steps | written, exercised via the stages |
+| `part/` — part packs | proven (86 assertions); three packs load and validate |
 | `scripts/` — check, doctor, init, packs, hooks | written and exercised |
-| `ci/` — gates, verdicts, tiers, scanner | written; scanner proven both directions |
-| `test/` — mutation-proof harness | 63 assertions, green, every one mutation-proved |
-| A real bitstream from this flow | **yes, on a fixture design** |
-| A real bitstream for the KR260 eth chiplet | **NO — fails at stage 3** |
+| `ci/` — gates, verdicts, tiers, scanner, assert-stage | proven (55 assertions) |
+| `test/` — mutation-proof harness | 271 assertions, green, every one mutation-proved |
+| A bitstream from this flow | **yes — on a small fixture design** |
+| A bitstream for the KR260 eth chiplet | **NO — parity fails at stage 3** |
+| The deploy tier against real hardware | **never run; no board has been touched** |
 
-**The KR260 parity test failed, and that is the most important line in this
-table.** The toolkit reaches a bitstream on a small fixture, and cannot build
-the design it exists to build: a block-design-based project needs
-`generate_target` (absent), a stage3->stage4 handoff that carries more than a
-bare `.bd`, and the part set on the in-memory design before `read_bd`. Full
-diagnosis and a ten-item fix list in the consuming project's
-`fpga/PARITY_REPORT.md`. Until that passes, `tidelink/fpga` remains the only
-flow that builds this chiplet, and nothing here should be described as
-replacing it.
+**The failed parity test is the most important line in that table.** A
+block-design-based project cannot be built here: `generate_target` is absent
+from the toolkit entirely, the stage-3 → stage-4 handoff carries a bare `.bd`
+and loses the generated `synth/<bd>.v` and the IP output products, and the part
+is not set on the in-memory design before `read_bd` — so Vivado defaults to
+Virtex-7 and every IP fails to resolve thousands of lines before the real part
+loads. Full diagnosis and a ten-item fix list live in the consuming project's
+`fpga/PARITY_REPORT.md`.
 
-`test/run.sh` is green, and that is a claim about the contract layer only.
-**No stage has been run against Vivado**, because `flow/vivado/*.tcl` does not
-exist yet — `make synth` will tell you so and take no licence. Phase-1
-acceptance items 4 and 6 (a real project manifest; `part-probe`/`board-probe`
-against a real board pack) are not met.
+Until that passes, `tidelink/fpga` remains the only flow that builds this
+chiplet, and nothing here should be described as replacing it.
+
+`test/run.sh` being green is a claim about the contract layer and the fixture
+path. It is not a claim about the real design.
 
 ---
 
