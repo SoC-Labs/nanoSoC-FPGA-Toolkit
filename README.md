@@ -19,11 +19,16 @@ include $(FPGA_FLOW_DIR)/mk/flow.mk     # everything about the FLOW
 
 ## Status — what has and has not been built
 
-**Phase 1 (the contract layer) is under construction. Nothing here has produced
-a bitstream.** No stage has been run against Vivado, and the flow Tcl is
-written but unexecuted. Treat every claim below as a description of intent
-until `test/run.sh` and the phase-1 acceptance list in
-[`CONTRACT.md`](CONTRACT.md) §11 are green.
+**Phase 1 (the contract layer) is largely built and its suite is green. Nothing
+here has produced a bitstream.** No stage has been run against Vivado — the
+Vivado stage scripts are not written yet, so there is nothing to run. The
+phase-1 acceptance list in [`CONTRACT.md`](CONTRACT.md) §11 is **not** complete:
+items 4 and 6 need a real project manifest and a real board pack, and neither
+exists.
+
+Read the table as three different claims, because they are: *written* means the
+code exists, *exercised* means someone ran it and it did what it says, and
+*proven* means a test would go red if it stopped.
 
 This is a deliberate echo of the reference toolkit's own README, which draws a
 hard line between *written*, *executed*, and *proven*. A toolkit that overstates
