@@ -82,71 +82,20 @@ opt BD_ADD_HEADERS      1    ;# 1 = add the include path's headers to the projec
 
 
 ################################################################################
-# THE GATE AND THE STAGE-MEASUREMENT BLOCK
+# THE GATE AND THE STAGE-MEASUREMENT BLOCK LIVE IN provenance.tcl
 #
-# DUPLICATED, IDENTICALLY, IN ALL THREE FRONT-HALF STAGE SCRIPTS. Their right
-# home is flow/common/provenance.tcl as `prov_gate` and `prov_stage_fields`, and
-# these three files may not create it. See the long note in 1_flist.tcl for the
-# two reasons: prov_manifest closes the file with no seam for a stage's own
-# measurements, and nothing in flow/common writes a gate file at all - while
-# ci/assert-stage.sh requires both.
+# They were written here, and in the five other stage scripts, because
+# prov_manifest wrote CONTRACT.md section 5's seven blocks and closed the file
+# with no slot for a stage's own measurements - while ci/assert-stage.sh
+# REQUIRES those measurements as top-level manifest keys. Two sessions hit that
+# independently and each invented the same workaround, so there were six copies
+# of a local block-8 emitter and six of a gate writer.
+#
+# They are now `prov_stage_field` / `prov_stage_fields` and `prov_gate` in
+# flow/common/provenance.tcl, which owns manifest emission and already owned the
+# site-path rule the measurements have to go through. flow_boot sources that
+# file, so nothing here has to.
 ################################################################################
-
-# THESE NAMES MUST BE FREE. `proc` silently REPLACES an existing command, and
-# this file is sourced into a tool with several thousand of them. The equivalent
-# guard in flow_utils.tcl has already fired in anger on the reference toolkit - a
-# helper named `fail` shadowed a builtin and aborted a route stage 2.5 hours in.
-foreach __c {stage_fields gate_write} {
-    if {[llength [info commands $__c]]} {
-        error "[file tail [info script]]: '$__c' is already a command in this\
-               tool - defining it here would shadow it. Rename the helper and\
-               its callers."
-    }
-}
-unset __c
-
-proc stage_fields {path fields} {
-    set fh [open $path a]
-    puts $fh ""
-    puts $fh "# 8. what this stage MEASURED. ci/assert-stage.sh reads these keys."
-    foreach {k v} $fields {
-        if {$v eq ""} { set v "(none)" }
-        mf $fh $k $v
-    }
-    close $fh
-    return $path
-}
-
-proc gate_write {stage what hard budgets delegated notcovered} {
-    global REPORT_DIR block_name RUN_TAG board_name part_name
-    set path [file join $REPORT_DIR ${stage}_gate.txt]
-    set fh [open $path w]
-    puts $fh "[string toupper [string map {_ -} $stage]] gate, [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]"
-    puts $fh "design $block_name, run tag $RUN_TAG, board $board_name, part $part_name"
-    puts $fh ""
-    foreach line $what { puts $fh $line }
-    puts $fh ""
-    if {[llength $hard]} {
-        puts $fh "HARD FAILURES: [llength $hard]"
-        foreach h $hard { puts $fh "  - $h" }
-    } else {
-        puts $fh "HARD FAILURES: none"
-    }
-    puts $fh ""
-    puts $fh "BUDGETS EXCEEDED"
-    foreach b $budgets { puts $fh "  - $b" }
-    puts $fh ""
-    puts $fh "DECLARED ELSEWHERE - MEASURED HERE, OWNED BY SOMEBODY ELSE"
-    foreach d $delegated { puts $fh "  - $d" }
-    puts $fh ""
-    puts $fh "NOT covered by ANY run of this flow, at any setting:"
-    foreach n $notcovered { puts $fh "  - $n" }
-    puts $fh ""
-    puts $fh "# Copyright (C) 2026, SoC Labs (www.soclabs.org)"
-    close $fh
-    say "gate: $path"
-    return $path
-}
 
 
 ################################################################################
@@ -181,7 +130,7 @@ if {$BD_TCL eq ""} {
         warn "  not run is worse than no verdict."
     }
     set manifest [prov_manifest bd]
-    stage_fields $manifest [list \
+    prov_stage_fields $manifest [list \
         stage_configured   no \
         not_configured_why "BD_TCL is empty in the project's design.mk" \
         bd_tcl             "(none)" \
@@ -644,7 +593,7 @@ if {$synth_mode ne "unmeasured"} {
                        The consequence is measured in the synthesis stage, not here"
 }
 
-gate_write bd \
+prov_gate bd bd \
     [list \
         "WHAT THIS CHECK IS: an assertion that a block design named DESIGN_NAME" \
         "exists, that it is not empty, that every overlay was applied in the order" \
@@ -672,7 +621,7 @@ gate_write bd \
          recorded here; nothing checks that the board-level top names it" ]
 
 set manifest [prov_manifest bd]
-stage_fields $manifest [list \
+prov_stage_fields $manifest [list \
     stage_configured   yes \
     bd_tcl             [prov_site_path $BD_TCL] \
     design_name        $DESIGN_NAME \

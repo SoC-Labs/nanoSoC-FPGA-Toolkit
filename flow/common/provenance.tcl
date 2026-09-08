@@ -73,6 +73,33 @@
 #   6 hooks_run     pre_synth(2s) ...   or (none)
 #   7 knobs         EVERY registered knob and its resolved value
 #
+# ...and then ONE MORE, written by the stage rather than by prov_manifest:
+#
+#   8 measurements  what THIS stage measured - file_count, vlnv, lut/ff/bram,
+#                   wns/whs/unrouted_nets, bin_style/bit_bytes ...
+#
+# BLOCK 8 IS NOT PART OF THE PROVENANCE BLOCK, and the distinction is the reason
+# it has its own accumulator instead of going through prov_set. ci/assert-stage.
+# sh reads those keys with `awk '$1 == key'`, so each has to be a TOP-LEVEL key;
+# prov_set would prefix them `prov.`, which is the namespace `compare-runs`
+# treats as design IDENTITY. A utilisation figure is a RESULT of building a
+# design, not a statement of WHICH design it is - two runs that differ in LUT
+# count are not two different designs, and a comparison that refused them would
+# refuse every A/B experiment anyone would want to run. So a stage records its
+# numbers with prov_stage_field and prov_stage_fields appends them AFTER
+# prov_manifest has closed the file.
+#
+# THE VERDICT ARTEFACT, $REPORT_DIR/<stem>_gate.txt, is prov_gate. Section 5
+# fixes its four classes and section 12.3 makes `HARD FAILURES: none` load-
+# bearing punctuation.
+#
+# Both of those procs were written SIX TIMES before they were written here -
+# once in each stage script, by two sessions working in parallel that each hit
+# the same hole independently and each invented the same workaround. That is the
+# toolkit's own founding complaint (75 copies of bit2bin.py, 179 of
+# build_design.tcl) reproduced inside the toolkit in an afternoon. If you are
+# about to write a seventh copy: don't. Extend these.
+#
 # Block 7 IS ENUMERATED, NEVER WRITTEN DOWN. `opt` registers a knob by the act of
 # reading it (flow_utils.tcl section 3), so ::flow(knobs) is the resolved set and
 # flow_knob_scan is the declared set, and this file emits both - the resolved
@@ -106,6 +133,8 @@ foreach __c {
     prov_sha256 prov_sha256_string prov_resolve prov_site_path prov_pin
     prov_file prov_git prov_collect_common prov_collect_packs prov_collect_all
     prov_emit prov_write prov_knobs prov_manifest prov_tool prov_value
+    prov_path_value prov_knob_value prov_stage_reset prov_stage_field
+    prov_stage_get prov_stage_measured prov_stage_fields prov_gate
 } {
     if {[llength [info commands $__c]]} {
         error "provenance.tcl: '$__c' is already a command in this tool - it\
@@ -143,6 +172,7 @@ proc prov_reset {} {
     array set   ::prov_pinned {}
     array unset ::prov_mutated
     array set   ::prov_mutated {}
+    prov_stage_reset
 }
 
 proc prov_set {key value} {
@@ -726,23 +756,44 @@ proc prov_write {path} {
 # The override directory is scanned too, and LAST, so an overridden step's knobs
 # are reported from the file that would actually be sourced.
 
-## prov_knob_value <value>
-## A knob value that LOOKS like a path is put through the site-path rule; one
-## that does not is passed through unchanged.
+## prov_path_value <value>
+## A value that LOOKS like a path is put through the site-path rule; one that
+## does not is passed through unchanged. THE ONE RULE, APPLIED TO ANY VALUE a
+## caller hands the manifest - block 7's knobs and block 8's measurements both
+## go through here, because both hold paths by design and the file header's rule
+## ("prov_site_path is the ONE place that decision is made; nothing else in the
+## flow may write a path into a manifest") does not have a knobs-only clause.
 ##
 ## Deliberately conservative about what "looks like a path" means: a token
-## starting with / or ~, or containing a / with no whitespace around it. A knob
-## holding a list of paths is handled token by token, because FLIST_INCDIRS is
-## exactly that and digesting the whole list as one string would destroy a value
-## a reader legitimately needs. An effort level, a directive name or a number is
-## untouched - digesting those would make the manifest unreadable for no gain.
-proc prov_knob_value {v} {
+## starting with / or ~, or containing a / with no whitespace around it. A value
+## holding a LIST of paths is handled token by token, because FLIST_INCDIRS and
+## the bd stage's overlay_order are exactly that and digesting the whole list as
+## one string would destroy a value a reader legitimately needs. An effort level,
+## a directive name or a number is untouched - digesting those would make the
+## manifest unreadable for no gain.
+##
+## IDEMPOTENT, AND THAT IS LOAD-BEARING RATHER THAN TIDY. `<run>/work/sources.tcl`
+## and `sha256:<digest>` are what prov_site_path RETURNS, and a stage that called
+## it at the point of measurement - which three of the six do, for values that
+## are a path or an UNVERIFIED depending on a branch - would otherwise have its
+## answer digested a second time. `<run>/work/sources.tcl` is not a path that
+## resolves anywhere, so the second pass would fall through to the site branch
+## and emit a digest of a label: the reader loses the only field that tells them
+## WHICH file was read, and two runs under different build roots start differing
+## again - the exact failure the labels exist to prevent. Measured on the six
+## stage scripts: twelve fields in three manifests take this branch.
+proc prov_path_value {v} {
     if {[string first "UNVERIFIED:" $v] == 0} { return $v }
     if {$v eq ""} { return [prov_value $v] }
     set out {}
     set changed 0
     foreach tok [split $v " "] {
         if {$tok eq ""} { continue }
+        # ALREADY THROUGH THE RULE. See the idempotence note above.
+        if {[string index $tok 0] eq "<" || [string first "sha256:" $tok] == 0} {
+            lappend out $tok
+            continue
+        }
         if {[string index $tok 0] eq "/" || [string index $tok 0] eq "~" \
             || ([string first "/" $tok] > 0)} {
             set d [prov_site_path $tok]
@@ -755,6 +806,11 @@ proc prov_knob_value {v} {
     if {!$changed && [llength $out] == 0} { return [prov_value $v] }
     return [join $out " "]
 }
+
+## prov_knob_value <value> - block 7's spelling of prov_path_value. Kept as a
+## name of its own because prov_knobs is the caller a reader arrives from, and
+## because it is what the suite's mutation proof for the knob path rule plants.
+proc prov_knob_value {v} { return [prov_path_value $v] }
 
 proc prov_knobs {fh} {
     set resolved {}
@@ -805,7 +861,40 @@ proc prov_knobs {fh} {
 #
 # Returns the path, so a stage's own assertion can be `if {![file size [prov_
 # manifest synth]]}` rather than a second spelling of the filename.
-proc prov_manifest {stage} {
+#
+# TWO NAMES, TAKEN SEPARATELY, BECAUSE ONE STAGE CANNOT SATISFY BOTH WITH ONE.
+#
+#   <stage>  the stage's NAME. It is the make target, it is what mk/flow.mk
+#            exports as FPGA_STAGE, it is what ci/assert-stage.sh is invoked
+#            with, and it is what goes in the `stage` FIELD - identifying the
+#            stage is that field's entire job.
+#   <stem>   the ARTEFACT stem, fixed by CONTRACT.md section 4. It decides the
+#            FILENAME and nothing else. It defaults to the stage name, which is
+#            correct for five of the six stages.
+#
+# This took one string until 2026-09-08, and package-ip could not satisfy it.
+# MEASURED, both ways, on the real assert-stage:
+#
+#   prov_manifest package_ip -> assert-stage FAILS the run: "the manifest at
+#                               .../package_ip_manifest.txt says stage
+#                               'package_ip', not 'package-ip' - it is not this
+#                               stage's manifest, so nothing read out of it
+#                               describes this stage"
+#   prov_manifest package-ip -> the file lands at package-ip_manifest.txt, where
+#                               neither mk/flow.mk nor assert-stage looks
+#
+# The stage script worked around it by writing under one name and renaming the
+# file afterwards, which put a filename decision in a stage script and left the
+# next hyphenated stage to rediscover the whole thing.
+#
+# THE STEM IS NOT DERIVED FROM THE STAGE NAME. `package-ip` -> `package_ip`
+# happens to be a `-`-to-`_` map, but the artefact names are a list CONTRACT.md
+# section 4 fixes, not a function of the stage names, and a proc that guessed
+# would be a second place that list lives - which is rule three of this toolkit.
+# A hyphenated stage that does NOT pass a stem is warned about by name, because
+# the resulting filename is one nothing looks for and the failure is otherwise
+# an absent-artefact error two stages later.
+proc prov_manifest {stage {stem ""}} {
     global REPORT_DIR WORK_DIR LOG_DIR OUT_DIR IN_WORK_DIR FLOW_T0
 
     if {![info exists REPORT_DIR]} {
@@ -813,7 +902,18 @@ proc prov_manifest {stage} {
             "  the manifest for stage '$stage'. flow_boot publishes it; a stage" \
             "  that skipped flow_boot has also skipped every input assertion."
     }
-    set path [file join $REPORT_DIR ${stage}_manifest.txt]
+    if {$stem eq ""} {
+        set stem $stage
+        if {[string first "-" $stage] >= 0} {
+            catch {
+                warn "prov_manifest '$stage': no artefact stem given, so this"
+                warn "  manifest lands at ${stage}_manifest.txt. CONTRACT.md"
+                warn "  section 4 fixes the artefact names and none of them"
+                warn "  carries a '-'. Call prov_manifest <stage> <stem>."
+            }
+        }
+    }
+    set path [file join $REPORT_DIR ${stem}_manifest.txt]
     set fh [open $path w]
 
     puts $fh "# $stage manifest - schema $::PROV_SCHEMA"
@@ -954,6 +1054,219 @@ proc prov_manifest {stage} {
 
     close $fh
     say "manifest: $path"
+    return $path
+}
+
+
+################################################################################
+# 5. BLOCK 8 - WHAT THE STAGE ITSELF MEASURED
+#
+# THE SEAM prov_manifest DOES NOT HAVE. prov_manifest writes CONTRACT.md section
+# 5's seven blocks and closes the file; nothing in them is a place for a stage's
+# own numbers, and ci/assert-stage.sh REQUIRES those numbers as top-level
+# manifest keys - file_count for flist, vlnv and params_packaged for package-ip,
+# bd_cells and overlays_applied for bd, lut/ff/bram/dsp for synth,
+# wns/whs/unrouted_nets for impl, bin_style/bit_bytes for bitstream. So block 8
+# is appended after prov_manifest returns, and this is the sanctioned way to do
+# it. Six stage scripts wrote their own emitter first; see the file header.
+#
+# WHY NOT prov_set. `prov_set` puts a key in the `prov.` namespace, which
+# `compare-runs` treats as design IDENTITY: a difference there means the two
+# runs are not the same design and the comparison is REFUSED. A stage result is
+# not identity. Two runs of one design that differ in LUT count are the normal
+# case - that is what an A/B experiment IS - and routing every measurement
+# through prov_set would make `compare-runs` refuse every pair anyone would
+# actually want to compare, at which point it gets switched off.
+#
+# THE THREE RULES OF SECTION 5 APPLY HERE UNCHANGED, and each is implemented
+# once rather than at each of the ~90 call sites in the six stage scripts:
+#
+#   * a value that was never taken is the literal token `unmeasured`, NEVER `0`
+#     and NEVER blank. `0` is a legitimate measurement - zero unrouted nets,
+#     zero blackboxes - and ci/lib.sh's CI_UNMEASURED_RE keys on the token, so a
+#     stage that wrote a blank or a `0` for "did not look" would be GRADED GREEN
+#     by assert-stage on a number nobody took;
+#   * a value that was looked for and could not be read is `UNVERIFIED:<reason>`,
+#     passed in by the caller, which knows the reason;
+#   * a value that IS a path goes through the site-path rule, exactly like every
+#     other path in this file. Measurements hold paths routinely - sources_tcl,
+#     component_xml, bd_wrapper, inbody_record - and the file header's rule has
+#     no measurements-only exemption.
+#
+# NOTE `(none)` IS NOT `unmeasured`, and the two must not be collapsed.
+# CONTRACT.md section 11 fixes `(none)` for "explicitly nothing" - a design with
+# no defines, an overlay list that is empty on purpose - and ci_is_measured
+# treats it as a MEASUREMENT, correctly: somebody looked, and the answer was
+# nothing. Only the CALLER can tell those apart, so the caller passes `(none)`
+# and a blank arriving here is treated as the thing the caller could not supply.
+################################################################################
+
+# key -> value, plus declaration order, so block 8 is diffable line by line.
+# SEPARATE FROM ::prov, which is block 2. See above.
+array set ::prov_stage       {}
+set       ::prov_stage_order {}
+
+proc prov_stage_reset {} {
+    array unset ::prov_stage
+    array set   ::prov_stage {}
+    set ::prov_stage_order {}
+}
+
+## prov_stage_field <key> <value>
+## Record ONE measurement. FIRST DECLARATION FIXES THE ORDER; a later write to
+## the same key replaces the value and does not move it, so a stage that refines
+## a number does not shuffle its manifest under a reader's diff.
+##
+## The blank-to-`unmeasured` conversion happens HERE, at record time, and not at
+## emission: prov_stage_measured and the gate paragraphs read these values back
+## while the stage is still deciding its verdict, and a blank read back as ""
+## would compare, format and concatenate as though it were a number.
+proc prov_stage_field {key value} {
+    if {[string trim $value] eq ""} { set value "unmeasured" }
+    if {![info exists ::prov_stage($key)]} { lappend ::prov_stage_order $key }
+    set ::prov_stage($key) $value
+}
+
+## prov_stage_get <key> - the recorded value, or `unmeasured` when nothing
+## recorded one. NEVER "" and never an error: this is called from inside gate
+## paragraphs and `expr` comparisons a hundred lines from the record.
+proc prov_stage_get {key} {
+    if {[info exists ::prov_stage($key)]} { return $::prov_stage($key) }
+    return "unmeasured"
+}
+
+## prov_stage_measured <key> - true only when a REAL measurement is recorded.
+## This is the guard that has to go in front of every arithmetic use of a
+## measurement, because `expr {"unmeasured" > 0}` is not a comparison, it is an
+## error that aborts a stage at its verdict - after the work is done.
+proc prov_stage_measured {key} {
+    set v [prov_stage_get $key]
+    return [expr {$v ne "unmeasured" && ![string match "UNVERIFIED*" $v]}]
+}
+
+## prov_stage_fields <manifest path> ?<key value key value ...>?
+##
+## Append block 8 to a manifest prov_manifest has already closed, and return the
+## path. The optional list is recorded first, so a stage that measures
+## everything at the end writes ONE call and a stage that accumulates as it goes
+## calls prov_stage_field and passes nothing here.
+##
+## APPEND, NOT REWRITE. prov_manifest is called last for a reason (CONTRACT.md
+## section 5): its existence is the evidence that the stage reached its final
+## section. Re-opening it "w" to insert an eighth block would destroy the seven
+## that are already on disk if the stage died between the two calls, which is
+## precisely the window this ordering exists to make safe.
+proc prov_stage_fields {path {fields {}}} {
+    foreach {k v} $fields { prov_stage_field $k $v }
+    set fh [open $path a]
+    puts $fh ""
+    puts $fh "# 8. what this stage MEASURED, read back out of the reports and"
+    puts $fh "#    artefacts it wrote. ci/assert-stage.sh reads these keys."
+    puts $fh "#    'unmeasured' is a count nobody took. It is not 0."
+    foreach k $::prov_stage_order {
+        mf $fh $k [prov_path_value $::prov_stage($k)]
+    }
+    close $fh
+    return $path
+}
+
+
+################################################################################
+# 6. THE STAGE VERDICT ARTEFACT
+################################################################################
+
+## prov_gate <stage> <stem> <paragraph> <hard> <budgets> <delegated> <notcovered>
+##
+## Writes $REPORT_DIR/<stem>_gate.txt in the structure CONTRACT.md section 5
+## fixes, and returns the path. <stage> and <stem> split for the same reason
+## they split in prov_manifest: the TITLE names the stage (`PACKAGE-IP gate`)
+## and the FILENAME is the artefact stem (`package_ip_gate.txt`). Unlike
+## prov_manifest the stem is required, because every caller of this proc is a
+## stage script written after the split and there is no one-argument form in the
+## field to keep working.
+##
+## The four lists are the four verdict classes, in the order they are written:
+##   <hard>       the run is BROKEN. Anything here makes the stage fail.
+##   <budgets>    a measurement passed an EXPECT_* knob the project armed.
+##   <delegated>  measured here, owned by somebody else - and EVERY entry must
+##                carry `owner=<who>`. assert-stage FAILS an entry without one,
+##                because "somebody else measures this" with no somebody is how
+##                a thing comes to be measured by nobody.
+##   <notcovered> what NO run of this flow measures, at any setting. The honesty
+##                mechanism: a green run still enumerates what it did not look at.
+##
+## `HARD FAILURES: none` IS THE EXACT STRING, AND IT IS PUNCTUATION, NOT PROSE.
+## mk/flow.mk greps for it and ci/assert-stage.sh greps for it ANCHORED
+## (`^HARD FAILURES: none`) - anchored because an unanchored grep for
+## `HARD FAILURES` also matches the section HEADING and therefore passes on every
+## gate file ever written, including one listing nine of them. So: capitals, one
+## space after the colon, `none` in lower case, at the left margin, and the
+## count - never the word - when there are any. Change any of that and every
+## gate in the flow silently starts passing.
+##
+## EVERY SECTION IS ALWAYS WRITTEN, INCLUDING THE EMPTY ONES. An absent section
+## is not an empty one: a reader cannot tell "no budget was exceeded" from
+## "budgets were never checked", and assert-stage calls a missing heading
+## UNVERIFIED for exactly that reason. That is why the four lists are positional
+## and required rather than optional arguments with empty defaults - a stage
+## that has nothing in a class has to say `{}` and mean it.
+##
+## BULLETS ARE FLATTENED TO ONE LINE EACH. assert-stage reads a section with
+## `awk '/^HEADING/{s=1;next} s&&/^[A-Z]/{exit} s&&/^  - /{print}'`, so a bullet
+## carrying an embedded newline ENDS THE SECTION at its second line if that line
+## starts with a capital - silently dropping every later bullet, including the
+## ones a reader most needs. Stage scripts write these as Tcl continuation
+## strings, which already collapse to single spaces, but a bullet that
+## interpolates a report line or a tool message does not, and that is the one
+## that matters. `regsub` costs nothing and closes the class.
+proc prov_gate {stage stem paragraph hard budgets delegated notcovered} {
+    global REPORT_DIR block_name RUN_TAG board_name part_name
+
+    if {![info exists REPORT_DIR]} {
+        die "prov_gate: REPORT_DIR is not set, so there is nowhere to write the" \
+            "  verdict for stage '$stage'. flow_boot publishes it; a stage that" \
+            "  skipped flow_boot has also skipped every input assertion."
+    }
+    set path [file join $REPORT_DIR ${stem}_gate.txt]
+
+    # THE IDENTITY LINE IS ASSEMBLED DEFENSIVELY. These four are flow_boot
+    # globals and every stage has them, but this proc is also reachable from a
+    # refusal path and from a harness, and a verdict writer that throws because
+    # the board pack did not load leaves NO verdict at all - which assert-stage
+    # reads as "the stage did not reach its verdict section". A gate naming an
+    # unknown board is worth more than no gate.
+    set ident {}
+    foreach {label var} {design block_name {run tag} RUN_TAG
+                         board board_name part part_name} {
+        upvar #0 $var v
+        lappend ident "$label [expr {[info exists v] ? $v : "(not loaded)"}]"
+    }
+
+    set fh [open $path w]
+    puts $fh "[string toupper $stage] gate, [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]"
+    puts $fh [join $ident ", "]
+    puts $fh ""
+    foreach line $paragraph { puts $fh $line }
+    puts $fh ""
+    if {[llength $hard]} {
+        puts $fh "HARD FAILURES: [llength $hard]"
+        foreach h $hard { puts $fh "  - [regsub -all {\s+} $h { }]" }
+    } else {
+        puts $fh "HARD FAILURES: none"
+    }
+    puts $fh ""
+    puts $fh "BUDGETS EXCEEDED"
+    foreach b $budgets { puts $fh "  - [regsub -all {\s+} $b { }]" }
+    puts $fh ""
+    puts $fh "DECLARED ELSEWHERE - MEASURED HERE, OWNED BY SOMEBODY ELSE"
+    foreach d $delegated { puts $fh "  - [regsub -all {\s+} $d { }]" }
+    puts $fh ""
+    puts $fh "NOT covered by ANY run of this flow, at any setting:"
+    foreach n $notcovered { puts $fh "  - [regsub -all {\s+} $n { }]" }
+    puts $fh ""
+    puts $fh "# Copyright (C) 2026, SoC Labs (www.soclabs.org)"
+    close $fh
+    catch { say "gate: $path" }
     return $path
 }
 

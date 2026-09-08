@@ -778,7 +778,8 @@ flow_hook pre_<stage>                      ;# seam - see below
 flow_hook post_<stage>                     ;# seam, BEFORE the writes (§6.1.3)
 ... write artefacts ...
 <stage>_gate                               ;# the verdict, AFTER the seam
-prov_manifest <stage>                      ;# last
+<stage>_gate                               ;# via prov_gate, see 12.4
+prov_manifest <stage> ?<stem>?             ;# last
 ```
 
 **Where `pre_<stage>` fires, corrected 2026-09-08.** An earlier draft put it
@@ -813,6 +814,45 @@ about.
    produced nothing"; it can only do that if the first case leaves a record.
 8. **`RTL_DEFINES_INBODY` is delivered by materialising modified copies** into
    `$WORK_DIR`, never by `set_property verilog_define` — see §9.2.
+
+### 12.4 The two procs a stage records itself with
+
+`provenance.tcl` owns both. A stage that writes its own is duplicating them —
+which is how six copies of each came to exist before this was written down.
+
+```tcl
+prov_stage_field  <key> <value>      ;# one measurement. Blank -> `unmeasured`
+prov_stage_get    <key>              ;# read back; `unmeasured` when absent
+prov_stage_fields <manifest> ?<k v>? ;# append block 8
+prov_gate <stage> <stem> <paragraph> <hard> <budgets> <delegated> <notcovered>
+```
+
+The four gate lists are **positional and required**: a stage with nothing in a
+class writes `{}` and means it, because an absent section is not an empty one
+and a consumer must be able to tell them apart.
+
+**`unmeasured` is the only spelling.** `(none)` is NOT a synonym — `ci/lib.sh`'s
+`CI_UNMEASURED_RE` matches the first and not the second, so a stage emitting
+`(none)` for something it failed to measure is graded as having measured it. The
+two halves of the flow disagreed on exactly this before they were merged, and
+one of them would have passed `assert-stage` green on a number nobody took.
+`(none)` stays reserved for a value a caller explicitly chose to be nothing.
+
+**A gate bullet may not contain a newline.** `assert-stage`'s parser ends a
+section at `/^[A-Z]/`, so a bullet whose continuation starts at column 0 with a
+capital terminates its own section and silently drops every later bullet in it.
+`prov_gate` flattens whitespace to prevent it.
+
+### 12.5 Stage name and artefact stem are two things
+
+`prov_manifest` and `prov_gate` take both because they cannot be derived from
+each other. The `stage` FIELD carries the stage name as CONTRACT §4 spells it
+(`package-ip`); the FILENAME uses the artefact stem (`package_ip_manifest.txt`).
+Passing one string for both is unsatisfiable: `package_ip` makes `assert-stage`
+fail ("says stage 'package_ip', not 'package-ip'") and `package-ip` puts the
+file where nothing looks. The stem is not computed from the stage — the
+artefact names are a list §4 fixes, and a proc that guessed would be a second
+place that list lived.
 
 ### 12.3 The gate file
 

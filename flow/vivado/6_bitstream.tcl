@@ -70,72 +70,28 @@ set PLATFORM    [flow_env FPGA_PLATFORM bare]
 
 
 ################################################################################
-# 2. THE MEASUREMENT BLOCK
+# 2. THE MEASUREMENT BLOCK AND THE VERDICT WRITER LIVE IN provenance.tcl
 #
-# See 4_synth.tcl section 2. ci/assert-stage.sh reads bin_style and bit_bytes out
-# of the manifest as top-level keys, and cross-checks bit_bytes against the file
-# on disk - so these are appended as block 8 rather than emitted through prov_set,
-# which would put a RESULT in the `prov.` identity namespace.
+# ci/assert-stage.sh reads this stage's numbers out of the manifest with
+# `awk '$1 == key'`, so they are top-level keys. prov_manifest writes the seven
+# blocks CONTRACT.md section 5 fixes and has no eighth; prov_set would put them
+# in the `prov.` namespace, which `compare-runs` treats as design IDENTITY, and
+# a QoR number is a RESULT. So block 8 is appended after prov_manifest returns.
+#
+# That was written out longhand in all six stage scripts - as `stage_meas`,
+# `stage_meas_get`, `stage_meas_measured`, `stage_meas_append` and `write_gate`
+# here, as `stage_fields` and `gate_write` in the front half - by two sessions
+# that each found the hole independently. They are now, in provenance.tcl:
+#
+#   prov_stage_field <k> <v>       record one measurement
+#   prov_stage_get <k>             read it back ("unmeasured" when absent)
+#   prov_stage_measured <k>        true only for a REAL measurement
+#   prov_stage_fields <manifest>   append block 8
+#   prov_gate <stage> <stem> ...   the verdict artefact
+#
+# flow_boot sources provenance.tcl, so nothing here has to. `stage_stop` below
+# is still local: it is this stage's REFUSAL path, not a manifest writer.
 ################################################################################
-
-set ::MEAS {}
-proc stage_meas {k v} {
-    if {[string trim $v] eq ""} { set v "unmeasured" }
-    lappend ::MEAS $k $v
-}
-proc stage_meas_get {k} {
-    foreach {kk vv} $::MEAS { if {$kk eq $k} { return $vv } }
-    return "unmeasured"
-}
-proc stage_meas_measured {k} {
-    set v [stage_meas_get $k]
-    return [expr {$v ne "unmeasured" && ![string match "UNVERIFIED*" $v]}]
-}
-proc stage_meas_append {path} {
-    set fh [open $path a]
-    puts $fh ""
-    puts $fh "# 8. measurements - what this stage measured, read back off disk."
-    puts $fh "#    'unmeasured' is a count nobody took, not 0."
-    foreach {k v} $::MEAS { mf $fh $k $v }
-    close $fh
-    return $path
-}
-
-
-
-# THE VERDICT WRITER, defined here because the refusal path below needs it too.
-# Every section is present even when empty: a reader cannot tell "no budget was
-# exceeded" from "budgets were never checked" if the heading is missing, and
-# ci/assert-stage.sh calls the second one UNVERIFIED for exactly that reason.
-# Bullets are `  - ` and nothing else inside a section starts a line with a
-# capital, because that is what the awk in ci/assert-stage.sh keys on.
-proc write_gate {path stage hard budgets owned notcov paragraph} {
-    global block_name RUN_TAG board_name part_name
-    set fh [open $path w]
-    puts $fh "[string toupper $stage] gate, [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]"
-    puts $fh "design $block_name, run tag $RUN_TAG, board $board_name, part $part_name"
-    puts $fh ""
-    foreach l $paragraph { puts $fh $l }
-    puts $fh ""
-    if {[llength $hard]} {
-        puts $fh "HARD FAILURES: [llength $hard]"
-        foreach h $hard { puts $fh "  - [regsub -all {\s+} $h { }]" }
-    } else {
-        puts $fh "HARD FAILURES: none"
-    }
-    puts $fh ""
-    puts $fh "BUDGETS EXCEEDED"
-    foreach b $budgets { puts $fh "  - [regsub -all {\s+} $b { }]" }
-    puts $fh ""
-    puts $fh "DECLARED ELSEWHERE - MEASURED HERE, OWNED BY SOMEBODY ELSE"
-    foreach o $owned { puts $fh "  - [regsub -all {\s+} $o { }]" }
-    puts $fh ""
-    puts $fh "NOT covered by ANY run of this flow, at any setting:"
-    foreach n $notcov { puts $fh "  - [regsub -all {\s+} $n { }]" }
-    puts $fh ""
-    close $fh
-    return $path
-}
 
 # A REFUSAL THAT LEAVES A RECORD.
 #
@@ -148,21 +104,23 @@ proc write_gate {path stage hard budgets owned notcov paragraph} {
 # written and the exit code is 2, NOT 0: nothing was measured, and exit 0 would
 # be the other half of a distinction this record exists to make.
 proc stage_stop {stage reason lines} {
-    global REPORT_DIR
-    stage_meas stage_status "REFUSED: $reason"
+    prov_stage_field stage_status "REFUSED: $reason"
     catch {
-        write_gate [file join $REPORT_DIR ${stage}_gate.txt] $stage [list $reason] {} {} \
-            [list "everything. This stage refused before it ran, so nothing about\
-                   this design was measured at any setting"] \
+        prov_gate $stage $stage \
             [list \
                 "THIS STAGE REFUSED. It did not run, so every number it would have" \
                 "produced is absent rather than good. The hard failure below is the" \
                 "input it could not read; the run directory holds no artefact from" \
-                "this stage and no later stage can be graded against one."]
+                "this stage and no later stage can be graded against one."] \
+            [list $reason] \
+            {} \
+            {} \
+            [list "everything. This stage refused before it ran, so nothing about\
+                   this design was measured at any setting"]
     }
     catch {
         set m [prov_manifest $stage]
-        stage_meas_append $m
+        prov_stage_fields $m
         say "record of the refusal: $m"
     }
     flow_refuse {*}$lines
@@ -528,35 +486,35 @@ proc msg_criticals {} {
 step "measurements"
 
 # `stage` is already in manifest block 1; ci_mf takes the first match.
-stage_meas bin_style    [expr {$BITSTREAM_BIN_STYLE eq "" ? "" : $BITSTREAM_BIN_STYLE}]
-stage_meas bin_source   $BIN_SOURCE
-stage_meas bit_bytes    [expr {[file exists $BIT] ? [file size $BIT] : ""}]
-stage_meas bin_bytes    [expr {[file exists $BIN] ? [file size $BIN] : ""}]
-stage_meas payload_bytes [expr {[file exists $RAW_BIN] ? [file size $RAW_BIN] : ""}]
-stage_meas xsa_bytes    [expr {[file exists $XSA] ? [file size $XSA] : ""}]
-stage_meas hwh          [expr {$HWH ne "" ? [file tail $HWH] : ""}]
-stage_meas ltx_bytes    [expr {[file exists $LTX] ? [file size $LTX] : ""}]
-stage_meas debug_cores  $DEBUG_CORES
-stage_meas platform     $PLATFORM
-stage_meas bitstream_props [expr {[llength $BITSTREAM_PROPS] ? [join $BITSTREAM_PROPS { }] : "(none)"}]
+prov_stage_field bin_style    [expr {$BITSTREAM_BIN_STYLE eq "" ? "" : $BITSTREAM_BIN_STYLE}]
+prov_stage_field bin_source   $BIN_SOURCE
+prov_stage_field bit_bytes    [expr {[file exists $BIT] ? [file size $BIT] : ""}]
+prov_stage_field bin_bytes    [expr {[file exists $BIN] ? [file size $BIN] : ""}]
+prov_stage_field payload_bytes [expr {[file exists $RAW_BIN] ? [file size $RAW_BIN] : ""}]
+prov_stage_field xsa_bytes    [expr {[file exists $XSA] ? [file size $XSA] : ""}]
+prov_stage_field hwh          [expr {$HWH ne "" ? [file tail $HWH] : ""}]
+prov_stage_field ltx_bytes    [expr {[file exists $LTX] ? [file size $LTX] : ""}]
+prov_stage_field debug_cores  $DEBUG_CORES
+prov_stage_field platform     $PLATFORM
+prov_stage_field bitstream_props [expr {[llength $BITSTREAM_PROPS] ? [join $BITSTREAM_PROPS { }] : "(none)"}]
 
 # THE FIRMWARE HASH. ci/assert-stage.sh warns when it is absent, and it is right
 # to: nothing else records which memory image is inside this bitstream, so the
 # pair cannot be checked afterwards. `unmeasured` when no image is configured -
 # which is a different statement from "the image is empty".
 if {$FW_HEX ne ""} {
-    stage_meas fpga_image_hex_sha256 [prov_sha256 [prov_resolve $FW_HEX]]
-    stage_meas fpga_image_hex_bytes  [file size $FW_HEX]
+    prov_stage_field fpga_image_hex_sha256 [prov_sha256 [prov_resolve $FW_HEX]]
+    prov_stage_field fpga_image_hex_bytes  [file size $FW_HEX]
 } else {
-    stage_meas fpga_image_hex_sha256 ""
-    stage_meas fpga_image_hex_bytes  ""
+    prov_stage_field fpga_image_hex_sha256 ""
+    prov_stage_field fpga_image_hex_bytes  ""
 }
 
 foreach {__cw __ids __nfound} [msg_criticals] break
-stage_meas critical_warnings    $__cw
-stage_meas critical_warning_ids [expr {[llength $__ids] ? [join $__ids {,}] : "(none)"}]
+prov_stage_field critical_warnings    $__cw
+prov_stage_field critical_warning_ids [expr {[llength $__ids] ? [join $__ids {,}] : "(none)"}]
 
-foreach {k v} $::MEAS { say [format "  %-24s %s" $k $v] }
+foreach k $::prov_stage_order { say [format "  %-24s %s" $k [prov_stage_get $k]] }
 
 
 ################################################################################
@@ -589,7 +547,7 @@ if {$BITSTREAM_BIN_STYLE eq ""} {
                   chose"
 } elseif {![file exists $BIN] || ![file size $BIN]} {
     lappend HARD "no .bin at $BIN - the .bin is what a running system loads"
-} elseif {![stage_meas_measured bin_source] || [string match "UNVERIFIED*" $BIN_SOURCE]} {
+} elseif {![prov_stage_measured bin_source] || [string match "UNVERIFIED*" $BIN_SOURCE]} {
     lappend HARD "the .bin exists and nothing recorded which conversion produced it:\
                   $BIN_SOURCE"
 }
@@ -604,7 +562,7 @@ if {$PLATFORM eq "pynq" && $HWH eq ""} {
                   one. There is no block design in this run to generate it"
 }
 
-if {[stage_meas_measured critical_warnings] && $__cw > 0} {
+if {[prov_stage_measured critical_warnings] && $__cw > 0} {
     set __unexempt {}
     foreach id $__ids {
         if {[lsearch -exact $MSG_GATE_ALLOWLIST $id] < 0} { lappend __unexempt $id }
@@ -623,12 +581,12 @@ if {[stage_meas_measured critical_warnings] && $__cw > 0} {
 }
 
 lappend OWNED "which conversion this .bin needs, owner=the board pack's bin_style:\
-               this run used '[stage_meas_get bin_style]' ([stage_meas_get bin_source]).\
+               this run used '[prov_stage_get bin_style]' ([prov_stage_get bin_source]).\
                The other style produces a file of the same size that the device does\
                not boot, and nothing between here and the board detects it"
 if {$FW_HEX ne ""} {
     lappend OWNED "which firmware image is inside this bitstream, owner=FPGA_IMAGE_HEX:\
-                   sha256 [stage_meas_get fpga_image_hex_sha256] recorded at this\
+                   sha256 [prov_stage_get fpga_image_hex_sha256] recorded at this\
                    stage. The image was baked in at ELABORATION, so this hash proves\
                    which file is on disk now, and the synth manifest is what proves\
                    which one was read"
@@ -651,14 +609,14 @@ lappend NOTCOV "deployment. Programming a board is a post-stage target\
                 to this build"
 
 
-set GATE [file join $REPORT_DIR bitstream_gate.txt]
-write_gate $GATE bitstream $HARD $BUDGETS $OWNED $NOTCOV [list \
+set GATE [prov_gate bitstream bitstream [list \
     "This gate is about FILES: that the image, its loadable .bin and the hardware" \
     "handoff exist, are not zero bytes, and that the .bin was converted the way" \
     "the board pack says this family needs. It is NOT a statement that the device" \
     "configures - the two .bin styles produce files of the same size and the wrong" \
     "one simply does not come up - and it is NOT a statement about the design," \
-    "which the impl gate graded."]
+    "which the impl gate graded."] \
+    $HARD $BUDGETS $OWNED $NOTCOV]
 
 say "verdict: $GATE"
 
@@ -668,7 +626,7 @@ say "verdict: $GATE"
 ################################################################################
 
 set MANIFEST [prov_manifest bitstream]
-stage_meas_append $MANIFEST
+prov_stage_fields $MANIFEST
 
 if {![file exists $MANIFEST] || ![file size $MANIFEST]} {
     die "the manifest at $MANIFEST was not written."
@@ -676,7 +634,7 @@ if {![file exists $MANIFEST] || ![file size $MANIFEST]} {
 
 step "bitstream summary"
 say "bitstream: $BIT"
-say ".bin     : [expr {[file exists $BIN] ? $BIN : {(none)}}]  style=[stage_meas_get bin_style]"
+say ".bin     : [expr {[file exists $BIN] ? $BIN : {(none)}}]  style=[prov_stage_get bin_style]"
 say "handoff  : [expr {[file exists $XSA] ? $XSA : {(none)}}]"
 say "verdict  : $GATE"
 say "manifest : $MANIFEST"

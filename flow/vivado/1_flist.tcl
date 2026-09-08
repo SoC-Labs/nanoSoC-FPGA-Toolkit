@@ -88,91 +88,20 @@ opt FLIST_TOP_IN_SOURCES 0  ;# 1 = append TOP_HDL and EXTRA_SRCS to sources.tcl.
 
 
 ################################################################################
-# THE GATE AND THE STAGE-MEASUREMENT BLOCK
+# THE GATE AND THE STAGE-MEASUREMENT BLOCK LIVE IN provenance.tcl
 #
-# DUPLICATED, IDENTICALLY, IN ALL THREE FRONT-HALF STAGE SCRIPTS, and that is a
-# defect with a known fix this file is not allowed to make. Their right home is
-# flow/common/provenance.tcl, beside prov_manifest, as `prov_gate` and
-# `prov_stage_fields`. Two things forced the copies:
+# They were written here, and in the five other stage scripts, because
+# prov_manifest wrote CONTRACT.md section 5's seven blocks and closed the file
+# with no slot for a stage's own measurements - while ci/assert-stage.sh
+# REQUIRES those measurements as top-level manifest keys. Two sessions hit that
+# independently and each invented the same workaround, so there were six copies
+# of a local block-8 emitter and six of a gate writer.
 #
-#   1. prov_manifest writes seven blocks and closes the file. ci/assert-stage.sh
-#      requires each stage's own MEASUREMENTS as top-level manifest keys -
-#      `file_count` for this stage, `vlnv` and `params_packaged` for package-ip,
-#      `bd_cells` and `overlays_applied` for bd - and there is no seam in
-#      provenance.tcl through which a stage can contribute one. So the block is
-#      appended after prov_manifest returns.
-#   2. CONTRACT.md section 5 fixes the gate file's section structure and section
-#      12.3 makes it load-bearing punctuation, but nothing in flow/common writes
-#      one.
-#
-# If you are here to add a fourth copy: don't. Add the two procs to
-# provenance.tcl and delete these.
+# They are now `prov_stage_field` / `prov_stage_fields` and `prov_gate` in
+# flow/common/provenance.tcl, which owns manifest emission and already owned the
+# site-path rule the measurements have to go through. flow_boot sources that
+# file, so nothing here has to.
 ################################################################################
-
-# THESE NAMES MUST BE FREE. `proc` silently REPLACES an existing command, and
-# this file is sourced into a tool with several thousand of them. The equivalent
-# guard in flow_utils.tcl has already fired in anger on the reference toolkit - a
-# helper named `fail` shadowed a builtin and aborted a route stage 2.5 hours in.
-foreach __c {stage_fields gate_write} {
-    if {[llength [info commands $__c]]} {
-        error "[file tail [info script]]: '$__c' is already a command in this\
-               tool - defining it here would shadow it. Rename the helper and\
-               its callers."
-    }
-}
-unset __c
-
-# One `<key> <value>` block appended to a manifest prov_manifest has closed.
-proc stage_fields {path fields} {
-    set fh [open $path a]
-    puts $fh ""
-    puts $fh "# 8. what this stage MEASURED. ci/assert-stage.sh reads these keys."
-    foreach {k v} $fields {
-        if {$v eq ""} { set v "(none)" }
-        mf $fh $k $v
-    }
-    close $fh
-    return $path
-}
-
-# The stage verdict artefact, in the section structure CONTRACT.md section 5
-# fixes. `HARD FAILURES: none` is the exact string mk/flow.mk and
-# ci/assert-stage.sh grep for, anchored, so it is punctuation and not prose.
-#
-# EVERY SECTION IS ALWAYS WRITTEN, including the empty ones. An absent section is
-# not an empty one: a reader cannot tell "no budget was exceeded" from "budgets
-# were never checked", and ci/assert-stage.sh treats the missing heading as
-# UNVERIFIED for that reason.
-proc gate_write {stage what hard budgets delegated notcovered} {
-    global REPORT_DIR block_name RUN_TAG board_name part_name
-    set path [file join $REPORT_DIR ${stage}_gate.txt]
-    set fh [open $path w]
-    puts $fh "[string toupper $stage] gate, [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]"
-    puts $fh "design $block_name, run tag $RUN_TAG, board $board_name, part $part_name"
-    puts $fh ""
-    foreach line $what { puts $fh $line }
-    puts $fh ""
-    if {[llength $hard]} {
-        puts $fh "HARD FAILURES: [llength $hard]"
-        foreach h $hard { puts $fh "  - $h" }
-    } else {
-        puts $fh "HARD FAILURES: none"
-    }
-    puts $fh ""
-    puts $fh "BUDGETS EXCEEDED"
-    foreach b $budgets { puts $fh "  - $b" }
-    puts $fh ""
-    puts $fh "DECLARED ELSEWHERE - MEASURED HERE, OWNED BY SOMEBODY ELSE"
-    foreach d $delegated { puts $fh "  - $d" }
-    puts $fh ""
-    puts $fh "NOT covered by ANY run of this flow, at any setting:"
-    foreach n $notcovered { puts $fh "  - $n" }
-    puts $fh ""
-    puts $fh "# Copyright (C) 2026, SoC Labs (www.soclabs.org)"
-    close $fh
-    say "gate: $path"
-    return $path
-}
 
 
 ################################################################################
@@ -651,7 +580,7 @@ if {[llength $::flist_defines]} {
                        belongs in RTL_PARAMS or RTL_DEFINES_INBODY"
 }
 
-gate_write flist \
+prov_gate flist flist \
     [list \
         "WHAT THIS CHECK IS: an assertion about the SOURCE LIST. Every path in the" \
         "filelist chain resolved, no source was zero bytes, the include and define" \
@@ -681,7 +610,7 @@ gate_write flist \
          textual and one-directional: not-found is a fact, found is not a proof" ]
 
 set manifest [prov_manifest flist]
-stage_fields $manifest [list \
+prov_stage_fields $manifest [list \
     file_count      $::flist_files \
     flist_chain     [llength $::flist_chain] \
     incdir_count    [llength $::flist_incdirs] \

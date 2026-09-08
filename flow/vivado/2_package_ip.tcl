@@ -81,25 +81,24 @@ flow_banner package-ip
 #
 # The stage is called `package-ip` - that is the make target, it is what
 # mk/flow.mk exports as FPGA_STAGE, and it is what ci/assert-stage.sh is invoked
-# with. Its ARTEFACTS are called `package_ip_*`: CONTRACT.md section 4 fixes
+# with, and it is what its manifest's `stage` field has to say. Its ARTEFACTS
+# are called `package_ip_*`: CONTRACT.md section 4 fixes
 # `package_ip_manifest.txt`, mk/flow.mk asserts that exact filename, and
 # ci/assert-stage.sh reads it.
 #
-# prov_manifest derives the FILENAME from the stage name it is given AND writes
-# that same string into the manifest's `stage` field, so one call cannot satisfy
-# both. MEASURED, both ways, on 2026-09-08:
+# prov_manifest and prov_gate take the two SEPARATELY, so this stage passes both
+# and neither consumer is disappointed. It used to take one string for both,
+# which this stage could not satisfy - MEASURED, both ways, on 2026-09-08:
 #
-#   prov_manifest package_ip -> assert-stage FAILS the run: "the manifest says
+#   prov_manifest package_ip -> assert-stage FAILED the run: "the manifest says
 #                               stage 'package_ip', not 'package-ip' - it is not
 #                               this stage's manifest"
-#   prov_manifest package-ip -> the file lands at package-ip_manifest.txt, where
-#                               neither make nor assert-stage looks for it
+#   prov_manifest package-ip -> the file landed at package-ip_manifest.txt,
+#                               where neither make nor assert-stage looks for it
 #
-# So the manifest is written under the stage's REAL NAME - which is what the
-# `stage` field must carry, since identifying the stage is that field's whole
-# job - and then renamed to the artefact name the contract fixes. The durable
-# fix is for prov_manifest to take the two separately; provenance.tcl is not
-# this file's to change and this is recorded in the handback.
+# The workaround was to write under the stage name and then RENAME the file,
+# which put an artefact-naming decision in a stage script. Fixed in
+# provenance.tcl on 2026-09-08; the rename is gone from both call sites below.
 ################################################################################
 set STAGE_NAME package-ip     ;# the stage: FPGA_STAGE, the make target, assert-stage
 set STAGE_STEM package_ip     ;# the artefact stem, fixed by CONTRACT.md section 4
@@ -121,21 +120,26 @@ opt PACKAGE_IP_REQUIRE_PARAMS 1        ;# 1 = an RTL_PARAM the packaged core doe
 
 
 ################################################################################
-# THE GATE AND THE STAGE-MEASUREMENT BLOCK
+# THE GATE AND THE STAGE-MEASUREMENT BLOCK LIVE IN provenance.tcl
 #
-# DUPLICATED, IDENTICALLY, IN ALL THREE FRONT-HALF STAGE SCRIPTS. Their right
-# home is flow/common/provenance.tcl as `prov_gate` and `prov_stage_fields`, and
-# these three files may not create it. See the long note in 1_flist.tcl for the
-# two reasons: prov_manifest closes the file with no seam for a stage's own
-# measurements, and nothing in flow/common writes a gate file at all - while
-# ci/assert-stage.sh requires both.
+# They were written here, and in the five other stage scripts, because
+# prov_manifest wrote CONTRACT.md section 5's seven blocks and closed the file
+# with no slot for a stage's own measurements - while ci/assert-stage.sh
+# REQUIRES those measurements as top-level manifest keys. Two sessions hit that
+# independently and each invented the same workaround, so there were six copies
+# of a local block-8 emitter and six of a gate writer.
+#
+# They are now `prov_stage_field` / `prov_stage_fields` and `prov_gate` in
+# flow/common/provenance.tcl, which owns manifest emission and already owned the
+# site-path rule the measurements have to go through. flow_boot sources that
+# file, so nothing here has to.
 ################################################################################
 
 # THESE NAMES MUST BE FREE. `proc` silently REPLACES an existing command, and
 # this file is sourced into a tool with several thousand of them. The equivalent
 # guard in flow_utils.tcl has already fired in anger on the reference toolkit - a
 # helper named `fail` shadowed a builtin and aborted a route stage 2.5 hours in.
-foreach __c {stage_fields gate_write inbody_mentions inbody_materialise find_component} {
+foreach __c {inbody_mentions inbody_materialise find_component} {
     if {[llength [info commands $__c]]} {
         error "[file tail [info script]]: '$__c' is already a command in this\
                tool - defining it here would shadow it. Rename the helper and\
@@ -143,49 +147,6 @@ foreach __c {stage_fields gate_write inbody_mentions inbody_materialise find_com
     }
 }
 unset __c
-
-proc stage_fields {path fields} {
-    set fh [open $path a]
-    puts $fh ""
-    puts $fh "# 8. what this stage MEASURED. ci/assert-stage.sh reads these keys."
-    foreach {k v} $fields {
-        if {$v eq ""} { set v "(none)" }
-        mf $fh $k $v
-    }
-    close $fh
-    return $path
-}
-
-proc gate_write {stage what hard budgets delegated notcovered} {
-    global REPORT_DIR block_name RUN_TAG board_name part_name
-    set path [file join $REPORT_DIR ${stage}_gate.txt]
-    set fh [open $path w]
-    puts $fh "[string toupper [string map {_ -} $stage]] gate, [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]"
-    puts $fh "design $block_name, run tag $RUN_TAG, board $board_name, part $part_name"
-    puts $fh ""
-    foreach line $what { puts $fh $line }
-    puts $fh ""
-    if {[llength $hard]} {
-        puts $fh "HARD FAILURES: [llength $hard]"
-        foreach h $hard { puts $fh "  - $h" }
-    } else {
-        puts $fh "HARD FAILURES: none"
-    }
-    puts $fh ""
-    puts $fh "BUDGETS EXCEEDED"
-    foreach b $budgets { puts $fh "  - $b" }
-    puts $fh ""
-    puts $fh "DECLARED ELSEWHERE - MEASURED HERE, OWNED BY SOMEBODY ELSE"
-    foreach d $delegated { puts $fh "  - $d" }
-    puts $fh ""
-    puts $fh "NOT covered by ANY run of this flow, at any setting:"
-    foreach n $notcovered { puts $fh "  - $n" }
-    puts $fh ""
-    puts $fh "# Copyright (C) 2026, SoC Labs (www.soclabs.org)"
-    close $fh
-    say "gate: $path"
-    return $path
-}
 
 
 ################################################################################
@@ -223,10 +184,8 @@ if {$PACKAGE_TCL eq ""} {
         warn "  '$RUN_TAG', when this stage was configured. A verdict about a"
         warn "  stage that did not run is worse than no verdict."
     }
-    set manifest [prov_manifest $STAGE_NAME]
-    set wanted [file join $REPORT_DIR ${STAGE_STEM}_manifest.txt]
-    if {$manifest ne $wanted} { file rename -force $manifest $wanted ; set manifest $wanted }
-    stage_fields $manifest [list \
+    set manifest [prov_manifest $STAGE_NAME $STAGE_STEM]
+    prov_stage_fields $manifest [list \
         stage_configured   no \
         not_configured_why "PACKAGE_TCL is empty in the project's design.mk" \
         package_tcl        "(none)" \
@@ -889,7 +848,7 @@ if {[llength $params]} {
                        instantiates it may override every one of them"
 }
 
-gate_write $STAGE_STEM \
+prov_gate $STAGE_NAME $STAGE_STEM \
     [list \
         "WHAT THIS CHECK IS: an assertion that a core came out, that the defines" \
         "RTL_DEFINES_INBODY names were written into files that actually read them," \
@@ -919,17 +878,13 @@ gate_write $STAGE_STEM \
          the define block. The copy is generated from the original in one pass, and\
          both sha256s are recorded, but nothing diffs them" ]
 
-# WRITTEN UNDER THE STAGE'S NAME, THEN RENAMED TO THE ARTEFACT NAME. See the note
-# at the top of this file: prov_manifest uses one string for both, and the two
-# consumers of this file disagree about which it should be.
-set manifest [prov_manifest $STAGE_NAME]
-set wanted [file join $REPORT_DIR ${STAGE_STEM}_manifest.txt]
-if {$manifest ne $wanted} {
-    file rename -force $manifest $wanted
-    set manifest $wanted
-    say "manifest renamed to the artefact name CONTRACT.md section 4 fixes: $manifest"
-}
-stage_fields $manifest [list \
+# THE STAGE NAME AND THE ARTEFACT STEM, PASSED SEPARATELY. See the note at the
+# top of this file: the `stage` FIELD must say `package-ip` because that is what
+# ci/assert-stage.sh checks it against, and the FILENAME must be
+# `package_ip_manifest.txt` because that is what CONTRACT.md section 4 fixes and
+# what mk/flow.mk asserts. One string could not do both.
+set manifest [prov_manifest $STAGE_NAME $STAGE_STEM]
+prov_stage_fields $manifest [list \
     stage_configured   yes \
     package_tcl        [prov_site_path $PACKAGE_TCL] \
     vlnv               $vlnv \

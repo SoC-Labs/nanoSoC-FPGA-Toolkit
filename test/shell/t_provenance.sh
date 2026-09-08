@@ -199,6 +199,92 @@ prov_run() {
 ## first_line <regex> - line number of the first manifest line matching, or ""
 first_line() { grep -nE -m1 -- "$1" "$MAN" | cut -d: -f1; }
 
+# A third driver, for BLOCK 8 and the GATE FILE - the two artefacts a stage
+# contributes to itself. Neither is reachable through prov_manifest, which is
+# the whole reason both were written six times before they were written once.
+#
+# The fixture is chosen to exercise every branch of the value rule in one run:
+#
+#   vendor_src       a RAW SITE PATH. Must come out as sha256: and never in clear.
+#   in_tree_src      ALREADY put through prov_site_path by the caller, as three
+#                    of the six stage scripts do. Must come out UNCHANGED.
+#   never_taken      recorded as "". Must become the token `unmeasured`.
+#   explicitly_none  recorded as "(none)". Must stay "(none)" - a different fact.
+#   zero_count       a measured 0. Must stay 0 (CONTRACT.md rule 2, other way up).
+#
+# The gate's delegated list carries a bullet with an EMBEDDED NEWLINE whose
+# second line starts at column 0 with a capital, followed by a second bullet.
+# That is the exact shape that truncates a section under ci/assert-stage.sh's
+# awk, and the second bullet is what disappears when it does.
+cat > "$SB/prov_stage.tcl" <<'TCL'
+set tk    [lindex $::argv 0]
+set stage [lindex $::argv 1]
+set stem  [lindex $::argv 2]
+source [file join $tk flow common flow_utils.tcl]
+flow_config prefix PROV
+source [file join $tk flow common provenance.tcl]
+set WORK_DIR    $::env(FPGA_WORK_DIR)
+set IN_WORK_DIR $::env(FPGA_WORK_DIR)
+set LOG_DIR     $::env(FPGA_LOG_DIR)
+set REPORT_DIR  $::env(FPGA_REPORT_DIR)
+set OUT_DIR     $::env(FPGA_OUT_DIR)
+
+# The four identity globals flow_boot publishes, which prov_gate puts in the
+# gate's second line.
+set block_name  demo_block
+set RUN_TAG     [flow_env FPGA_RUN_TAG default]
+set board_name  demo_board
+set part_name   demo_part
+
+prov_stage_field vendor_src      $::env(T_SITE_FILE)
+prov_stage_field in_tree_src     [prov_site_path $::env(T_PROJ_FILE)]
+prov_stage_field never_taken     ""
+prov_stage_field explicitly_none "(none)"
+prov_stage_field zero_count      0
+
+set m [prov_manifest $stage $stem]
+prov_stage_fields $m [list inline_count 7]
+
+set hard {}
+if {[flow_env T_HARD] ne ""} { set hard [list $::env(T_HARD)] }
+prov_gate $stage $stem \
+    [list "WHAT THIS CHECK IS: a fixture, and nothing else."] \
+    $hard \
+    {} \
+    [list "first entry, owner=somebody: it has an embedded newline right here\nAnd A Capital Line At Column Zero after it" \
+          "second entry, owner=somebody else: this one has to survive the first"] \
+    [list "everything this fixture does not look at, which is everything"]
+puts $m
+TCL
+
+SMAN=""
+SGATE=""
+## prov_stage_run <toolkit> <stage> <stem> [hard failure reason]
+## Leaves the manifest path in SMAN and the gate path in SGATE - the paths the
+## artefacts SHOULD be at. It deliberately does NOT assert they exist: two of
+## the mutation proofs below plant a fault that puts them somewhere else, and
+## finding that out is the assertion's job, not the driver's.
+prov_stage_run() {
+    local tk="$1" stage="$2" stem="$3" hard="${4:-}" rc=0
+    local rd="$P/run/reports"
+    rm -f "$rd/${stem}_manifest.txt" "$rd/${stem}_gate.txt" \
+          "$rd/${stage}_manifest.txt" "$rd/${stage}_gate.txt"
+    PROV_OUT="$(env \
+        FPGA_DIR="$P/proj" FPGA_PROJECT_ROOT="$P/proj" FPGA_FLOW_DIR="$P/tk" \
+        FPGA_RUN_DIR="$P/run" FPGA_WORK_DIR="$P/run/work" FPGA_LOG_DIR="$P/run/logs" \
+        FPGA_REPORT_DIR="$rd" FPGA_OUT_DIR="$P/run/outputs" \
+        T_SITE_FILE="$SITE_A" T_PROJ_FILE="$P/proj/rtl/in.v" T_HARD="$hard" \
+        timeout 60 tclsh "$SB/prov_stage.tcl" "$tk" "$stage" "$stem" 2>&1)" || rc=$?
+    SMAN="$rd/${stem}_manifest.txt"
+    SGATE="$rd/${stem}_gate.txt"
+    if [ "$rc" -ne 0 ]; then
+        printf 'the block-8/gate driver failed (exit %d):\n%s\n' "$rc" "$PROV_OUT"
+        return 1
+    fi
+    return 0
+}
+
+
 #=============================================================================
 # 1. THE SEVEN BLOCKS, IN CONTRACT.md SECTION 5 ORDER
 #
@@ -760,5 +846,444 @@ else
     t_skip prov.knobs.site_path.mutation \
         "could not plant the fault: the knob emission line in prov_knobs has changed shape"
 fi
+
+#=============================================================================
+# 8. BLOCK 8: WHAT THE STAGE ITSELF MEASURED
+#
+# prov_manifest writes CONTRACT.md section 5's seven blocks and closes the
+# file. ci/assert-stage.sh then grades the stage by reading the stage's OWN
+# numbers out of that same manifest with `awk '$1 == key'` - file_count, vlnv,
+# lut/ff/bram/dsp, wns/whs/unrouted_nets, bin_style/bit_bytes. Those are block
+# 8, and the whole of what makes them different from block 2 is that they are
+# RESULTS and not IDENTITY:
+#
+#   * they must be TOP-LEVEL keys. `prov.lut` is invisible to assert-stage's
+#     awk, so a stage whose numbers went through prov_set would be graded
+#     UNVERIFIED on every measurement it actually took;
+#   * they must NOT be in the `prov.` namespace for a second and larger reason.
+#     `compare-runs` treats that namespace as design identity and REFUSES a pair
+#     that differs in it. Two runs of one design that differ in LUT count are
+#     the normal case - that is what an A/B experiment IS - so a utilisation
+#     figure recorded as identity makes the comparison tool refuse every pair
+#     anybody would want to compare, and a tool that refuses everything gets
+#     switched off within a day.
+#
+# Six stage scripts wrote their own emitter for this before provenance.tcl had
+# one, in two mutually incompatible spellings. These assertions are about the
+# one that replaced them.
+#=============================================================================
+t_head "block 8 is the stage's own measurements, as TOP-LEVEL keys"
+
+## stage_fields_toplevel <toolkit>
+## The key `inline_count` must be readable exactly the way ci/assert-stage.sh
+## reads it: first whitespace-separated field on a line of its own.
+stage_fields_toplevel() {
+    local tk="$1" v
+    prov_stage_run "$tk" meas meas || return 1
+    v="$(awk '$1 == "inline_count" { print $2; exit }' "$SMAN")"
+    [ "$v" = "7" ] && {
+        # ...and NOT under the identity prefix as well, which would put a
+        # RESULT where compare-runs reads design identity.
+        grep -qE '^prov\.inline_count' "$SMAN" && {
+            printf 'inline_count is ALSO emitted as prov.inline_count. That is the\n'
+            printf 'namespace compare-runs treats as design identity, and a utilisation\n'
+            printf 'figure there makes it refuse every A/B pair:\n'
+            grep -nE '^prov\.inline_count' "$SMAN"; return 1; }
+        return 0
+    }
+    printf "ci/assert-stage.sh reads a measurement with awk '\$1 == key'. Reading\n"
+    printf "'inline_count' that way gave '%s', not 7 - so every gate that depends on\n" "$v"
+    printf 'a stage measurement grades UNVERIFIED on a number the stage did take:\n'
+    awk '/# 8\./{p=1} p' "$SMAN"
+    return 1
+}
+
+t_check prov.stage_fields.toplevel \
+    "a measurement is a top-level manifest key, readable by assert-stage's awk, and not in the prov. identity namespace" \
+    stage_fields_toplevel "$FLOW_DIR"
+
+# THE MUTATION IS THE MISTAKE THE DESIGN EXISTS TO PREVENT: send block 8 through
+# the `prov.` prefix, exactly as prov_emit does for block 2.
+M="$(t_mutant "$SB" block8-in-identity-namespace)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/provenance.tcl \
+        '        mf $fh $k [prov_path_value $::prov_stage($k)]' \
+        '        mf $fh prov.$k [prov_path_value $::prov_stage($k)]'; then
+    t_check_fail prov.stage_fields.toplevel.mutation \
+        "with block 8 emitted under the prov. prefix, assert-stage's awk finds nothing and the assertion goes red" \
+        stage_fields_toplevel "$M"
+else
+    t_skip prov.stage_fields.toplevel.mutation \
+        "could not plant the fault: the emission line in prov_stage_fields() has changed shape"
+fi
+
+#=============================================================================
+# 9. A MEASUREMENT NOBODY TOOK IS `unmeasured` - NOT `(none)`, NOT BLANK
+#
+# `(none)` and `unmeasured` are NOT interchangeable and collapsing them is a
+# silent failure with a green verdict on the end of it. ci/lib.sh's
+# CI_UNMEASURED_RE matches `unmeasured` and does NOT match `(none)`, so
+# ci_is_measured calls `(none)` A MEASUREMENT - correctly: somebody looked and
+# the answer was nothing. A stage that wrote `(none)` for "did not look" is
+# therefore GRADED GREEN by assert-stage on a number nobody took.
+#
+# One of the six deleted copies of this emitter did exactly that.
+#=============================================================================
+t_head "a blank measurement becomes 'unmeasured', which assert-stage refuses to grade"
+
+## stage_fields_unmeasured <toolkit>
+stage_fields_unmeasured() {
+    local tk="$1" v
+    prov_stage_run "$tk" meas meas || return 1
+    v="$(awk '$1 == "never_taken" { print $2; exit }' "$SMAN")"
+    if [ "$v" != "unmeasured" ]; then
+        printf "a measurement recorded as the empty string came out as '%s'.\n" "$v"
+        printf 'CI_UNMEASURED_RE in ci/lib.sh matches `unmeasured` and does NOT match\n'
+        printf '`(none)`, so anything else here is GRADED AS A MEASUREMENT by\n'
+        printf 'ci/assert-stage.sh - a green verdict on a number nobody took.\n'
+        return 1
+    fi
+    # ...and the other direction: an EXPLICIT `(none)` is left alone. Somebody
+    # looked and the answer was nothing, which is a different fact.
+    v="$(awk '$1 == "explicitly_none" { print $2; exit }' "$SMAN")"
+    if [ "$v" != "(none)" ]; then
+        printf "an explicit '(none)' came out as '%s'. CONTRACT.md section 11 fixes\n" "$v"
+        printf '`(none)` for "explicitly nothing"; only the caller can tell that from\n'
+        printf '"did not look", so the emitter must not decide it for them.\n'
+        return 1
+    fi
+    # ...and a real zero stays a real zero. CONTRACT.md rule 2 from the other side.
+    v="$(awk '$1 == "zero_count" { print $2; exit }' "$SMAN")"
+    if [ "$v" != "0" ]; then
+        printf "a measured 0 came out as '%s'. 0 is a legitimate count - zero unrouted\n" "$v"
+        printf 'nets, zero blackboxes - and rewriting it loses the best result the flow has.\n'
+        return 1
+    fi
+    return 0
+}
+
+t_check prov.stage_fields.unmeasured \
+    "a blank measurement is 'unmeasured', an explicit '(none)' survives, and a measured 0 stays 0" \
+    stage_fields_unmeasured "$FLOW_DIR"
+
+M="$(t_mutant "$SB" blank-measurement-is-none)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/provenance.tcl \
+        '    if {[string trim $value] eq ""} { set value "unmeasured" }' \
+        '    if {[string trim $value] eq ""} { set value "(none)" }'; then
+    t_check_fail prov.stage_fields.unmeasured.mutation \
+        "with a blank measurement written as (none) - which ci_is_measured GRADES - the assertion goes red" \
+        stage_fields_unmeasured "$M"
+else
+    t_skip prov.stage_fields.unmeasured.mutation \
+        "could not plant the fault: the blank-value line in prov_stage_field() has changed shape"
+fi
+
+#=============================================================================
+# 10. A MEASUREMENT CAN BE A PATH, AND THE SITE-PATH RULE HAS NO EXEMPTION
+#
+# Measurements hold paths routinely - sources_tcl, source_census, component_xml,
+# bd_wrapper, bd_regen_tcl, inbody_record. This file's header says
+# prov_site_path is the ONE place a path-in-a-manifest decision is made and
+# nothing else in the flow may write a path into a manifest; block 7 did not
+# obey that until 2026-09-08 and block 8 is the same shape of hole.
+#
+# BOTH DIRECTIONS ARE PROVED, and the second one is the subtle half:
+#
+#   * a raw site path is DIGESTED. It never appears in clear.
+#   * a value the stage ALREADY put through prov_site_path is left ALONE. Three
+#     of the six stage scripts call prov_site_path at the point of measurement,
+#     because the value is a path or an UNVERIFIED depending on a branch. Twelve
+#     manifest fields across the three front-half stages take that route. If the
+#     rule were applied a second time, `<run>/work/sources.tcl` - which resolves
+#     nowhere - would fall through to the site branch and be emitted as a DIGEST
+#     OF A LABEL: the reader loses the only field that says which file was read,
+#     and two runs under different build roots start differing in every path
+#     field again, which is the failure the labels exist to prevent.
+#=============================================================================
+t_head "a measurement that is a path goes through the site-path rule - exactly once"
+
+## stage_site_path_digested <toolkit>
+stage_site_path_digested() {
+    local tk="$1"
+    prov_stage_run "$tk" meas meas || return 1
+    grep -qF -- "$P/site" "$SMAN" || return 0
+    printf 'a MEASUREMENT disclosed the vendor mount point in clear:\n'
+    grep -nF -- "$P/site" "$SMAN"
+    printf 'Block 2 digested the same shape of path a hundred lines earlier. A manifest\n'
+    printf 'gets pasted into bug reports and a mount point is inventory-shaped disclosure.\n'
+    return 1
+}
+
+## stage_label_not_redigested <toolkit>
+stage_label_not_redigested() {
+    local tk="$1" v
+    prov_stage_run "$tk" meas meas || return 1
+    v="$(awk '$1 == "in_tree_src" { print $2; exit }' "$SMAN")"
+    case "$v" in
+        "<project>/rtl/in.v") return 0 ;;
+    esac
+    printf "a value the stage had ALREADY put through prov_site_path came out as '%s'.\n" "$v"
+    printf 'It went in as <project>/rtl/in.v. A label re-fed to the site-path rule\n'
+    printf 'resolves nowhere, falls through to the site branch and becomes a digest of a\n'
+    printf 'label - so the reader loses the only field that says WHICH file was read,\n'
+    printf 'and two runs under different build roots differ in every path field again.\n'
+    return 1
+}
+
+t_check prov.stage_fields.site_path \
+    "a measurement that is a raw site path is a sha256: digest, never the mount point" \
+    stage_site_path_digested "$FLOW_DIR"
+t_check prov.stage_fields.idempotent \
+    "a measurement the stage already labelled is left alone, not digested a second time" \
+    stage_label_not_redigested "$FLOW_DIR"
+
+M="$(t_mutant "$SB" measurement-path-raw)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/provenance.tcl \
+        '        mf $fh $k [prov_path_value $::prov_stage($k)]' \
+        '        mf $fh $k [prov_value $::prov_stage($k)]'; then
+    t_check_fail prov.stage_fields.site_path.mutation \
+        "with measurements written raw the vendor mount point is disclosed, so the assertion goes red" \
+        stage_site_path_digested "$M"
+else
+    t_skip prov.stage_fields.site_path.mutation \
+        "could not plant the fault: the emission line in prov_stage_fields() has changed shape"
+fi
+
+M="$(t_mutant "$SB" no-idempotence-guard)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/provenance.tcl \
+        '        if {[string index $tok 0] eq "<" || [string first "sha256:" $tok] == 0} {' \
+        '        if {0} {'; then
+    t_check_fail prov.stage_fields.idempotent.mutation \
+        "without the already-through-the-rule guard, an in-tree LABEL is digested a second time and the assertion goes red" \
+        stage_label_not_redigested "$M"
+else
+    t_skip prov.stage_fields.idempotent.mutation \
+        "could not plant the fault: the idempotence guard in prov_path_value() has changed shape"
+fi
+
+#=============================================================================
+# 11. THE VERDICT ARTEFACT: FOUR CLASSES, AND ONE STRING THAT IS PUNCTUATION
+#
+# CONTRACT.md section 5 fixes the gate file's structure and section 12.3 makes
+# `HARD FAILURES: none` the exact string mk/flow.mk greps for. ci/assert-stage.sh
+# greps for it ANCHORED, because an unanchored grep for `HARD FAILURES` also
+# matches the section heading and would therefore pass on every gate file ever
+# written - including one listing nine of them.
+#
+# Every section is written even when empty: assert-stage calls a MISSING heading
+# UNVERIFIED, because a reader cannot tell "no budget was exceeded" from
+# "budgets were never checked".
+#
+# THE ASSERTIONS BELOW READ THE GATE WITH assert-stage's OWN awk, not with a
+# looser pattern of this suite's invention. A test that parses the artefact more
+# forgivingly than the consumer does is a test that passes on files the consumer
+# rejects.
+#=============================================================================
+t_head "the gate file has the four verdict classes, and 'HARD FAILURES: none' exactly"
+
+## gate_clean_structure <toolkit> - a run with nothing wrong
+gate_clean_structure() {
+    local tk="$1" h
+    prov_stage_run "$tk" gateok gateok "" || return 1
+    grep -qE '^HARD FAILURES: none$' "$SGATE" || {
+        printf 'the clean gate does not carry the exact anchored string mk/flow.mk and\n'
+        printf 'ci/assert-stage.sh grep for. It is punctuation, not prose:\n'
+        grep -n 'HARD FAILURES' "$SGATE"; return 1; }
+    for h in '^BUDGETS EXCEEDED' '^DECLARED ELSEWHERE - MEASURED HERE, OWNED BY SOMEBODY ELSE' \
+             '^NOT covered by ANY run of this flow, at any setting:'; do
+        grep -qE -- "$h" "$SGATE" || {
+            printf 'the gate has no section matching /%s/. An absent section is not an\n' "$h"
+            printf 'empty one - assert-stage calls a missing heading UNVERIFIED, because a\n'
+            printf 'reader cannot tell "none exceeded" from "never checked":\n'
+            cat "$SGATE"; return 1; }
+    done
+    # ...and the NOT-covered bullets are readable by assert-stage's own awk.
+    h="$(awk '/^NOT covered by ANY run/ { s=1; next } s && /^[A-Z]/ { exit } s && /^  - / { print }' "$SGATE" | grep -c .)"
+    [ "$h" -ge 1 ] || {
+        printf 'assert-stage.sh reads the NOT-covered bullets with its own awk and found\n'
+        printf 'none. A green run that lists nothing it failed to measure is the shape of\n'
+        printf 'a run nobody can audit:\n'; cat "$SGATE"; return 1; }
+    return 0
+}
+
+## gate_hard_counted <toolkit> - a run WITH a hard failure
+## The one that matters: a broken run must not carry the string that makes
+## every gate in the flow pass.
+gate_hard_counted() {
+    local tk="$1"
+    prov_stage_run "$tk" gatebad gatebad "the input this stage needed is not there" || return 1
+    if grep -qE '^HARD FAILURES: none' "$SGATE"; then
+        printf 'A RUN WITH A HARD FAILURE STILL SAYS "HARD FAILURES: none". That is the\n'
+        printf 'exact string mk/flow.mk and ci/assert-stage.sh grep for, so this broken\n'
+        printf 'run grades GREEN everywhere:\n'; cat "$SGATE"; return 1
+    fi
+    grep -qE '^HARD FAILURES: 1$' "$SGATE" || {
+        printf 'the gate does not report the COUNT of hard failures:\n'
+        grep -n 'HARD FAILURES' "$SGATE"; return 1; }
+    grep -qE '^  - the input this stage needed is not there$' "$SGATE" || {
+        printf 'the hard failure is not listed as a `  - ` bullet, which is what the awk\n'
+        printf 'in ci/assert-stage.sh keys on:\n'; cat "$SGATE"; return 1; }
+    return 0
+}
+
+## gate_bullet_one_line <toolkit>
+## A bullet carrying an embedded newline ENDS ITS SECTION at the second line if
+## that line starts with a capital - assert-stage's awk exits on /^[A-Z]/ - so
+## every later bullet in the section is silently dropped. The fixture plants a
+## delegated entry with exactly that shape and a second entry after it.
+gate_bullet_one_line() {
+    local tk="$1" n
+    prov_stage_run "$tk" gateok gateok "" || return 1
+    n="$(awk '/^DECLARED ELSEWHERE/ { s=1; next } s && /^[A-Z]/ { exit } s && /^  - / { print }' "$SGATE" | grep -c .)"
+    [ "$n" = "2" ] && return 0
+    printf 'ci/assert-stage.sh reads %s delegated bullet(s); the fixture wrote 2. A bullet\n' "$n"
+    printf 'with an embedded newline whose next line starts with a capital TERMINATES the\n'
+    printf 'section, silently dropping every entry after it - and a delegation nobody\n'
+    printf 'reads is a finding owned by nobody:\n'
+    sed -n '/^DECLARED ELSEWHERE/,/^NOT covered/p' "$SGATE"
+    return 1
+}
+
+t_check prov.gate.structure \
+    "a clean gate carries 'HARD FAILURES: none' exactly, and all four section headings" \
+    gate_clean_structure "$FLOW_DIR"
+t_check prov.gate.hard_counted \
+    "a gate with a hard failure reports the count and the bullet, and never the passing string" \
+    gate_hard_counted "$FLOW_DIR"
+t_check prov.gate.bullet_one_line \
+    "a bullet carrying an embedded newline is flattened, so it cannot truncate its own section" \
+    gate_bullet_one_line "$FLOW_DIR"
+
+M="$(t_mutant "$SB" gate-none-capitalised)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/provenance.tcl \
+        '        puts $fh "HARD FAILURES: none"' \
+        '        puts $fh "HARD FAILURES: None"'; then
+    t_check_fail prov.gate.structure.mutation \
+        "with one letter of the load-bearing string capitalised, every gate in the flow stops matching and the assertion goes red" \
+        gate_clean_structure "$M"
+else
+    t_skip prov.gate.structure.mutation \
+        "could not plant the fault: the clean-verdict line in prov_gate() has changed shape"
+fi
+
+M="$(t_mutant "$SB" gate-drops-budget-heading)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/provenance.tcl \
+        '    puts $fh "BUDGETS EXCEEDED"' \
+        '    if {[llength $budgets]} { puts $fh "BUDGETS EXCEEDED" }'; then
+    t_check_fail prov.gate.structure.mutation.empty_section \
+        "with the BUDGETS heading written only when non-empty, 'none exceeded' and 'never checked' become the same file, so the assertion goes red" \
+        gate_clean_structure "$M"
+else
+    t_skip prov.gate.structure.mutation.empty_section \
+        "could not plant the fault: the BUDGETS EXCEEDED heading in prov_gate() has changed shape"
+fi
+
+M="$(t_mutant "$SB" gate-always-none)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/provenance.tcl \
+        '    if {[llength $hard]} {' \
+        '    if {0} {'; then
+    t_check_fail prov.gate.hard_counted.mutation \
+        "with the hard-failure branch dead, a broken run writes the passing string and the assertion goes red" \
+        gate_hard_counted "$M"
+else
+    t_skip prov.gate.hard_counted.mutation \
+        "could not plant the fault: the hard-failure branch in prov_gate() has changed shape"
+fi
+
+M="$(t_mutant "$SB" gate-bullet-unflattened)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/provenance.tcl \
+        '    foreach d $delegated { puts $fh "  - [regsub -all {\s+} $d { }]" }' \
+        '    foreach d $delegated { puts $fh "  - $d" }'; then
+    t_check_fail prov.gate.bullet_one_line.mutation \
+        "without the flattener a bullet's embedded newline truncates its section, so the assertion goes red" \
+        gate_bullet_one_line "$M"
+else
+    t_skip prov.gate.bullet_one_line.mutation \
+        "could not plant the fault: the delegated-bullet line in prov_gate() has changed shape"
+fi
+
+#=============================================================================
+# 12. THE STAGE NAME AND THE ARTEFACT STEM ARE TWO THINGS
+#
+# One string used to do both jobs, and package-ip could not satisfy it. Both
+# ways were MEASURED against the real ci/assert-stage.sh on 2026-09-08:
+#
+#   one string = package_ip -> assert-stage FAILS: "the manifest says stage
+#                              'package_ip', not 'package-ip' - it is not this
+#                              stage's manifest, so nothing read out of it
+#                              describes this stage"
+#   one string = package-ip -> the file lands at package-ip_manifest.txt, where
+#                              neither mk/flow.mk nor assert-stage looks
+#
+# The stage script worked around it by writing under one name and RENAMING the
+# file, which put an artefact-naming decision in a stage script and left the
+# next hyphenated stage to rediscover the whole thing. The two are now separate
+# arguments, and this is the assertion that they stay separate.
+#=============================================================================
+t_head "prov_manifest names the FILE from the stem and the 'stage' FIELD from the stage"
+
+## manifest_stage_and_stem <toolkit>
+manifest_stage_and_stem() {
+    local tk="$1" f v
+    prov_stage_run "$tk" package-ip package_ip || return 1
+    f="$P/run/reports/package_ip_manifest.txt"
+    if [ ! -s "$f" ]; then
+        printf 'no manifest at %s.\n' "$f"
+        printf 'CONTRACT.md section 4 fixes that filename and mk/flow.mk asserts it; what\n'
+        printf 'the stage actually wrote was:\n'
+        ls -1 "$P/run/reports" | sed 's/^/  /'
+        return 1
+    fi
+    # ci/assert-stage.sh reads this field and FAILS the run when it disagrees
+    # with the stage it was invoked as.
+    v="$(awk '$1 == "stage" { print $2; exit }' "$f")"
+    if [ "$v" != "package-ip" ]; then
+        printf "the manifest at %s says stage '%s'.\n" "$f" "$v"
+        printf 'ci/assert-stage.sh is invoked as `package-ip` and cross-checks this field:\n'
+        printf 'it FAILS the run with "it is not this manifest of this stage, so nothing\n'
+        printf 'read out of it describes this stage".\n'
+        return 1
+    fi
+    # ...and the gate followed the stem, with the STAGE in its title.
+    [ -s "$P/run/reports/package_ip_gate.txt" ] || {
+        printf 'the gate did not follow the artefact stem: no package_ip_gate.txt\n'
+        ls -1 "$P/run/reports" | sed 's/^/  /'; return 1; }
+    grep -qE '^PACKAGE-IP gate,' "$P/run/reports/package_ip_gate.txt" || {
+        printf 'the gate TITLE does not name the stage:\n'
+        head -1 "$P/run/reports/package_ip_gate.txt"; return 1; }
+    return 0
+}
+
+t_check prov.manifest.stem \
+    "stage 'package-ip' with stem 'package_ip' writes package_ip_manifest.txt whose stage field says package-ip" \
+    manifest_stage_and_stem "$FLOW_DIR"
+
+# The state this repository was in until 2026-09-08: one string for both. The
+# file lands where nothing looks for it.
+M="$(t_mutant "$SB" one-string-for-both-filename)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/provenance.tcl \
+        '    set path [file join $REPORT_DIR ${stem}_manifest.txt]' \
+        '    set path [file join $REPORT_DIR ${stage}_manifest.txt]'; then
+    t_check_fail prov.manifest.stem.mutation.filename \
+        "with the filename taken from the stage name, package-ip_manifest.txt lands where nothing looks and the assertion goes red" \
+        manifest_stage_and_stem "$M"
+else
+    t_skip prov.manifest.stem.mutation.filename \
+        "could not plant the fault: the manifest path line in prov_manifest() has changed shape"
+fi
+
+# ...and the other half of the same trap: the right filename, the wrong `stage`
+# field. This is the one assert-stage catches and calls a foreign manifest.
+M="$(t_mutant "$SB" one-string-for-both-field)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/provenance.tcl \
+        '    mf $fh stage   $stage' \
+        '    mf $fh stage   $stem'; then
+    t_check_fail prov.manifest.stem.mutation.field \
+        "with the stage FIELD taken from the artefact stem, assert-stage reads a foreign manifest and the assertion goes red" \
+        manifest_stage_and_stem "$M"
+else
+    t_skip prov.manifest.stem.mutation.field \
+        "could not plant the fault: the stage field line in prov_manifest() has changed shape"
+fi
+
 
 t_summary

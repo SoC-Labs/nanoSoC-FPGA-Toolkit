@@ -115,81 +115,28 @@ if {$PART_STR eq ""} { set PART_STR [part part_name] }
 
 
 ################################################################################
-# 2. THE MEASUREMENT BLOCK, AND WHY THIS STAGE APPENDS ONE
+# 2. THE MEASUREMENT BLOCK AND THE VERDICT WRITER LIVE IN provenance.tcl
 #
-# ci/assert-stage.sh grades a finished stage by READING THE MANIFEST, with
-# `awk '$1 == key'` - so a measurement has to be a top-level key in the first
-# column. prov_manifest (flow/common/provenance.tcl) writes the seven blocks
-# CONTRACT.md section 5 fixes and has no eighth for a stage's own numbers, and
-# prov_set would prefix them `prov.`, which is the namespace `compare-runs`
-# treats as design IDENTITY - a utilisation figure is a RESULT. So the stage
-# appends block 8 itself, immediately after prov_manifest returns.
+# ci/assert-stage.sh reads this stage's numbers out of the manifest with
+# `awk '$1 == key'`, so they are top-level keys. prov_manifest writes the seven
+# blocks CONTRACT.md section 5 fixes and has no eighth; prov_set would put them
+# in the `prov.` namespace, which `compare-runs` treats as design IDENTITY, and
+# a QoR number is a RESULT. So block 8 is appended after prov_manifest returns.
 #
-# That these four procs are duplicated in the three stage scripts is a fault to
-# fix in provenance.tcl, which owns manifest emission. It is recorded in the
-# handover rather than papered over with a fourth file these stages do not own.
+# That was written out longhand in all six stage scripts - as `stage_meas`,
+# `stage_meas_get`, `stage_meas_measured`, `stage_meas_append` and `write_gate`
+# here, as `stage_fields` and `gate_write` in the front half - by two sessions
+# that each found the hole independently. They are now, in provenance.tcl:
+#
+#   prov_stage_field <k> <v>       record one measurement
+#   prov_stage_get <k>             read it back ("unmeasured" when absent)
+#   prov_stage_measured <k>        true only for a REAL measurement
+#   prov_stage_fields <manifest>   append block 8
+#   prov_gate <stage> <stem> ...   the verdict artefact
+#
+# flow_boot sources provenance.tcl, so nothing here has to. `stage_stop` below
+# is still local: it is this stage's REFUSAL path, not a manifest writer.
 ################################################################################
-
-set ::MEAS {}
-proc stage_meas {k v} {
-    # "" is not a measurement. CONTRACT.md rule 2: the token is `unmeasured`,
-    # never 0 and never blank - a blank field reads as one the writer forgot.
-    if {[string trim $v] eq ""} { set v "unmeasured" }
-    lappend ::MEAS $k $v
-}
-proc stage_meas_get {k} {
-    foreach {kk vv} $::MEAS { if {$kk eq $k} { return $vv } }
-    return "unmeasured"
-}
-proc stage_meas_measured {k} {
-    set v [stage_meas_get $k]
-    return [expr {$v ne "unmeasured" && ![string match "UNVERIFIED*" $v]}]
-}
-proc stage_meas_append {path} {
-    set fh [open $path a]
-    puts $fh ""
-    puts $fh "# 8. measurements - what this stage measured, read back out of the"
-    puts $fh "#    reports it wrote. 'unmeasured' is a count nobody took, not 0."
-    foreach {k v} $::MEAS { mf $fh $k $v }
-    close $fh
-    return $path
-}
-
-
-
-# THE VERDICT WRITER, defined here because the refusal path below needs it too.
-# Every section is present even when empty: a reader cannot tell "no budget was
-# exceeded" from "budgets were never checked" if the heading is missing, and
-# ci/assert-stage.sh calls the second one UNVERIFIED for exactly that reason.
-# Bullets are `  - ` and nothing else inside a section starts a line with a
-# capital, because that is what the awk in ci/assert-stage.sh keys on.
-proc write_gate {path stage hard budgets owned notcov paragraph} {
-    global block_name RUN_TAG board_name part_name
-    set fh [open $path w]
-    puts $fh "[string toupper $stage] gate, [clock format [clock seconds] -format {%Y-%m-%dT%H:%M:%S%z}]"
-    puts $fh "design $block_name, run tag $RUN_TAG, board $board_name, part $part_name"
-    puts $fh ""
-    foreach l $paragraph { puts $fh $l }
-    puts $fh ""
-    if {[llength $hard]} {
-        puts $fh "HARD FAILURES: [llength $hard]"
-        foreach h $hard { puts $fh "  - [regsub -all {\s+} $h { }]" }
-    } else {
-        puts $fh "HARD FAILURES: none"
-    }
-    puts $fh ""
-    puts $fh "BUDGETS EXCEEDED"
-    foreach b $budgets { puts $fh "  - [regsub -all {\s+} $b { }]" }
-    puts $fh ""
-    puts $fh "DECLARED ELSEWHERE - MEASURED HERE, OWNED BY SOMEBODY ELSE"
-    foreach o $owned { puts $fh "  - [regsub -all {\s+} $o { }]" }
-    puts $fh ""
-    puts $fh "NOT covered by ANY run of this flow, at any setting:"
-    foreach n $notcov { puts $fh "  - [regsub -all {\s+} $n { }]" }
-    puts $fh ""
-    close $fh
-    return $path
-}
 
 # A REFUSAL THAT LEAVES A RECORD.
 #
@@ -202,21 +149,23 @@ proc write_gate {path stage hard budgets owned notcov paragraph} {
 # written and the exit code is 2, NOT 0: nothing was measured, and exit 0 would
 # be the other half of a distinction this record exists to make.
 proc stage_stop {stage reason lines} {
-    global REPORT_DIR
-    stage_meas stage_status "REFUSED: $reason"
+    prov_stage_field stage_status "REFUSED: $reason"
     catch {
-        write_gate [file join $REPORT_DIR ${stage}_gate.txt] $stage [list $reason] {} {} \
-            [list "everything. This stage refused before it ran, so nothing about\
-                   this design was measured at any setting"] \
+        prov_gate $stage $stage \
             [list \
                 "THIS STAGE REFUSED. It did not run, so every number it would have" \
                 "produced is absent rather than good. The hard failure below is the" \
                 "input it could not read; the run directory holds no artefact from" \
-                "this stage and no later stage can be graded against one."]
+                "this stage and no later stage can be graded against one."] \
+            [list $reason] \
+            {} \
+            {} \
+            [list "everything. This stage refused before it ran, so nothing about\
+                   this design was measured at any setting"]
     }
     catch {
         set m [prov_manifest $stage]
-        stage_meas_append $m
+        prov_stage_fields $m
         say "record of the refusal: $m"
     }
     flow_refuse {*}$lines
@@ -753,30 +702,30 @@ step "measurements"
 # `stage` and `part` are NOT repeated here: blocks 1 and 3 of the manifest
 # already carry them, and ci_mf returns the FIRST match for a key, so a second
 # copy is a second thing that can disagree with the first.
-stage_meas top        $TOP
-stage_meas flow_mode  $FLOW_MODE
-stage_meas lut        [util_row $UTIL_RPT {{Slice LUTs*} {Slice LUTs} {CLB LUTs*} {CLB LUTs}}]
-stage_meas ff         [util_row $UTIL_RPT {{Slice Registers} {CLB Registers} {Register as Flip Flop}}]
-stage_meas bram       [util_row $UTIL_RPT {{Block RAM Tile}}]
-stage_meas dsp        [util_row $UTIL_RPT {{DSPs} {DSP48E1} {DSP48E2}}]
-stage_meas uram       [util_row $UTIL_RPT {{URAM} {URAM288}}]
-stage_meas bufg       [util_row $UTIL_RPT {{BUFGCTRL} {BUFGCE} {Global Clock Buffer}}]
-stage_meas iob        [util_row $UTIL_RPT {{Bonded IOB}}]
-stage_meas blackboxes [util_blackboxes $UTIL_RPT]
+prov_stage_field top        $TOP
+prov_stage_field flow_mode  $FLOW_MODE
+prov_stage_field lut        [util_row $UTIL_RPT {{Slice LUTs*} {Slice LUTs} {CLB LUTs*} {CLB LUTs}}]
+prov_stage_field ff         [util_row $UTIL_RPT {{Slice Registers} {CLB Registers} {Register as Flip Flop}}]
+prov_stage_field bram       [util_row $UTIL_RPT {{Block RAM Tile}}]
+prov_stage_field dsp        [util_row $UTIL_RPT {{DSPs} {DSP48E1} {DSP48E2}}]
+prov_stage_field uram       [util_row $UTIL_RPT {{URAM} {URAM288}}]
+prov_stage_field bufg       [util_row $UTIL_RPT {{BUFGCTRL} {BUFGCE} {Global Clock Buffer}}]
+prov_stage_field iob        [util_row $UTIL_RPT {{Bonded IOB}}]
+prov_stage_field blackboxes [util_blackboxes $UTIL_RPT]
 
 foreach {__cw __ids __nfound} [msg_criticals] break
-stage_meas critical_warnings     $__cw
-stage_meas critical_warning_ids  [expr {[llength $__ids] ? [join $__ids {,}] : "(none)"}]
+prov_stage_field critical_warnings     $__cw
+prov_stage_field critical_warning_ids  [expr {[llength $__ids] ? [join $__ids {,}] : "(none)"}]
 set __er "" ; catch { set __er [get_msg_config -count -severity {ERROR}] }
-stage_meas errors $__er
+prov_stage_field errors $__er
 unset -nocomplain __er
 
-stage_meas dcp_bytes       [expr {[file exists $DCP]      ? [file size $DCP]      : ""}]
-stage_meas utilization_rpt [expr {[file exists $UTIL_RPT] ? [file size $UTIL_RPT] : ""}]
-stage_meas source_files    [expr {[info exists flist_files] ? $flist_files : ""}]
-stage_meas generics        [expr {[llength $GENERICS] ? [join $GENERICS {,}] : "(none)"}]
+prov_stage_field dcp_bytes       [expr {[file exists $DCP]      ? [file size $DCP]      : ""}]
+prov_stage_field utilization_rpt [expr {[file exists $UTIL_RPT] ? [file size $UTIL_RPT] : ""}]
+prov_stage_field source_files    [expr {[info exists flist_files] ? $flist_files : ""}]
+prov_stage_field generics        [expr {[llength $GENERICS] ? [join $GENERICS {,}] : "(none)"}]
 
-foreach {k v} $::MEAS { say [format "  %-22s %s" $k $v] }
+foreach k $::prov_stage_order { say [format "  %-22s %s" $k [prov_stage_get $k]] }
 
 
 ################################################################################
@@ -813,12 +762,12 @@ foreach r $REPORT_MISSING {
     lappend HARD "required report '$r' was not written - a gate reads it, and\
                   absent evidence is UNVERIFIED, which is a failure"
 }
-if {![stage_meas_measured lut] || ![stage_meas_measured ff]} {
+if {![prov_stage_measured lut] || ![prov_stage_measured ff]} {
     lappend HARD "utilisation could not be read out of [file tail $UTIL_RPT] - the\
                   budgets below are unarmed and this run's size is UNKNOWN, which\
                   is not the same as small"
 }
-if {![stage_meas_measured blackboxes]} {
+if {![prov_stage_measured blackboxes]} {
     lappend HARD "the utilisation report has no Black Boxes section, so nothing\
                   measured whether a module went unresolved - and an unresolved\
                   module costs no LUTs and raises no error"
@@ -837,11 +786,11 @@ proc budget_max {label value budget where} {
     return 1
 }
 set __from "post-synthesis, from reports/[file tail $UTIL_RPT]"
-budget_max lut        [stage_meas_get lut]        $EXPECT_LUT_MAX      $__from
-budget_max ff         [stage_meas_get ff]         $EXPECT_FF_MAX       $__from
-budget_max bram       [stage_meas_get bram]       $EXPECT_BRAM_MAX     $__from
-budget_max dsp        [stage_meas_get dsp]        $EXPECT_DSP_MAX      $__from
-budget_max blackboxes [stage_meas_get blackboxes] $EXPECT_BLACKBOX_MAX \
+budget_max lut        [prov_stage_get lut]        $EXPECT_LUT_MAX      $__from
+budget_max ff         [prov_stage_get ff]         $EXPECT_FF_MAX       $__from
+budget_max bram       [prov_stage_get bram]       $EXPECT_BRAM_MAX     $__from
+budget_max dsp        [prov_stage_get dsp]        $EXPECT_DSP_MAX      $__from
+budget_max blackboxes [prov_stage_get blackboxes] $EXPECT_BLACKBOX_MAX \
     "unresolved modules, from the Black Boxes section of reports/[file tail $UTIL_RPT]"
 unset __from
 
@@ -850,7 +799,7 @@ unset __from
 # allowlist applied to a partial reading of the log would exempt messages nobody
 # saw. MSG_GATE_ALLOWLIST defaults EMPTY (CONTRACT.md section 7): a default that
 # tolerated ids would hand every project someone else's undiagnosed exemptions.
-if {[stage_meas_measured critical_warnings] && $__cw > 0} {
+if {[prov_stage_measured critical_warnings] && $__cw > 0} {
     set __unexempt {}
     foreach id $__ids {
         if {[lsearch -exact $MSG_GATE_ALLOWLIST $id] < 0} { lappend __unexempt $id }
@@ -870,7 +819,7 @@ if {[stage_meas_measured critical_warnings] && $__cw > 0} {
 
 # --- delegated -------------------------------------------------------------
 lappend OWNED "post-synthesis LUT count is an OVER-estimate, owner=the impl stage:\
-               [stage_meas_get lut] here, and the tool's own footnote says the\
+               [prov_stage_get lut] here, and the tool's own footnote says the\
                final count after physical optimisation is typically lower.\
                reports/utilization_impl.rpt is the number that ships"
 if {[llength $XDC_PINS]} {
@@ -907,16 +856,18 @@ if {[llength $GENERICS]} {
                     it is a PROJECT file - this stage only passes the values on"
 }
 
-# write_gate is defined in section 2, because the refusal path needs it too.
-set GATE [file join $REPORT_DIR synth_gate.txt]
-write_gate $GATE synth $HARD $BUDGETS $OWNED $NOTCOV [list \
+# prov_gate names the STAGE and the artefact STEM separately (they are the same
+# string for five of the six stages; see 2_package_ip.tcl for the one that
+# forced the split). It returns the path it wrote.
+set GATE [prov_gate synth synth [list \
     "This gate is about SIZE and RESOLUTION: how much of the device the" \
     "synthesised netlist takes, and whether every module in it resolved to real" \
     "logic. It is NOT about timing (no clock is defined at synthesis - XDC_TIMING" \
     "is implementation-only by contract), NOT about routability, and NOT about" \
     "whether the design is correct. Every number below was read back out of a" \
     "report file on disk. None of it is inferred from an exit status, because" \
-    "synth_design returns 0 on a design that elaborated to almost nothing."]
+    "synth_design returns 0 on a design that elaborated to almost nothing."] \
+    $HARD $BUDGETS $OWNED $NOTCOV]
 
 say "verdict: $GATE"
 
@@ -926,7 +877,7 @@ say "verdict: $GATE"
 ################################################################################
 
 set MANIFEST [prov_manifest synth]
-stage_meas_append $MANIFEST
+prov_stage_fields $MANIFEST
 
 if {![file exists $MANIFEST] || ![file size $MANIFEST]} {
     die "the manifest at $MANIFEST was not written." \
