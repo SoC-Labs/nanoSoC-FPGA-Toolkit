@@ -129,6 +129,28 @@ printf 'rtl/a.v\n+notimingcheck\n'                    > "$F/unknownopt.f"
 printf 'rtl/a.v\n-timescale 1ns/1ps\n'                > "$F/simopt.f"
 printf '+incdir+rtl/a.v\nrtl/a.v\n'                   > "$F/incdir_is_a_file.f"
 
+# An unrecognised option followed on the SAME LINE by something that looks like
+# a source. The absorption rule must not touch these: one is a real file and the
+# other is a MISSING one, and swallowing either as an option argument is a source
+# silently dropped, which is rule 0.
+# A SECOND source, so that swallowing the first does not collapse the run to
+# "zero source files" - which would refuse for its own reason and let the proof
+# below pass while measuring something else.
+printf -- 'rtl/b.sv\n-nospecify rtl/a.v\n'            > "$F/optarg_src.f"
+printf -- 'rtl/a.v\n-nospecify rtl/does_not_exist.v\n' > "$F/optarg_missing.f"
+
+# One path, named twice, in one filelist. Read ONCE and reported as absorbed.
+printf 'rtl/a.v\nrtl/a.v\n'                           > "$F/dup.f"
+
+# The chain flist_apply is driven over: three +incdir+ across three levels and a
+# +define+, so "applied" and "collected" are different measurements.
+cat > "$F/apply.f" <<EOF
++incdir+inc1
++define+FLIST_TEST_D1
+rtl/a.v
+-f sub.f
+EOF
+
 #=============================================================================
 # DRIVING THE READER
 #
@@ -626,30 +648,41 @@ else
         "could not plant the fault: the FLIST_STRICT_OPTS test in flist_note_ignored() has changed shape"
 fi
 
-#=============================================================================
-# 10. THREE KNOWN DEFECTS
-#
-# This suite does not own read_flist.tcl, so it RECORDS these rather than fixing
-# them. Each is a t_known_defect: the assertion is correct, the reader does not
-# satisfy it today, and if any of them starts passing the suite goes RED, so the
-# marker cannot outlive the bug it documents.
-#=============================================================================
-t_head "known defects in read_flist.tcl"
 
-# --- 10a. flist_apply() reads the files and applies NEITHER the include dirs
-# NOR the defines.
+#=============================================================================
+# 10. THE FOUR DEFECTS THIS SECTION USED TO RECORD
 #
-# ::flist_cmds holds read_verilog/read_vhdl and nothing else - the include_dirs
-# and verilog_define assignments exist only in the TEXT that flist_write_sources
-# generates. So the file's whole reason for existing survives in sources.tcl and
-# is dropped on the floor by the other entry point, the one its own docstring
-# offers to non-project flows: "Execute the reads in the running tool." An
-# `include is resolved when a file is READ, so in that path every header in
-# every +incdir+ is unreachable and every +define+ is undefined. That is the
-# header's defect one layer down - not "all but one survive" but "none do".
+# Three of these were `t_known_defect` markers here until 2026-09-08, and the
+# fourth was not covered at all. read_flist.tcl has been fixed, so they are
+# ORDINARY ASSERTIONS now: a defect marker that outlives its defect is how a
+# suite starts lying about what it covers, and the harness makes a stale marker
+# go RED for exactly that reason.
+#
+# Every one is paired with a mutation proof that PUTS THE ORIGINAL DEFECT BACK -
+# not an approximation of it. The `+incdir+` proof drops the `isdirectory` test;
+# the flist_apply proof drops the property assignment; the option-argument proof
+# stops absorbing the argument; the summary proof restores the arithmetic that
+# was structurally zero. Each is one literal line through t_replace_line, whose
+# return value is honoured: a fault that could not be planted is a SKIP naming
+# the line that moved, never a silent pass.
+#=============================================================================
+t_head "10a. flist_apply() APPLIES the include dirs and the defines, before the reads"
+
+# THE HEADLINE DEFECT, AND IT WAS WORSE THAN THE ONE THE FILE WAS WRITTEN TO
+# AVOID. ::flist_cmds held read_verilog/read_vhdl and nothing else - the
+# include_dirs and verilog_define assignments existed only in the TEXT that
+# flist_write_sources generates. So the reader's whole reason for existing
+# survived into sources.tcl and was dropped on the floor by the other entry
+# point, the one its own docstring offers to non-project flows: "Execute the
+# reads in the running tool." Measured on this fixture: 3 include directories
+# collected, 0 applied. The header's defect is "41 collected, ONE survives";
+# this one left none.
+#
+# The drive script DECIDES NOTHING. It stubs the tool commands, runs
+# flist_apply, and prints what was applied in order; the assertions below read
+# that list. A drive script that graded itself would be a place for a mutant to
+# pass by making the grader lenient.
 cat > "$SB/apply_drive.tcl" <<'TCL'
-# Drive flist_apply with the tool commands stubbed, and report whether the
-# include dirs reached the fileset. Exits 0 only if they did.
 set tk [lindex $::argv 0]
 source [file join $tk flow common flow_utils.tcl]
 flow_config prefix FLIST
@@ -662,67 +695,359 @@ proc current_fileset {args} { return sources_1 }
 source [file join $tk flow common read_flist.tcl]
 flist_apply
 foreach c $::applied { puts "APPLIED: $c" }
-if {[lsearch -glob $::applied "set_property include_dirs*"] >= 0} { exit 0 }
-puts "flist_apply executed [llength $::applied] command(s) and applied NONE of the"
-puts "[llength $::flist_incdirs] include director(ies) it collected, nor any of the"
-puts "[llength $::flist_defines] define(s). `include is resolved when a file is READ."
-exit 1
 TCL
+
+## apply_run <toolkit> - drive flist_apply over apply.f, leaving the APPLIED
+## lines in RF_OUT. Non-zero only when flist_apply itself failed.
+apply_run() {
+    local tk="$1" rc=0
+    RF_OUT="$(FPGA_RTL_FLIST="$F/apply.f" timeout 60 tclsh "$SB/apply_drive.tcl" "$tk" 2>&1)" || rc=$?
+    return $rc
+}
 
 ## apply_applies_incdirs <toolkit>
 apply_applies_incdirs() {
-    local tk="$1" rc=0
-    RF_OUT="$(FPGA_RTL_FLIST="$F/top.f" timeout 60 tclsh "$SB/apply_drive.tcl" "$tk" 2>&1)" || rc=$?
-    [ "$rc" -eq 0 ] && return 0
-    printf '%s\n' "$RF_OUT"
+    local tk="$1" line n=0 d
+    apply_run "$tk" || { printf 'flist_apply failed:\n%s\n' "$RF_OUT"; return 1; }
+    line="$(printf '%s\n' "$RF_OUT" | grep -m1 '^APPLIED: set_property include_dirs ')"
+    if [ -z "$line" ]; then
+        printf 'flist_apply ran the reads and applied NO include_dirs at all. The union it\n'
+        printf 'collected reaches the fileset only through the text of sources.tcl, so in this\n'
+        printf 'path every header in every +incdir+ is unreachable:\n%s\n' "$RF_OUT"
+        return 1
+    fi
+    for d in inc1 inc2 inc3; do
+        printf '%s' "$line" | grep -qF -- "$F/$d" && n=$((n + 1))
+    done
+    [ "$n" -eq 3 ] && return 0
+    printf 'only %d of 3 collected include directories were APPLIED:\n%s\n' "$n" "$line"
     return 1
 }
 
-t_known_defect flist.apply.incdirs \
-    "flist_apply() runs the reads and applies NO include_dirs and NO verilog_define - the header's own defect, in the in-tool path" \
-    apply_applies_incdirs "$FLOW_DIR"
+## apply_applies_defines <toolkit>
+apply_applies_defines() {
+    local tk="$1" line
+    apply_run "$tk" || { printf 'flist_apply failed:\n%s\n' "$RF_OUT"; return 1; }
+    line="$(printf '%s\n' "$RF_OUT" | grep -m1 '^APPLIED: set_property verilog_define ')"
+    if [ -z "$line" ]; then
+        printf 'flist_apply applied NO verilog_define. An undefined `ifdef is silent - it\n'
+        printf 'builds the other arm and says nothing, which is CONTRACT.md section 9.2:\n'
+        printf 'an `ifdef opt-in was false in EVERY FPGA build and a byte-identical bitstream\n'
+        printf 'was the only thing that proved it:\n%s\n' "$RF_OUT"
+        return 1
+    fi
+    printf '%s' "$line" | grep -qF 'FLIST_TEST_D1' && return 0
+    printf 'verilog_define was applied without the define the filelist named:\n%s\n' "$line"
+    return 1
+}
 
-# --- 10b. `+incdir+` accepts a REGULAR FILE.
-#
-# flist_scan checks that the resolved path EXISTS. The `-y` branch beside it
-# also checks `file isdirectory`; this one does not. A file therefore lands in
-# include_dirs, Vivado searches nothing, and the headers that were supposed to
-# be there fail to resolve with no message naming the line that caused it -
-# which is word for word the failure the +incdir+ refusal exists to prevent,
-# reached by a different route.
+## apply_before_reads <toolkit>
+## ORDER, not merely presence. The two-pass scan at the top of read_flist.tcl
+## exists so that every search path is in place before the FIRST read rather
+## than merely before the last one; applying them afterwards would be betting
+## that the tool defers include resolution, which is the bet the header refuses.
+apply_before_reads() {
+    local tk="$1" prop read
+    apply_run "$tk" || { printf 'flist_apply failed:\n%s\n' "$RF_OUT"; return 1; }
+    prop="$(printf '%s\n' "$RF_OUT" | grep -n '^APPLIED: set_property ' | head -1 | cut -d: -f1)"
+    read="$(printf '%s\n' "$RF_OUT" | grep -n '^APPLIED: read_' | head -1 | cut -d: -f1)"
+    [ -n "$prop" ] || { printf 'nothing was applied at all:\n%s\n' "$RF_OUT"; return 1; }
+    [ -n "$read" ] || { printf 'nothing was READ at all, so there is no order to measure:\n%s\n' "$RF_OUT"; return 1; }
+    [ "$prop" -lt "$read" ] && return 0
+    printf 'the search paths were applied at position %s, AFTER the first read at %s:\n%s\n' \
+        "$prop" "$read" "$RF_OUT"
+    return 1
+}
+
+t_check flist.apply.incdirs \
+    "flist_apply() applies the whole +incdir+ union to the fileset, not just collects it" \
+    apply_applies_incdirs "$FLOW_DIR"
+t_check flist.apply.defines \
+    "and the +define+ list too - an undefined \`ifdef builds the other arm in silence" \
+    apply_applies_defines "$FLOW_DIR"
+t_check flist.apply.before_reads \
+    "and both BEFORE the first read command, which is what the two-pass scan is for" \
+    apply_before_reads "$FLOW_DIR"
+
+# -- mutation proof: THE ORIGINAL DEFECT, one line ----------------------------
+M="$(t_mutant "$SB" apply-no-incdirs)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/read_flist.tcl \
+        '        set_property include_dirs [concat $have $::flist_incdirs] $__fs' \
+        '        set __mutation_dropped_the_include_dirs $::flist_incdirs'; then
+    t_check_fail flist.apply.incdirs.mutation \
+        "with the include_dirs assignment removed from flist_apply_search, the in-tool path reads every source with ZERO include directories and the assertion goes red" \
+        apply_applies_incdirs "$M"
+else
+    t_skip flist.apply.incdirs.mutation \
+        "could not plant the fault: the include_dirs assignment in flist_apply_search() has changed shape"
+fi
+
+M="$(t_mutant "$SB" apply-no-defines)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/read_flist.tcl \
+        '        set_property verilog_define [concat $have $::flist_defines] $__fs' \
+        '        set __mutation_dropped_the_defines $::flist_defines'; then
+    t_check_fail flist.apply.defines.mutation \
+        "with the verilog_define assignment removed, every +define+ is undefined in the in-tool path and the assertion goes red" \
+        apply_applies_defines "$M"
+else
+    t_skip flist.apply.defines.mutation \
+        "could not plant the fault: the verilog_define assignment in flist_apply_search() has changed shape"
+fi
+
+# ORDER ONLY. Two lines, one fault: the properties still get applied - so the
+# two assertions above stay GREEN under this mutant - but after the reads
+# instead of before them. That is what proves apply_before_reads measures order
+# and not presence.
+M="$(t_mutant "$SB" apply-after-reads)"
+MUT_OK=0
+if [ -n "$M" ] && t_replace_line "$M" flow/common/read_flist.tcl \
+        '    set applied [flist_apply_search]' \
+        '    set applied 1'; then
+    if t_replace_line "$M" flow/common/read_flist.tcl \
+            '    foreach c $::flist_cmds { uplevel #0 $c }' \
+            '    foreach c $::flist_cmds { uplevel #0 $c } ; flist_apply_search'; then
+        MUT_OK=1
+    fi
+fi
+if [ "$MUT_OK" = 1 ]; then
+    t_check_fail flist.apply.before_reads.mutation \
+        "with the search paths applied AFTER the reads instead of before them, the order assertion goes red while presence alone would still pass" \
+        apply_before_reads "$M"
+else
+    t_skip flist.apply.before_reads.mutation \
+        "could not plant the fault: flist_apply()'s call to flist_apply_search() or its read loop has changed shape"
+fi
+
+#=============================================================================
+t_head "10b. +incdir+ must name a DIRECTORY, exactly as -y does"
+
+# `file exists` alone accepted `+incdir+rtl/a.v` and put a FILE into
+# include_dirs, where Vivado searches nothing and reports nothing - which is
+# word for word the failure the +incdir+ refusal exists to prevent, reached by a
+# different route. The `-y` branch twenty lines away had always checked
+# `isdirectory`; this branch had not.
+
 ## incdir_file_refused <toolkit>
 incdir_file_refused() {
     local tk="$1" rc=0
     rf_rc "$tk" -q "$F/incdir_is_a_file.f" || rc=$?
-    [ "$rc" -ne 0 ] && return 0
-    printf '+incdir+ naming a regular file was ACCEPTED and put into include_dirs:\n%s\n' "$RF_OUT"
+    if [ "$rc" -ne 2 ]; then
+        printf 'exit %d, not 2 (refused / unusable input). A regular file in include_dirs is a\n' "$rc"
+        printf 'search path with nothing under it, and no tool says so:\n%s\n' "$RF_OUT"
+        return 1
+    fi
+    printf '%s' "$RF_OUT" | grep -qF 'rtl/a.v' || {
+        printf 'it refused without naming the path that caused it:\n%s\n' "$RF_OUT"; return 1; }
+    printf '%s' "$RF_OUT" | grep -qiF 'directory' && return 0
+    printf 'it refused and named the path, but never says the problem is that it is not a\n'
+    printf 'directory - so the reader is sent looking for a missing file instead:\n%s\n' "$RF_OUT"
     return 1
 }
 
-t_known_defect flist.incdir.isdirectory \
-    "+incdir+ naming a regular file is accepted (the -y branch checks isdirectory, the +incdir+ branch only checks exists)" \
+t_check flist.incdir.isdirectory \
+    "+incdir+ naming a regular file exits 2 and says it is not a directory" \
     incdir_file_refused "$FLOW_DIR"
 
-# --- 10c. An unrecognised option's ARGUMENT is read as a source path.
+M="$(t_mutant "$SB" incdir-exists-only)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/read_flist.tcl \
+        '                    if {![file isdirectory $r]} {' \
+        '                    if {0} {'; then
+    t_check_fail flist.incdir.isdirectory.mutation \
+        "with the isdirectory test removed - checking only that the path exists, as the branch used to - a FILE is accepted into include_dirs and the assertion goes red" \
+        incdir_file_refused "$M"
+else
+    t_skip flist.incdir.isdirectory.mutation \
+        "could not plant the fault: the isdirectory test in flist_scan()'s +incdir+ branch has changed shape"
+fi
+
+#=============================================================================
+t_head "10c. an unrecognised option takes its ARGUMENT with it"
+
+# `-timescale 1ns/1ps` - the exact two-token spelling this reader's own census
+# warning names as harmless - used to refuse the whole run AT THE DEFAULT
+# SETTING with "source file not found: 1ns/1ps". The argument was read as a
+# source, the option was never reported at all (the census prints at the end of
+# flist_read, and the refusal happened first), and the diagnosis named the
+# argument, sending the reader to look for a file that was never meant to exist.
 #
-# The reader's own warning text names `-timescale` as one of the simulator-only
-# options that are "fine" - and `-timescale 1ns/1ps`, the ordinary two-token
-# spelling, refuses the whole run with "source file not found: 1ns/1ps". The
-# option is never even reported as unrecognised, and the diagnosis sends the
-# reader looking for a file rather than at the option that produced it. Note
-# that FLIST_STRICT_OPTS is not the issue: this refuses at the DEFAULT setting.
-## simulator_opt_with_arg_survives <toolkit>
-simulator_opt_with_arg_survives() {
+# THE DESIGN CALL, recorded here because a test is where a behaviour is pinned:
+# an unrecognised option is REPORTED AND NOT FATAL at the default setting, and
+# its argument is absorbed and reported with it. Not fatal, because CONTRACT.md
+# section 9.1 makes the filelist the configuration and these filelists are
+# shared with the simulator flow - simulator-only options are their normal
+# contents, and refusing them would force a second, FPGA-only copy of the one
+# file that decides what design gets built. FLIST_STRICT_OPTS=1 keeps the strict
+# answer and is asserted in section 9 above.
+
+## opt_arg_absorbed <toolkit>
+opt_arg_absorbed() {
     local tk="$1" rc=0
-    rf_rc "$tk" -q "$F/simopt.f" || rc=$?
-    [ "$rc" -eq 0 ] && return 0
-    printf 'a two-token simulator option refused the run (exit %d) at the DEFAULT setting, and\n' "$rc"
-    printf 'the message names its ARGUMENT as a missing source rather than naming the option:\n%s\n' "$RF_OUT"
+    rf_rc "$tk" "$F/simopt.f" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        printf 'a two-token simulator option refused the run (exit %d) at the DEFAULT setting,\n' "$rc"
+        printf 'and the message names its ARGUMENT as a missing source rather than the option:\n%s\n' "$RF_OUT"
+        return 1
+    fi
+    printf '%s\n' "$RF_OUT" | grep -qF -- '-timescale' || {
+        printf 'the run survived, but -timescale was never reported as unrecognised. An option\n'
+        printf 'that was meant to change the build and had no effect is a silent\n'
+        printf 'misconfiguration:\n%s\n' "$RF_OUT"; return 1; }
+    printf '%s\n' "$RF_OUT" | grep -qF '1ns/1ps' || {
+        printf 'the option is reported without the argument that was skipped with it, so the\n'
+        printf 'census does not account for every token on the line:\n%s\n' "$RF_OUT"; return 1; }
+    printf '%s\n' "$RF_OUT" | grep -qE '^read_(verilog|vhdl).*1ns/1ps' || return 0
+    printf 'the argument was handed to a read command as a source path:\n%s\n' "$RF_OUT"
     return 1
 }
 
-t_known_defect flist.unknown_opt.argument \
-    "'-timescale 1ns/1ps' - named in the reader's own warning as harmless - refuses the run, diagnosed as a missing source called '1ns/1ps'" \
-    simulator_opt_with_arg_survives "$FLOW_DIR"
+## opt_arg_keeps_sources <toolkit>
+## THE BOUNDARY OF THE RULE, and the half that keeps rule 0 intact. A token that
+## looks like an HDL source is NEVER absorbed - so a real source after an
+## unrecognised option is still read, and a MISSING one is still refused by
+## name instead of being swallowed as an option argument and built without.
+opt_arg_keeps_sources() {
+    local tk="$1" rc=0
+    rf_rc "$tk" -q "$F/optarg_src.f" || {
+        printf 'the reader refused a source that follows an unrecognised option:\n%s\n' "$RF_OUT"; return 1; }
+    printf '%s\n' "$RF_OUT" | grep -qF -- "$F/rtl/a.v" || {
+        printf 'a real source following an unrecognised option was SWALLOWED as that option'"'"'s\n'
+        printf 'argument and never read. It elaborates as a black box Vivado warns about and\n'
+        printf 'then builds:\n%s\n' "$RF_OUT"
+        return 1; }
+    rc=0
+    rf_rc "$tk" -q "$F/optarg_missing.f" || rc=$?
+    if [ "$rc" -ne 2 ]; then
+        printf 'a MISSING source following an unrecognised option exited %d instead of 2: it was\n' "$rc"
+        printf 'absorbed as the option'"'"'s argument, and the design builds without it in silence:\n%s\n' "$RF_OUT"
+        return 1
+    fi
+    printf '%s' "$RF_OUT" | grep -qF 'does_not_exist.v' && return 0
+    printf 'it refused, but without naming the missing source:\n%s\n' "$RF_OUT"
+    return 1
+}
+
+t_check flist.unknown_opt.argument \
+    "'-timescale 1ns/1ps' survives at the default setting, and BOTH tokens are named in the census" \
+    opt_arg_absorbed "$FLOW_DIR"
+t_check flist.unknown_opt.argument.sources_kept \
+    "but a token that looks like a source is never absorbed - present it is read, missing it still refuses by name" \
+    opt_arg_keeps_sources "$FLOW_DIR"
+
+M="$(t_mutant "$SB" opt-arg-eaten)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/read_flist.tcl \
+        '                if {[flist_opt_takes_arg $t $nxt]} { set arg $nxt ; incr i }' \
+        '                set arg ""'; then
+    t_check_fail flist.unknown_opt.argument.mutation \
+        "with the argument no longer absorbed - the original defect - '1ns/1ps' is read as a source path and the run refuses, so the assertion goes red" \
+        opt_arg_absorbed "$M"
+else
+    t_skip flist.unknown_opt.argument.mutation \
+        "could not plant the fault: the argument-absorption line in flist_sources() has changed shape"
+fi
+
+# The OTHER direction, and it is the one that matters more: absorb too much and
+# a missing source disappears into an option argument. That is a source silently
+# dropped, which is the defect class the whole file exists to prevent.
+M="$(t_mutant "$SB" opt-arg-eats-sources)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/read_flist.tcl \
+        '    if {[flist_looks_like_source $next]} { return 0 }' \
+        '    if {0} { return 0 }'; then
+    t_check_fail flist.unknown_opt.argument.sources_kept.mutation \
+        "with the looks-like-a-source guard removed, an unrecognised option swallows the source beside it and the assertion goes red" \
+        opt_arg_keeps_sources "$M"
+else
+    t_skip flist.unknown_opt.argument.sources_kept.mutation \
+        "could not plant the fault: the source-extension test in flist_opt_takes_arg() has changed shape"
+fi
+
+#=============================================================================
+t_head "10d. flist_summary reports numbers that are not structurally zero"
+
+# THIS ONE WAS NOT COVERED AT ALL, and it is the quietest of the four.
+# flist_summary guarded its `commands` line with
+#
+#     set n [expr {[llength $::flist_cmds] - $::flist_files}]
+#     if {$n > 0} { ... }
+#
+# and those two counters are incremented on adjacent lines of the same two
+# procs. $n is STRUCTURALLY ZERO, so the line had never printed, once, in any
+# run - while the comment above it explained what the number meant. A number
+# that can only ever be zero is worse than no number: it reads as "no
+# duplicates" to anyone who sees the guard and assumes it fired.
+
+## summary_commands_line <toolkit>
+summary_commands_line() {
+    local tk="$1" cmds files
+    rf_rc "$tk" "$F/top.f" || { printf 'the reader refused:\n%s\n' "$RF_OUT"; return 1; }
+    cmds="$(printf '%s\n' "$RF_OUT" | sed -n 's/^FLIST: commands  *: \([0-9][0-9]*\)$/\1/p')"
+    if [ -z "$cmds" ]; then
+        printf 'flist_summary printed no commands line at all. It was guarded by an expression\n'
+        printf 'that is structurally zero - [llength $::flist_cmds] - $::flist_files, two\n'
+        printf 'counters incremented together - so the line never printed in any run:\n%s\n' "$RF_OUT"
+        return 1
+    fi
+    files="$(printf '%s\n' "$RF_OUT" | sed -n 's/^FLIST: source files  *: \([0-9][0-9]*\)$/\1/p')"
+    [ -n "$files" ] || { printf 'no source-files line to compare against:\n%s\n' "$RF_OUT"; return 1; }
+    [ "$cmds" -gt 0 ] || { printf 'the commands line reports 0 for a filelist with %s sources:\n%s\n' "$files" "$RF_OUT"; return 1; }
+    [ "$cmds" = "$files" ] && return 0
+    printf '%s read command(s) for %s source file(s) - these are incremented together and\n' "$cmds" "$files"
+    printf 'cannot legitimately differ:\n%s\n' "$RF_OUT"
+    return 1
+}
+
+## summary_reports_duplicates <toolkit>
+## The number the dead line's own comment described, counted where the
+## de-duplication happens instead of derived from two counters that move
+## together. A path named twice is two definitions of one module.
+summary_reports_duplicates() {
+    local tk="$1" n
+    rf_rc "$tk" "$F/dup.f" || { printf 'the reader refused:\n%s\n' "$RF_OUT"; return 1; }
+    printf '%s\n' "$RF_OUT" | grep -qE '^FLIST: duplicate paths: 1 ' || {
+        printf 'a path named twice in one filelist was absorbed without being reported. The\n'
+        printf 'summary is where a human diffs one run against another, and this is the number\n'
+        printf 'the dead line was meant to carry:\n%s\n' "$RF_OUT"
+        return 1; }
+    printf '%s' "$RF_OUT" | grep -qF -- "$F/rtl/a.v" || {
+        printf 'it reported a duplicate without naming the path:\n%s\n' "$RF_OUT"; return 1; }
+    n="$(printf '%s\n' "$RF_OUT" | grep -c "^read_verilog $F/rtl/a.v\$")"
+    [ "$n" -eq 1 ] && return 0
+    printf 'the duplicate was reported but the file was emitted %s times. Two read commands\n' "$n"
+    printf 'for one path are two definitions of one module and an elaboration error a long\n'
+    printf 'way from here:\n%s\n' "$RF_OUT"
+    return 1
+}
+
+t_check flist.summary.commands \
+    "the summary's commands line actually prints, and agrees with the source count" \
+    summary_commands_line "$FLOW_DIR"
+t_check flist.summary.duplicates \
+    "a path named twice is reported as absorbed, by name, and read exactly once" \
+    summary_reports_duplicates "$FLOW_DIR"
+
+# THE ORIGINAL DEFECT, restored verbatim: the same say, behind the same
+# structurally-zero guard.
+M="$(t_mutant "$SB" summary-dead-line)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/read_flist.tcl \
+        '    say "commands       : [llength $::flist_cmds]"' \
+        '    if {[llength $::flist_cmds] - $::flist_files > 0} { say "commands       : [llength $::flist_cmds]" }'; then
+    t_check_fail flist.summary.commands.mutation \
+        "with the line put back behind its structurally-zero guard it never prints again, so the assertion goes red" \
+        summary_commands_line "$M"
+else
+    t_skip flist.summary.commands.mutation \
+        "could not plant the fault: the commands line in flist_summary() has changed shape"
+fi
+
+M="$(t_mutant "$SB" dup-not-counted)"
+if [ -n "$M" ] && t_replace_line "$M" flow/common/read_flist.tcl \
+        '        lappend ::flist_dups "$r (again at $where)"' \
+        '        set __mutation_swallowed_the_duplicate "$r (again at $where)"'; then
+    t_check_fail flist.summary.duplicates.mutation \
+        "with the duplicate not recorded where it is absorbed, the count is unreachable again and the assertion goes red" \
+        summary_reports_duplicates "$M"
+else
+    t_skip flist.summary.duplicates.mutation \
+        "could not plant the fault: the duplicate census line in flist_read_source() has changed shape"
+fi
 
 t_summary

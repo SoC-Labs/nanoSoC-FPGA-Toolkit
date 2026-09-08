@@ -39,6 +39,22 @@
 # and it asserts on the COUNT. An assertion that only checks the last directory
 # survives the exact defect it exists to catch.
 #
+# BOTH EMISSION PATHS APPLY THEM, and that had to be fixed rather than assumed.
+# The union reached the fileset only through the TEXT that flist_write_sources
+# generates; `::flist_cmds` held read_verilog and read_vhdl and nothing else, so
+# `flist_apply` - the in-tool path this file's own docstring offers to
+# non-project flows - read every source with ZERO include directories and ZERO
+# defines. Measured on the phase-1 fixture: 3 collected, 0 applied. That is this
+# same defect one layer down and strictly worse than the one above, because not
+# one directory survived rather than one. `flist_apply_search` now applies the
+# union - once each, appended, before the first read - and the suite asserts on
+# the count, on the defines and on the ORDER.
+#
+# A `+incdir+` MUST NAME A DIRECTORY, checked the same way `-y` checks it. `file
+# exists` alone accepts `+incdir+rtl/a.v`, and a file in include_dirs is searched
+# for nothing and reported by nothing: the headers it was meant to supply fail to
+# resolve exactly as if the line had not been there.
+#
 #
 # `-y` IS NOT OPTIONAL HERE - CONTRACT.md SECTION 9
 # ===========================================================================
@@ -77,6 +93,18 @@
 #   -v <file>           a library file. Read like any other source
 #   -define <D> / -d <D>  a define in the flag spelling
 #   # ...  // ...       comments, whole-line or trailing after whitespace
+#
+# ANYTHING ELSE BEGINNING WITH `-` OR `+` IS AN UNRECOGNISED OPTION: REPORTED,
+# NOT FATAL, AND IT TAKES ITS ARGUMENT WITH IT (exit 0; FLIST_STRICT_OPTS=1 makes
+# it exit 2 naming the option). `-timescale 1ns/1ps` used to refuse the whole run
+# with "source file not found: 1ns/1ps" - the argument read as a source, the
+# option never reported, and the diagnosis pointing at a file that was never
+# meant to exist. Not fatal by default because CONTRACT.md section 9.1 makes the
+# filelist the configuration and these filelists are SHARED with the simulator
+# flow: refusing simulator-only options would force a second, FPGA-only copy of
+# the one file that decides what design gets built. The full rule - which token
+# counts as an argument, decided without touching the filesystem, and why a token
+# that looks like a source is never absorbed - is at flist_note_ignored.
 #
 # ${VAR}, $(VAR) AND $VAR ARE ALL EXPANDED. Hand-written flists in this codebase
 # use ${VAR}; generator-emitted ones use the make-style $(VAR); shell-derived
@@ -135,7 +163,8 @@ set ::fpga_read_flist_loaded 1
 foreach __c {
     flist_expand_env flist_resolve flist_scan flist_sources flist_tokens
     flist_declares_unit flist_expand_y flist_dialect flist_emit flist_read
-    flist_write_sources flist_apply flist_summary flist_note_ignored
+    flist_write_sources flist_apply flist_apply_search flist_summary
+    flist_note_ignored flist_looks_like_source flist_opt_takes_arg
     flist_read_source flist_tried
 } {
     if {[llength [info commands $__c]]} {
@@ -179,6 +208,7 @@ set ::flist_cmds        {}     ;# the emitted Vivado commands, in order
 set ::flist_ignored     {}     ;# options this reader did not recognise
 set ::flist_stack       {}     ;# the -f include stack, for the cycle guard
 set ::flist_chain       {}     ;# every flist file read, for the manifest
+set ::flist_dups        {}     ;# paths named more than once, read ONCE - see flist_summary
 set ::flist_files       0      ;# source count
 
 
@@ -354,6 +384,29 @@ proc flist_scan {flist} {
                             "  fail to resolve, thousands of lines later, in a" \
                             "  file that does not mention this one."
                     }
+                    # AND IT HAS TO BE A DIRECTORY. `file exists` alone is
+                    # satisfied by `+incdir+rtl/a.v`, and a FILE in include_dirs
+                    # is a search path with nothing under it: Vivado searches
+                    # nothing there and says nothing about it, so the headers it
+                    # was supposed to supply fail to resolve exactly as if the
+                    # line had been absent - which is word for word the failure
+                    # the refusal above exists to prevent, reached by a different
+                    # route. The `-y` branch twenty lines down has always checked
+                    # this; this branch did not, and the two are the same
+                    # question asked about the same kind of path.
+                    if {![file isdirectory $r]} {
+                        flow_refuse "+incdir+ names a FILE, not a directory: $d" \
+                            "  named at: $where" \
+                            "  resolved: $r" \
+                            "  An include search path must be a directory. A" \
+                            "  file put into include_dirs is searched for" \
+                            "  nothing and reported by nothing, so every header" \
+                            "  this line was meant to make reachable fails to" \
+                            "  resolve with no message naming this line." \
+                            "  If the intent was to make that file's directory" \
+                            "  reachable, name the DIRECTORY; if it was to read" \
+                            "  the file, list it as a source."
+                    }
                     if {[lsearch -exact $::flist_incdirs $r] < 0} {
                         lappend ::flist_incdirs $r
                     }
@@ -492,13 +545,106 @@ proc flist_expand_y {ydir} {
     }
 }
 
-proc flist_note_ignored {tok where} {
+################################################################################
+# AN UNRECOGNISED OPTION AND ITS ARGUMENT - THE DESIGN CALL
+#
+# MEASURED DEFECT. `-timescale 1ns/1ps` - the ordinary two-token spelling, and
+# the option this file's own census warning names as one of the harmless
+# simulator-only ones - refused the whole run AT THE DEFAULT SETTING with
+#
+#     source file not found: 1ns/1ps
+#
+# `-timescale` was consumed as an unrecognised option and `1ns/1ps` was then read
+# as the next token on the line, which is not an option, which made it a source
+# path. Worse than the refusal is the diagnosis: it names the ARGUMENT and sends
+# the reader looking for a file, and the option that produced it is never
+# reported at all, because the ignored-option census is printed at the END of
+# flist_read and the refusal happens before it. And the silent variant is worse
+# still: `-l build.log` with a build.log actually present hands a log file to
+# read_verilog as a source.
+#
+# THE CALL: AN UNRECOGNISED OPTION IS REPORTED AS AN UNRECOGNISED OPTION, IS NOT
+# FATAL AT THE DEFAULT SETTING, AND ITS ARGUMENT IS ABSORBED AND REPORTED WITH
+# IT. Not fatal, because CONTRACT.md section 9.1 makes the filelist the
+# configuration and these filelists are SHARED with the simulator flow - the eth
+# chiplet's `nanosoc_eth_chiplet.flist` is read by VCS as well as by this reader.
+# Simulator-only options are the normal contents of such a file, not an
+# exception. A reader that refused them would force a divergent FPGA-only copy of
+# the one file that decides what design gets built, and two copies of that file
+# is the defect class this whole reader exists to prevent. FLIST_STRICT_OPTS=1
+# remains for a project that wants the strict answer, and it names the option.
+#
+# WHICH TOKEN IS AN ARGUMENT is decided WITHOUT touching the filesystem, so the
+# same filelist parses the same way on a machine where the file happens to exist
+# and on one where it does not. The next token on the SAME LINE is the option's
+# argument unless:
+#
+#   * the option is a `+` option. `+incdir+a+b`, `+define+X`, `+libext+.v`,
+#     `+notimingcheck`: the plus form carries its own arguments after `+`
+#     separators and never takes a following token. Verilog filelist convention,
+#     universal across simulators.
+#   * the next token is itself an option (`-*` or `+*`). This is also what keeps
+#     pass 1 and pass 2 in agreement: the only tokens pass 1 reacts to are `-y`,
+#     `-f`, `-F`, `+incdir+` and `+libext+`, and every one of them starts with a
+#     `-` or a `+`, so a token pass 2 absorbs is a token pass 1 was already
+#     ignoring. The two passes cannot diverge, which is why the absorption is
+#     implemented here only.
+#   * the next token LOOKS LIKE AN HDL SOURCE - it carries a source extension, or
+#     one of the `+libext+` extensions this flist declared. This is the guard
+#     that keeps rule 0 intact: without it, `-nospecify rtl/typo.v` would swallow
+#     a MISSING SOURCE as an option argument and build a design without it. With
+#     it, that token stays a source and the missing-file refusal still fires and
+#     still names the file.
+#
+# And it is bounded by the LINE, never crossing into the next one: a filelist is
+# written a line at a time and an option at the end of a line does not reach the
+# source at the start of the next.
+#
+# What is left uncovered, said plainly: an unrecognised option followed on the
+# same line by a source with no extension, or an extension outside the set below
+# and outside `+libext+`. That token is absorbed. It is NOT silent - it appears
+# in the census as `-nospecify rtl/weird (top.f:12)`, which is where a reader
+# asking "where did that file go" looks - and FLIST_STRICT_OPTS=1 makes it fatal.
+################################################################################
+
+# The extensions that make a token a source rather than an option argument. The
+# set flist_dialect switches on, plus the Verilog spellings its default arm
+# absorbs, plus whatever +libext+ declared - a flist that says its library files
+# are `.vlib` has said that `.vlib` names RTL.
+proc flist_looks_like_source {tok} {
+    set ext [string tolower [file extension $tok]]
+    if {$ext eq ""} { return 0 }
+    foreach e [concat {.v .sv .sva .svp .vh .svh .vhd .vhdl .veo .vp} $::flist_libext] {
+        if {$ext eq [string tolower $e]} { return 1 }
+    }
+    return 0
+}
+
+# Is <next> the argument of unrecognised option <tok>? <next> is "" when the
+# option is the last token on its line. See the block comment above.
+proc flist_opt_takes_arg {tok next} {
+    if {![string match "-*" $tok]} { return 0 }
+    if {$next eq ""} { return 0 }
+    if {[string match "-*" $next] || [string match "+*" $next]} { return 0 }
+    if {[flist_looks_like_source $next]} { return 0 }
+    return 1
+}
+
+proc flist_note_ignored {tok where {arg ""}} {
     global FLIST_STRICT_OPTS
     if {$FLIST_STRICT_OPTS} {
+        set extra {}
+        if {$arg ne ""} {
+            lappend extra "  Its argument '$arg' was skipped with it - an option" \
+                          "  this reader does not implement cannot have its" \
+                          "  argument read as a source file."
+        }
         flow_refuse "$where: unrecognised filelist option '$tok'" \
+            {*}$extra \
             "  FLIST_STRICT_OPTS=1 makes this fatal. Unset it to downgrade" \
             "  unrecognised options to a warning and a manifest entry."
     }
+    if {$arg ne ""} { set tok "$tok $arg" }
     lappend ::flist_ignored "$tok ($where)"
 }
 
@@ -539,7 +685,13 @@ proc flist_sources {flist} {
                 if {$p eq ""} { flow_refuse "$where: '-v' with no file after it." }
                 flist_read_source $p $flist $where
             } elseif {[string match "-*" $t] || [string match "+*" $t]} {
-                flist_note_ignored $t $where
+                # The option AND its argument, so the argument is never read as
+                # a source. See "AN UNRECOGNISED OPTION AND ITS ARGUMENT" above.
+                set nxt ""
+                if {$i + 1 < $ntok} { set nxt [lindex $toks [expr {$i + 1}]] }
+                set arg ""
+                if {[flist_opt_takes_arg $t $nxt]} { set arg $nxt ; incr i }
+                flist_note_ignored $t $where $arg
             } else {
                 flist_read_source $t $flist $where
             }
@@ -574,7 +726,12 @@ proc flist_read_source {tok fromflist where} {
             "  and then died, and it satisfies every 'test -e' in the world."
     }
     if {[lsearch -exact $::flist_files_read $r] >= 0} {
-        # Not fatal: reported at the end, once, with the whole list.
+        # Not fatal: reported at the end, once, with the whole list. COUNTED
+        # HERE, where the absorbing happens - flist_summary used to derive this
+        # number as [llength $::flist_cmds] - $::flist_files, and those two are
+        # incremented on adjacent lines of this proc and of flist_expand_y, so
+        # the difference was structurally zero and the line never printed once.
+        lappend ::flist_dups "$r (again at $where)"
         return
     }
     set d [flist_dialect $r]
@@ -631,6 +788,7 @@ proc flist_read {flist} {
     set ::flist_ignored    {}
     set ::flist_stack      {}
     set ::flist_chain      {}
+    set ::flist_dups       {}
     set ::flist_files      0
 
     # Project-wide defines apply to everything, so they are registered before the
@@ -686,6 +844,9 @@ proc flist_read {flist} {
         warn "  and had NO effect on what was read. Most are simulator-only"
         warn "  (-timescale, +notimingcheck, -sverilog) and that is fine; one"
         warn "  that was meant to change the build is a silent misconfiguration."
+        warn "  A SECOND WORD on a line below is that option's ARGUMENT, skipped"
+        warn "  with it rather than read as a source file - which is what used"
+        warn "  to happen, and refused the whole run naming the argument."
         warn "  Set FLIST_STRICT_OPTS=1 to make them fatal."
         foreach o $::flist_ignored { warn "    $o" }
     }
@@ -746,6 +907,37 @@ proc flist_write_sources {out} {
     return $out
 }
 
+# The include dirs and the defines, into the fileset that is current NOW: ONE
+# appended assignment each, exactly as flist_write_sources emits into
+# sources.tcl. Returns 1 when they reached a fileset, 0 when this tool has none.
+#
+# MEASURED DEFECT, AND IT IS THE HEADER'S OWN DEFECT ONE LAYER DOWN. ::flist_cmds
+# holds read_verilog and read_vhdl and NOTHING ELSE - the include_dirs and
+# verilog_define assignments existed only in the TEXT that flist_write_sources
+# generates. So flist_apply, the in-tool path this file's docstring offers to
+# non-project flows, read every source with ZERO include directories and ZERO
+# defines: measured on the phase-1 fixture, 3 include directories collected, 0
+# applied. The header's defect is "41 collected, one survives"; this was worse,
+# because none did.
+#
+# BEFORE THE FIRST READ, not after the last. That is the order flist_write_sources
+# already emits, and the order the two-pass scan exists to make possible: a reader
+# that applied them afterwards would be betting that the tool defers include
+# resolution to elaboration, which is the assumption the header refuses to make.
+proc flist_apply_search {} {
+    if {![flow_have current_fileset]} { return 0 }
+    if {[catch {current_fileset} __fs] || $__fs eq ""} { return 0 }
+    if {[llength $::flist_incdirs]} {
+        set have {} ; catch { set have [get_property include_dirs $__fs] }
+        set_property include_dirs [concat $have $::flist_incdirs] $__fs
+    }
+    if {[llength $::flist_defines]} {
+        set have {} ; catch { set have [get_property verilog_define $__fs] }
+        set_property verilog_define [concat $have $::flist_defines] $__fs
+    }
+    return 1
+}
+
 # Execute the reads in the running tool. Used by the flist stage when it wants
 # the design in memory as well as on disk (non-project flows).
 proc flist_apply {} {
@@ -754,6 +946,21 @@ proc flist_apply {} {
             "  The filelist parsed and sources.tcl was written, but nothing" \
             "  read it. Run this from Vivado, or source the generated" \
             "  sources.tcl from a stage that is."
+    }
+    set applied [flist_apply_search]
+    if {!$applied && ([llength $::flist_incdirs] || [llength $::flist_defines])} {
+        warn "flist_apply: this tool has NO FILESET, so the\
+              [llength $::flist_incdirs] include director(ies) and\
+              [llength $::flist_defines] define(s) this filelist collected were"
+        warn "  NOT applied to anything, and the reads below happen without them."
+        warn "  There is no fileset property to append them to in a non-project"
+        warn "  flow: they belong on the synth_design call, as"
+        warn "    synth_design -include_dirs \$::flist_incdirs \\"
+        warn "                 -verilog_define \$::flist_defines ..."
+        warn "  Both lists are left in those globals for exactly that. Passing"
+        warn "  neither is not a warning downstream: an unresolved \`include is a"
+        warn "  parse error thousands of lines from its cause, and an undefined"
+        warn "  \`ifdef is silent - it builds the other arm and says nothing."
     }
     foreach c $::flist_cmds { uplevel #0 $c }
     return $::flist_files
@@ -772,11 +979,43 @@ proc flist_summary {} {
     if {[llength $::flist_headers]} {
         say "headers seen   : [llength $::flist_headers] (dirs added to +incdir+, files not read)"
     }
-    # A path read twice is two definitions of one module and an elaboration error
-    # a long way from here. flist_read_source already de-duplicates, so this
-    # reports what it absorbed rather than letting it through.
-    set n [expr {[llength $::flist_cmds] - $::flist_files}]
-    if {$n > 0} { say "commands       : [llength $::flist_cmds]" }
+    # A path named twice is two definitions of one module and an elaboration
+    # error a long way from here. flist_read_source de-duplicates, so this
+    # reports what it ABSORBED rather than letting it through.
+    #
+    # THE NUMBER IS COUNTED WHERE THE DE-DUPLICATION HAPPENS. This block used to
+    # read
+    #
+    #     set n [expr {[llength $::flist_cmds] - $::flist_files}]
+    #     if {$n > 0} { say "commands : [llength $::flist_cmds]" }
+    #
+    # and $n is STRUCTURALLY ZERO: every flist_emit in this file is paired with
+    # an `incr ::flist_files` on the next line, in both flist_read_source and
+    # flist_expand_y, so the two counters cannot diverge and the line had never
+    # printed. A number that can only ever be zero is worse than no number - it
+    # reads as "no duplicates" to anyone who sees the guard and assumes it fired.
+    #
+    # Only EXPLICITLY named duplicates are counted. A `-y` glob that re-offers a
+    # file already listed as a source is de-duplicated too, silently and on
+    # purpose: that overlap is the normal shape of a vendor library directory and
+    # counting it would bury the case this line is for - one flist naming a
+    # source that another flist in the same chain already named.
+    if {[llength $::flist_dups]} {
+        say "duplicate paths: [llength $::flist_dups] named more than once, each read ONCE"
+        foreach d $::flist_dups { say "  $d" }
+    }
+    say "commands       : [llength $::flist_cmds]"
+    # The invariant the dead expression was standing on, asserted instead of
+    # silently assumed. One read command per source file, always; if these two
+    # ever disagree, a file was emitted without being counted or counted without
+    # being emitted, and every census and manifest downstream is wrong about the
+    # design by exactly that much.
+    if {[llength $::flist_cmds] != $::flist_files} {
+        warn "[llength $::flist_cmds] read command(s) for $::flist_files source file(s)."
+        warn "  These are incremented together and cannot legitimately differ."
+        warn "  The source census and the manifest both count files, so one of"
+        warn "  them is now describing a design this run did not read."
+    }
 }
 
 
