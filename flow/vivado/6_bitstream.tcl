@@ -491,10 +491,12 @@ set BUDGETS {}
 set OWNED   {}
 set NOTCOV  {}
 
-foreach {f what} [list \
-    $BIT "the bitstream a programmer loads" \
-    $XSA "the hardware handoff a software build reads to learn the address map"] {
-    if {$what eq "the hardware handoff a software build reads to learn the address map" && !$BITSTREAM_WRITE_XSA} { continue }
+set __required [list $BIT "the bitstream a programmer loads"]
+if {$BITSTREAM_WRITE_XSA} {
+    lappend __required $XSA \
+        "the hardware handoff a software build reads to learn the address map"
+}
+foreach {f what} $__required {
     if {![file exists $f]} {
         lappend HARD "no [file tail $f] at $f - $what"
     } elseif {![file size $f]} {
@@ -503,6 +505,7 @@ foreach {f what} [list \
                       satisfies every 'test -e' in the world"
     }
 }
+unset __required
 if {$BITSTREAM_BIN_STYLE eq ""} {
     lappend HARD "no bin_style, so no .bin was written. It is a REQUIRED board-pack\
                   key and an unset one is not a default - it is a conversion nobody\

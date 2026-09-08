@@ -270,7 +270,13 @@ foreach e $XDC_IMPL {
 # connect_debug_port on a net that was optimised away is an error at the end of a
 # long stage. Its default is disabled, deliberately - a debug core is a
 # modification of the design, not an observation of it.
+#
+# pre_impl FIRES BEFORE THE ILA STEP, not after, and the order is not arbitrary:
+# the natural thing for a project hook to do here is mark nets for debug, and a
+# MARK_DEBUG set after ila.tcl has already chosen its probes reaches nothing.
 ################################################################################
+
+flow_hook pre_impl
 
 flow_step ila
 
@@ -282,8 +288,6 @@ if {![info exists ::ILA_STEP_DONE] || !$::ILA_STEP_DONE} {
         "  numbers are not comparable in either direction."
 }
 set ILA_ON [expr {[info exists ::ILA_ENABLED] ? $::ILA_ENABLED : 0}]
-
-flow_hook pre_impl
 
 flow_step impl_setup
 

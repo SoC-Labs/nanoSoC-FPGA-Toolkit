@@ -259,6 +259,17 @@ mf_set deploy.test.action "${ACTION:-none}"
 HUB_SOCKET=""
 HUB_BASE=""
 HUB_TRANSPORT=""
+
+# THE TRANSPORT FLAGS, AND WHY EVERY EXPANSION OF THEM IS WRITTEN
+# ${CURL_XPORT[@]+"${CURL_XPORT[@]}"} RATHER THAN "${CURL_XPORT[@]}".
+#
+# This array is EMPTY on the plain-TCP path, and under `set -u` bash BEFORE 4.4
+# treats "${a[@]}" on an empty array as an unbound variable and aborts. The host
+# this was written on runs 4.4.20 and is fine; CONTRACT.md is explicit that these
+# scripts run on EDA hosts whose tool versions are older than the development
+# ones (it works around GNU make 4.2.1 for exactly this reason), and the failure
+# mode there is not a wrong answer - it is the deploy tier refusing to start, on
+# the machine nobody develops on.
 CURL_XPORT=()
 
 resolve_endpoint() {
@@ -341,7 +352,7 @@ stop_request() {
 http() {
     local method="$1" path="$2" body="${3:-}" tmo="${4:-30}"
     local out rc tmp
-    local args=(-sS -X "$method" --max-time "$tmo" "${CURL_XPORT[@]}"
+    local args=(-sS -X "$method" --max-time "$tmo" ${CURL_XPORT[@]+"${CURL_XPORT[@]}"}
                 -w $'\n__HTTP_STATUS__%{http_code}')
     [ -n "${FPGAHUB_TOKEN:-}" ] && args+=(-H "Authorization: Bearer $FPGAHUB_TOKEN")
     if [ -n "$body" ]; then
@@ -633,7 +644,7 @@ start_heartbeat() {
         while sleep "$interval"; do
             local hb
             hb="{\"holder\":$(json_str "$HOLDER"),\"token\":$(json_str "$LEASE_TOKEN"),\"ttl_seconds\":$TTL}"
-            curl -sS -X POST --max-time 15 "${CURL_XPORT[@]}" \
+            curl -sS -X POST --max-time 15 ${CURL_XPORT[@]+"${CURL_XPORT[@]}"} \
                  ${FPGAHUB_TOKEN:+-H "Authorization: Bearer $FPGAHUB_TOKEN"} \
                  -H 'Content-Type: application/json' --data-binary "$hb" \
                  "$HUB_BASE/api/v1/boards/$BOARD_GROUP/lease/heartbeat" \
@@ -1089,7 +1100,7 @@ do_test() {
         # and stop_sse actually stops it. A background simple command in a
         # non-interactive shell also inherits no EXIT trap - which is what the
         # wrapper's `trap -` was there for in the first place.
-        curl -sS -N --max-time "$(( ACTION_TIMEOUT + 60 ))" "${CURL_XPORT[@]}" \
+        curl -sS -N --max-time "$(( ACTION_TIMEOUT + 60 ))" ${CURL_XPORT[@]+"${CURL_XPORT[@]}"} \
              ${FPGAHUB_TOKEN:+-H "Authorization: Bearer $FPGAHUB_TOKEN"} \
              "$HUB_BASE/api/v1/events?types=action.start,action.log,action.end&board=$TARGET&action_id=$ACTION" \
              >> "$sse_log" 2>&1 &
