@@ -466,22 +466,9 @@ flow_hook post_bitstream
 # 9. MEASUREMENT
 ################################################################################
 
-proc msg_criticals {} {
-    set count "" ; catch { set count [get_msg_config -count -severity {CRITICAL WARNING}] }
-    set log [flow_env FPGA_LOG_FILE]
-    set ids {} ; set nfound 0
-    if {$log ne "" && [file exists $log]} {
-        set fh [open $log r]
-        while {[gets $fh line] >= 0} {
-            if {[regexp {^CRITICAL WARNING: \[([^\]]+)\]} $line -> id]} {
-                incr nfound
-                if {[lsearch -exact $ids $id] < 0} { lappend ids $id }
-            }
-        }
-        close $fh
-    }
-    return [list $count $ids $nfound]
-}
+# msg_criticals removed 2026-09-09: it read the reset-prone counter. The stage
+# now calls prov_msg_criticals, which reads the log. See section 7 of
+# provenance.tcl for the measurement that settled which evidence to believe.
 
 step "measurements"
 
@@ -510,9 +497,21 @@ if {$FW_HEX ne ""} {
     prov_stage_field fpga_image_hex_bytes  ""
 }
 
-foreach {__cw __ids __nfound} [msg_criticals] break
-prov_stage_field critical_warnings    $__cw
-prov_stage_field critical_warning_ids [expr {[llength $__ids] ? [join $__ids {,}] : "(none)"}]
+# THE CENSUS IS prov_msg_criticals (provenance.tcl section 7), not this stage's
+# own count. `get_msg_config -count` is RESET by every command that rebuilds the
+# design - open_checkpoint included - so a stage that asks the tool at the end is
+# told what happened since its last such command, not what the stage emitted.
+# This stage got away with it only because write_hw_platform's Project 1-1924
+# fires AFTER its open_checkpoint; any critical warning raised BEFORE that was
+# invisible here and the gate failed OPEN. Fixed 2026-09-09, same defect and
+# same fix as 4_synth and 5_impl.
+set __msg      [prov_msg_criticals]
+set __ids      [dict get $__msg ids]
+set __complete [dict get $__msg complete]
+prov_stage_field critical_warnings       [dict get $__msg total]
+prov_stage_field critical_warnings_basis [dict get $__msg basis]
+prov_stage_field critical_warning_ids    [expr {[llength $__ids] ? [join $__ids {,}] : "(none)"}]
+set __cw [prov_stage_get critical_warnings]
 
 foreach k $::prov_stage_order { say [format "  %-24s %s" $k [prov_stage_get $k]] }
 
@@ -563,21 +562,29 @@ if {$PLATFORM eq "pynq" && $HWH eq ""} {
 }
 
 if {[prov_stage_measured critical_warnings] && $__cw > 0} {
-    set __unexempt {}
-    foreach id $__ids {
-        if {[lsearch -exact $MSG_GATE_ALLOWLIST $id] < 0} { lappend __unexempt $id }
+    set __v [prov_msg_verdict $ALLOW_CRITICAL_WARNINGS $__ids \
+                              $MSG_GATE_ALLOWLIST $__complete]
+    switch -exact -- [dict get $__v verdict] {
+        allowed {
+            lappend OWNED "$__cw critical warning(s), owner=ALLOW_CRITICAL_WARNINGS=1 in\
+                           design.mk: reported, not gated. ids: [join $__ids {, }]"
+        }
+        exempt {
+            lappend OWNED "$__cw critical warning(s), owner=MSG_GATE_ALLOWLIST: every id\
+                           is allowlisted with a diagnosis in design.mk. ids: [join $__ids {, }]"
+        }
+        incomplete {
+            lappend BUDGETS "critical_warnings $__cw > budget 0 (ALLOW_CRITICAL_WARNINGS=0,\
+                             and NO exemption can be granted from this run, whatever\
+                             MSG_GATE_ALLOWLIST declares, because the id list does not\
+                             account for every message: [prov_stage_get critical_warnings_basis])"
+        }
+        default {
+            lappend BUDGETS "critical_warnings $__cw > budget 0 (ALLOW_CRITICAL_WARNINGS=0;\
+                             ids not allowlisted: [expr {[llength [dict get $__v unexempt]] ? [join [dict get $__v unexempt] {, }] : {none readable in the stage log}}])"
+        }
     }
-    if {$ALLOW_CRITICAL_WARNINGS} {
-        lappend OWNED "$__cw critical warning(s), owner=ALLOW_CRITICAL_WARNINGS=1 in\
-                       design.mk: reported, not gated. ids: [join $__ids {, }]"
-    } elseif {$__nfound == $__cw && ![llength $__unexempt] && [llength $__ids]} {
-        lappend OWNED "$__cw critical warning(s), owner=MSG_GATE_ALLOWLIST: every id is\
-                       allowlisted with a diagnosis in design.mk. ids: [join $__ids {, }]"
-    } else {
-        lappend BUDGETS "critical_warnings $__cw > budget 0 (ALLOW_CRITICAL_WARNINGS=0;\
-                         ids not allowlisted: [expr {[llength $__unexempt] ? [join $__unexempt {, }] : {none readable in the stage log}}])"
-    }
-    unset __unexempt
+    unset -nocomplain __v
 }
 
 lappend OWNED "which conversion this .bin needs, owner=the board pack's bin_style:\
