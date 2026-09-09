@@ -194,6 +194,12 @@ XDC by the glob `*_tidelink*.xdc`, so any other naming is silently invisible and
 warn-only. We take explicit paths, and `make check` errors on a `.xdc` present
 in `TARGET_DIR` that no variable names.
 ```
+XDC_CLOCKS      ?=                    # SYNTHESIS ONLY. create_clock and
+                                      # create_generated_clock. Not an
+                                      # exception, so not XDC_TIMING's window;
+                                      # implementation takes the same
+                                      # definitions from XDC_TIMING, so each
+                                      # stage defines each clock exactly once.
 XDC_TIMING      ?=                    # implementation only
 XDC_DRC         ?=                    # implementation only
 XDC_EXTRA       ?=                    # a LIST, order preserved
@@ -220,8 +226,12 @@ synthesis-visible constraints and 6 implementation-only.
 
 `flow/steps/synth_setup.tcl` therefore **refuses** when conversion is enabled and
 any clock definition is implementation-only, rather than letting the knob lie.
-The fix is to give synthesis the definitions — a synthesis-visible constraint
-file holding `create_clock`/`create_generated_clock` and nothing else. **This
+**`XDC_CLOCKS` is the way out** — a synthesis-only constraint file holding
+`create_clock`/`create_generated_clock` and nothing else. It is read at
+synthesis and marked `USED_IN_IMPLEMENTATION false`, because implementation
+takes the same definitions from `XDC_TIMING`; marking rather than merely not
+reading matters in project mode, where the file joins a fileset later stages
+also open, and without the property every clock would be defined twice. **This
 generalises beyond clock gating:** any synthesis decision that depends on knowing
 what a clock is inherits the same blindness, so a project keeping all its clock
 definitions implementation-only should expect more than one such surprise.

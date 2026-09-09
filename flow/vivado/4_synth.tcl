@@ -253,6 +253,30 @@ if {![llength $XDC_PINS]} {
     warn "  at the END of the flow rather than here."
 }
 
+# XDC_CLOCKS - clock DEFINITIONS, read here and NOT at implementation.
+#
+# A clock definition is not a timing exception, and the read window that is
+# right for exceptions is wrong for it. XDC_TIMING is withheld from synthesis
+# because an exception read here changes what synthesis BUILDS; a create_clock
+# only tells the tool what a net is. And synthesis needs to be told: Vivado
+# converts a gated clock into a clock enable only on a net it knows is a clock,
+# so with the definitions withheld `-gated_clock_conversion auto` converts
+# nothing, silently, with a byte-identical netlist. Measured - see
+# flow/steps/synth_setup.tcl section 4a.
+#
+# READ AT SYNTHESIS ONLY, deliberately. Implementation gets the same definitions
+# from XDC_TIMING, so reading this there too would define every clock twice.
+# One definition per stage, from one file per stage.
+set XDC_CLOCKS {}
+foreach f [split [flow_env FPGA_XDC_CLOCKS]] {
+    if {[string trim $f] eq ""} { continue }
+    flow_assert_input [string trim $f] \
+        "clock definitions - create_clock and create_generated_clock. Read at\
+         SYNTHESIS ONLY; implementation takes them from XDC_TIMING" \
+        XDC_CLOCKS
+    lappend XDC_CLOCKS [file normalize [string trim $f]]
+}
+
 # PROVENANCE IS PINNED AT THE READ, not at stage end: RTL_FLIST_GEN regenerates
 # the flist from inside the build, hooks are project code in the critical path,
 # and concurrent sessions editing one working tree is the normal condition here.
@@ -274,6 +298,13 @@ foreach f $XDC_PINS {
     incr __i
     prov_pin xdc_pins.$__i $f "synth-read"
     lappend ::PROV_FILES xdc_pins.$__i $f
+}
+unset __i
+set __i 0
+foreach f $XDC_CLOCKS {
+    incr __i
+    prov_pin xdc_clocks.$__i $f "synth-read"
+    lappend ::PROV_FILES xdc_clocks.$__i $f
 }
 unset __i
 
@@ -551,6 +582,28 @@ proc read_pin_xdc {path} {
 }
 
 foreach f $XDC_PINS { read_pin_xdc $f }
+
+# Clock definitions: read here, and marked NOT used in implementation, because
+# implementation takes the same definitions from XDC_TIMING. Marking rather than
+# merely not-reading matters in project mode, where the file joins a fileset
+# that later stages also open - without the property Vivado would apply it at
+# implementation too and every clock would be defined twice.
+proc read_clocks_xdc {path} {
+    read_xdc $path
+    catch {
+        set __o [get_files -quiet [file tail $path]]
+        if {[llength $__o]} {
+            set_property USED_IN_SYNTHESIS      true  $__o
+            set_property USED_IN_IMPLEMENTATION false $__o
+        }
+    }
+    say "read_xdc (synthesis only; implementation takes these from XDC_TIMING): $path"
+}
+
+foreach f $XDC_CLOCKS { read_clocks_xdc $f }
+if {![llength $XDC_CLOCKS]} {
+    say "XDC_CLOCKS: (none) - synthesis sees only the clocks XDC_PINS defines"
+}
 
 # Say what was NOT read, and why. A file a project named and this stage silently
 # skipped is indistinguishable, from the log, from one the engine forgot.

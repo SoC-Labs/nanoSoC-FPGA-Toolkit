@@ -150,7 +150,7 @@ KNOWN_VARS = (
     "RTL_DEFINES_NEVER", "RTL_PARAMS", "TOP_HDL", "EXTRA_SRCS", "SV_FILES",
     "IP_REPOS", "IP_VENDOR", "IP_CORE_REV", "IP_CACHE_DIR", "PACKAGE_TCL",
     "BD_TCL", "BD_OVERLAY_TCL", "BD_GLOBAL_SYNTH",
-    "XDC_TIMING", "XDC_DRC", "XDC_EXTRA", "XDC_OPTIONAL", "XDC_POST_ROUTE",
+    "XDC_CLOCKS", "XDC_TIMING", "XDC_DRC", "XDC_EXTRA", "XDC_OPTIONAL", "XDC_POST_ROUTE",
     "FW_APP", "FW_HEX", "FW_HEX_FORMAT", "FPGA_IMAGE_HEX",
     "HOOKS_DIR", "OVERRIDES_DIR",
     "BUILD_DIR", "RUN_TAG", "IN_RUN_TAG", "SYNTH_RUN_TAG",
@@ -627,7 +627,7 @@ def placeholders(rep, fpga_dir, build_dir, flow_dir=None):
 # it is an ERROR, and the error says which variables could claim it.
 # ---------------------------------------------------------------------------
 
-XDC_VARS = ("XDC_PINS", "XDC_TIMING", "XDC_DRC", "XDC_EXTRA",
+XDC_VARS = ("XDC_PINS", "XDC_CLOCKS", "XDC_TIMING", "XDC_DRC", "XDC_EXTRA",
             "XDC_OPTIONAL", "XDC_POST_ROUTE", "XDC_BASELINE")
 
 

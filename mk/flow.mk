@@ -424,6 +424,12 @@ BD_GLOBAL_SYNTH ?= 0
 # this build is missing, and neither is something to discover after the board
 # does not come up.
 XDC_PINS        ?=
+# Clock DEFINITIONS, read at SYNTHESIS ONLY. Not an exception, so it does not
+# belong in XDC_TIMING's read window - and synthesis needs it, because
+# gated-clock conversion is inert on a net Vivado has not been told is a clock.
+# Implementation takes the same definitions from XDC_TIMING, so this is read
+# once per stage from one file per stage and no clock is defined twice.
+XDC_CLOCKS      ?=
 XDC_TIMING      ?=
 XDC_DRC         ?=
 XDC_EXTRA       ?=
@@ -702,6 +708,7 @@ export FPGA_BD_GLOBAL_SYNTH  = $(BD_GLOBAL_SYNTH)
 
 # -- Constraints --
 export FPGA_XDC_PINS         = $(XDC_PINS)
+export FPGA_XDC_CLOCKS       = $(XDC_CLOCKS)
 export FPGA_XDC_TIMING       = $(XDC_TIMING)
 export FPGA_XDC_DRC          = $(XDC_DRC)
 export FPGA_XDC_EXTRA        = $(XDC_EXTRA)
