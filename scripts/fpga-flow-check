@@ -524,16 +524,54 @@ def bd_tcl_contract(rep, path):
         rep.bad("BD_TCL creates no block design", path, why, "BD_TCL")
 
 
-def placeholders(rep, fpga_dir, build_dir):
+def placeholders(rep, fpga_dir, build_dir, flow_dir=None):
+    """Scan the PROJECT for unfilled markers - and not the toolkit.
+
+    THE TOOLKIT IS NOT THE PROJECT, and when it is vendored as a submodule it
+    sits INSIDE the directory this walks. Its `templates/` carry `<<FILL IN>>`
+    markers by design - that is the whole point of a template - and its docs
+    describe the marker in prose. So without this exclusion the first `make
+    check` after `git submodule add` reports ~37 markers across 12 files, every
+    one of them the toolkit's own, and tells the reader to go and edit them.
+
+    That layout is the one this toolkit's README instructs, so every adopter
+    following the documented path hit it immediately. Found 2026-09-09 on the
+    first real submodule adoption - the sibling-clone layout had hidden it,
+    because there the toolkit is not under FPGA_DIR at all.
+
+    The exclusion is on NESTED REPOSITORIES, not on FPGA_FLOW_DIR. A first
+    attempt excluded only the resolved FPGA_FLOW_DIR and did not work: the
+    toolkit checkout can sit at fpga/fpga-toolkit while FPGA_FLOW_DIR points at
+    a sibling clone, and then the walk descends into a directory that is not the
+    one being excluded. `.git` present is the honest test - it is what actually
+    means "somebody else's files" - and it covers vendored deps too.
+    """
     if not fpga_dir or not os.path.isdir(fpga_dir):
         return
     build_real = os.path.realpath(build_dir) if build_dir else None
+    flow_real = os.path.realpath(flow_dir) if flow_dir else None
+
+    def is_nested_repo(p):
+        # A directory carrying `.git` is a repository of its own, so its
+        # contents are not this project's files. `.git` is a DIRECTORY in a
+        # plain clone and a FILE in a submodule worktree, hence os.path.exists
+        # rather than isdir - testing for the directory alone misses exactly
+        # the submodule case this is here for.
+        return os.path.exists(os.path.join(p, ".git"))
+
     hits = {}
     scanned = skipped = 0
     for root, dirs, files in os.walk(fpga_dir):
-        dirs[:] = [d for d in dirs
-                   if d not in SKIP_DIRS
-                   and os.path.realpath(os.path.join(root, d)) != build_real]
+        keep = []
+        for d in dirs:
+            full = os.path.join(root, d)
+            real = os.path.realpath(full)
+            if d in SKIP_DIRS or real == build_real or real == flow_real:
+                continue
+            if is_nested_repo(full):
+                continue          # another repository: not this project
+            keep.append(d)
+        dirs[:] = keep
         for fn in files:
             path = os.path.join(root, fn)
             if os.path.islink(path):
@@ -1444,7 +1482,7 @@ def run_checks():
 
     # --- what the project actually says --------------------------------------
     check_derived(rep, fpga_dir)
-    placeholders(rep, fpga_dir, build_dir)
+    placeholders(rep, fpga_dir, build_dir, get("FPGA_FLOW_DIR"))
 
     # --- interface drift -----------------------------------------------------
     unknown = sorted(k for k in ARGS.vars
