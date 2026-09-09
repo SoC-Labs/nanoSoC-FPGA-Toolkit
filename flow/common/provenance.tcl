@@ -1270,4 +1270,267 @@ proc prov_gate {stage stem paragraph hard budgets delegated notcovered} {
     return $path
 }
 
+################################################################################
+# 7. THE READERS BLOCK 8 IS MADE OF, AND THE VERDICT THEY FEED
+#
+#   prov_util_number   is this cell a utilisation count?
+#   prov_util_row      one row of a utilisation table
+#   prov_msg_criticals the stage's critical-warning census
+#   prov_msg_verdict   may this run carry the messages the census found?
+#
+# Block 8 is made of numbers read back off disk, and two of those readers were
+# written out longhand in more than one stage script - `util_row` in 4_synth.tcl
+# and 5_impl.tcl, `msg_criticals` in 4_synth.tcl, 5_impl.tcl and 6_bitstream.tcl.
+# That is the same duplication section 5's header describes for the emitters, at
+# the same cost: BOTH copies of `util_row` carried the same defect, and neither
+# reader can be fixed in a way the other stage inherits. So they live here,
+# beside the field they feed. 4_synth.tcl and 5_impl.tcl now read through these;
+# 6_bitstream.tcl still carries its own `msg_criticals` and its own copy of the
+# gate chain, and is the one place the defect below is still live.
+#
+# THE DEFECT, with the numbers. `util_row` tested the used column with
+# `string is integer -strict`, and a 7-series utilisation report counts block RAM
+# in HALF tiles:
+#
+#   | Block RAM Tile | 32.5 |     0 |    140 |  23.21 |
+#
+# `string is integer -strict 32.5` is FALSE, so the row was skipped, the proc
+# returned "" and prov_stage_field wrote `bram unmeasured` - in the synth AND the
+# impl manifest - for a design whose BRAM count the tool had reported perfectly
+# well. That made `ci/assert-stage.sh synth` red on a correct run, and it made
+# EXPECT_BRAM_MAX structurally unarmable: budget_max returns 0 for a value that
+# is not a double, so the budget nobody could compare against never fired.
+#
+# CONTRACT.md rule 2 says `unmeasured` means WE COULD NOT MEASURE. A parser that
+# turns a good number into `unmeasured` is lying in the direction the rule exists
+# to prevent, and it is the worse direction of the two: it spends the token that
+# is supposed to stop a run on a number that was there all along.
+################################################################################
+
+## prov_util_number <string> - true when the string is a utilisation COUNT as
+## Vivado writes one: digits, optionally with a decimal fraction.
+##
+## NOT `string is double`, which also accepts `1e5`, `Inf`, `NaN` and a leading
+## `+`, none of which a utilisation column ever holds, and all of which would
+## sail into `budget_max` and be compared. And not `string is integer` either -
+## that is the defect above. The shape of the field is the check.
+proc prov_util_number {s} {
+    return [regexp {^[0-9]+(?:\.[0-9]+)?$} $s]
+}
+
+## prov_util_row <report> <list of row names> -> the "Used" cell, or "" when no
+## row matched.
+##
+## The name is matched against a LIST of spellings because the tables are
+## architecture dependent - 7-series says "Slice LUTs*", UltraScale says
+## "CLB LUTs" - and a parser that knew only one of them would return `unmeasured`
+## on every other device and call that a measurement. The trailing `*` is part of
+## the name, not a wildcard: `string equal` is exact, deliberately.
+##
+## "" IS THE ONLY FAILURE VALUE, and the caller hands it to prov_stage_field,
+## which spells it `unmeasured`. This proc never returns 0 for a row it could not
+## find: a zero in a utilisation column is indistinguishable from an empty
+## design, and both look like good news.
+proc prov_util_row {file names} {
+    if {![file exists $file] || ![file size $file]} { return "" }
+    set fh [open $file r]
+    set data [read $fh]
+    close $fh
+    foreach line [split $data "\n"] {
+        if {![string match "|*" $line]} { continue }
+        set cells [split $line "|"]
+        if {[llength $cells] < 4} { continue }
+        set name [string trim [lindex $cells 1]]
+        set used [string trim [lindex $cells 2]]
+        foreach want $names {
+            if {[string equal -nocase $name $want] && [prov_util_number $used]} {
+                return $used
+            }
+        }
+    }
+    return ""
+}
+
+
+################################################################################
+# THE CRITICAL-WARNING CENSUS, AND WHY THE TOOL'S OWN COUNTER IS NOT THE ANSWER
+#
+# `get_msg_config -count -severity {CRITICAL WARNING}` does NOT count a stage. It
+# counts the messages issued since the last command that (re)built the in-memory
+# design, because every one of those commands resets Vivado's message counters as
+# it starts. Measured on Vivado 2024.1, xc7z020clg400-1, by planting messages
+# with send_msg_id between commands and reading the counter after each:
+#
+#   plant one                          counter 1
+#   read_xdc (two Constraints 18-6xx)  counter 3
+#   report_drc (one more)              counter 4
+#   opt_design                         counter 1   <- reset, then its own message
+#   plant one                          counter 2
+#   place_design (two of its own)      counter 2   <- reset, then its own two
+#   plant one                          counter 3
+#   route_design (one of its own)      counter 1   <- reset again
+#   report_timing_summary              counter 1   <- reports do NOT reset
+#   write_checkpoint                   counter 1
+#
+# open_checkpoint resets it too (1 -> 0 across a close/open pair).
+#
+# So an impl stage that ends by asking the tool gets the messages issued since
+# route_design began, and NOT the two `Constraints 18-611/18-612` its own
+# read_xdc raised forty minutes earlier. Two failures, in opposite directions,
+# both seen:
+#
+#   * counter 0, log 2  - the gate's own guard is `$cw > 0`, so the whole message
+#     gate was SKIPPED and the run went green with two ungraded critical
+#     warnings. A gate that cannot see the thing it grades is not a lenient
+#     gate, it is an absent one;
+#   * counter 1, log 3  - the shape the KR260 build hit. The counts disagree, so
+#     the id list is declared partial and NO exemption is granted.
+#     `Project 1-1924` (write_hw_platform on a design with no block design)
+#     fires for every PL-only project, so with the default
+#     ALLOW_CRITICAL_WARNINGS=0 such a project was permanently red with no route
+#     to green, whatever it declared in MSG_GATE_ALLOWLIST.
+#
+# WHICH ONE THE GATE BELIEVES. The stage log, for the same reason section 9 of
+# 4_synth.tcl reads its numbers off disk rather than out of the tool: the log is
+# the complete record of what the stage emitted, one line per message, written as
+# each was issued. The counter is kept as a CROSS-CHECK that can only make the
+# gate STRICTER - every message the counter still remembers was printed to the
+# log, so a log carrying FEWER than the counter is not this stage's log, or is
+# truncated, and an allowlist applied to a partial reading would exempt messages
+# nobody saw. That is the property `complete` carries, and it is the one the
+# original count-must-equal-count test was reaching for.
+#
+# THE ANCHOR IS WHAT MAKES A GREP SAFE HERE, and it is not a formality. Vivado
+# writes `CRITICAL WARNING: [<id>] <text>` at the left margin and nothing else in
+# a log does - but an UNANCHORED grep for the same words reports 3 hits in a
+# synth log that emitted NONE, measured on this repository's own fixture runs,
+# because a Vivado log echoes every line of the Tcl it sources with a `# ` prefix
+# and one of the lines it echoes is this proc's own regexp. That is the defect
+# the old "never grep, ask the tool" comment was protecting against; the answer
+# is to grep the one shape the tool guarantees, not to trust a counter that
+# answers a different question.
+################################################################################
+
+## prov_msg_criticals ?<log path>? -> a dict:
+##
+##   total     the number to grade: the log's, or the tool's when the log could
+##             not be read. "" when neither could be had.
+##   log       messages counted in the stage log, "" when it could not be read
+##   tool      get_msg_config's counter, "" when there is no tool
+##   ids       the message ids seen, unique, in first-seen order
+##   complete  1 only when `ids` accounts for every message the tool counted.
+##             AN EXEMPTION REQUIRES THIS. 0 is not "a bit uncertain", it is
+##             "this list is not the whole list".
+##   basis     one line for the manifest saying which evidence produced `total`
+##
+## The log path defaults to FPGA_LOG_FILE, which mk/flow.mk's vivado_stage
+## exports per stage and points at the same file it gives Vivado's own `-log`.
+proc prov_msg_criticals {{log ""}} {
+    set tool ""
+    catch { set tool [get_msg_config -count -severity {CRITICAL WARNING}] }
+    if {![string is integer -strict $tool]} { set tool "" }
+
+    if {$log eq ""} { catch { set log [flow_env FPGA_LOG_FILE] } }
+
+    set ids {} ; set n "" ; set why ""
+    if {$log eq ""} {
+        set why "FPGA_LOG_FILE is not set, so this stage does not know\
+                 which file its own messages went to"
+    } elseif {![file exists $log]} {
+        set why "no file at the recorded log path"
+    } elseif {[catch {open $log r} fh]} {
+        # THE ERROR CODE, NOT THE ERROR MESSAGE. Tcl's message is
+        # `couldn't open "<path>": permission denied`, and this string is a
+        # manifest field - the site-path rule at the top of this file has no
+        # exemption for a diagnostic, and prov_path_value does not rewrite a
+        # value that begins `UNVERIFIED:`, which this one does.
+        set why "the stage log could not be opened ($::errorCode)"
+    } else {
+        set n 0
+        while {[gets $fh line] >= 0} {
+            if {[regexp {^CRITICAL WARNING: \[([^\]]+)\]} $line -> id]} {
+                incr n
+                if {[lsearch -exact $ids $id] < 0} { lappend ids $id }
+            }
+        }
+        close $fh
+    }
+
+    set counter_note "the tool's live counter is reset by open_checkpoint,\
+                      synth_design, opt_design, place_design and route_design, so\
+                      it counts only since the last of those"
+    if {$n eq ""} {
+        # No log, so no ids, so nothing can be exempted - and the number that
+        # survives is a FLOOR, not a total. Both facts go in the manifest.
+        set total    $tool
+        set complete 0
+        set basis    "UNVERIFIED:stage-log-unreadable - $why. The number is the\
+                      tool's counter and is a LOWER BOUND: $counter_note"
+    } elseif {$tool ne "" && $tool > $n} {
+        # The counter remembers messages this log does not carry. The log is not
+        # this stage's, or it was truncated - either way the id list is partial.
+        set total    $tool
+        set complete 0
+        set basis    "$n message(s) in the stage log but the tool counts $tool -\
+                      the log is NOT a complete record of this stage, so the id\
+                      list is partial and grants no exemption"
+    } else {
+        set total    $n
+        set complete 1
+        set said [expr {$tool eq "" ? "no tool counter (no tool)" : "tool counter $tool"}]
+        set basis    "$n message(s) counted in the stage log, $said:\
+                      $counter_note, and every message it still counts is in\
+                      the log"
+    }
+
+    return [dict create total $total log $n tool $tool ids $ids \
+                        complete $complete basis [regsub -all {\s+} $basis { }]]
+}
+
+
+## prov_msg_verdict <allow knob> <ids> <allowlist> <complete> -> a dict:
+##
+##   verdict   allowed | exempt | incomplete | unlisted
+##   unexempt  the ids that are not in the allowlist
+##
+## THE FOUR ANSWERS TO "MAY THIS RUN CARRY THESE CRITICAL WARNINGS?", in one
+## place, because the chain that answers it was written out in three stage
+## scripts and the completeness half of it was wrong in all three. It returns a
+## verdict and NOT a sentence: the stage writes the gate bullet, in its own
+## words, about its own artefacts.
+##
+##   allowed     ALLOW_CRITICAL_WARNINGS=1. Reported, not gated - the project
+##               has said so out loud, in design.mk, where a reviewer sees it.
+##   exempt      every id is allowlisted AND the id list is complete.
+##   incomplete  the id list does not account for every message, so NOTHING can
+##               be exempted from this run - not even an id that is on the list,
+##               because an allowlist applied to a partial reading exempts
+##               messages nobody saw. CONTRACT.md section 7.
+##   unlisted    the list is complete and something on it is not allowlisted.
+##
+## `incomplete` is checked BEFORE `unlisted` deliberately: when both hold, the
+## honest sentence is the one about the evidence, not the one about the ids -
+## the id list a reader would go and allowlist is not known to be the whole list.
+##
+## An EMPTY id list never earns `exempt`. A stage that counted messages and read
+## no ids has nothing to compare against the allowlist, and "no ids to object to"
+## is not the same fact as "every id is allowed".
+proc prov_msg_verdict {allow ids allowlist complete} {
+    set unexempt {}
+    foreach id $ids {
+        if {[lsearch -exact $allowlist $id] < 0} { lappend unexempt $id }
+    }
+    if {$allow} {
+        set v allowed
+    } elseif {$complete && ![llength $unexempt] && [llength $ids]} {
+        set v exempt
+    } elseif {!$complete} {
+        set v incomplete
+    } else {
+        set v unlisted
+    }
+    return [dict create verdict $v unexempt $unexempt]
+}
+
+
 # Copyright (C) 2026, SoC Labs (www.soclabs.org)

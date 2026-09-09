@@ -569,21 +569,13 @@ proc route_status {file} {
     return $out
 }
 
-proc util_row {file names} {
-    if {![file exists $file] || ![file size $file]} { return "" }
-    set fh [open $file r] ; set data [read $fh] ; close $fh
-    foreach line [split $data "\n"] {
-        if {![string match "|*" $line]} { continue }
-        set cells [split $line "|"]
-        if {[llength $cells] < 4} { continue }
-        set name [string trim [lindex $cells 1]]
-        set used [string trim [lindex $cells 2]]
-        foreach want $names {
-            if {[string equal -nocase $name $want] && [string is integer -strict $used]} { return $used }
-        }
-    }
-    return ""
-}
+# ONE ROW OF A UTILISATION TABLE IS READ BY prov_util_row, in provenance.tcl
+# section 7. This file used to carry its own copy of that parser, as 4_synth.tcl
+# did, and both copies tested the used column with `string is integer -strict` -
+# false for `32.5`, which is how a 7-series report counts block RAM. BRAM came
+# out `unmeasured` in the manifest of a design whose BRAM the tool had reported,
+# and budget_max cannot compare a budget against a token, so EXPECT_BRAM_MAX
+# could not fire either. The proc's header carries the measurement.
 
 # report_drc: "Violations found: N" plus a per-rule table whose second column is
 # the severity. The severities are summed separately because they mean different
@@ -617,26 +609,15 @@ proc drc_counts {file} {
     return $out
 }
 
-# THE COUNT FROM THE TOOL, THE IDS FROM THE LOG. See 4_synth.tcl section 9: the
-# counter is authoritative and carries no ids, MSG_GATE_ALLOWLIST is a list of
-# ids, and an allowlist applied to a partial reading would exempt messages nobody
-# saw - so when the two disagree, no exemption is granted.
-proc msg_criticals {} {
-    set count "" ; catch { set count [get_msg_config -count -severity {CRITICAL WARNING}] }
-    set log [flow_env FPGA_LOG_FILE]
-    set ids {} ; set nfound 0
-    if {$log ne "" && [file exists $log]} {
-        set fh [open $log r]
-        while {[gets $fh line] >= 0} {
-            if {[regexp {^CRITICAL WARNING: \[([^\]]+)\]} $line -> id]} {
-                incr nfound
-                if {[lsearch -exact $ids $id] < 0} { lappend ids $id }
-            }
-        }
-        close $fh
-    }
-    return [list $count $ids $nfound]
-}
+# THE CENSUS IS prov_msg_criticals, in provenance.tcl section 7. It grades the
+# STAGE LOG and keeps the tool's counter as a cross-check, and THIS STAGE is the
+# one that measured why: Vivado resets its message counters at opt_design,
+# place_design and route_design as well as at open_checkpoint, so a counter read
+# after route_design has forgotten every message this stage's own read_xdc
+# raised. On the run that found it the counter said 0 and the log carried two
+# `Constraints 18-611/18-612` from a bad set_bus_skew - and because the gate
+# below is guarded by `> 0`, the whole message gate was SKIPPED and the run went
+# green with two critical warnings nobody graded.
 
 step "measurements"
 
@@ -673,11 +654,11 @@ prov_stage_field unrouted_basis $__how
 prov_stage_field routing_errors [expr {[dict exists $RS "nets with routing errors"] ? [dict get $RS "nets with routing errors"] : ""}]
 prov_stage_field logical_nets   [expr {[dict exists $RS "logical nets"] ? [dict get $RS "logical nets"] : ""}]
 
-prov_stage_field lut  [util_row $UTIL_RPT {{Slice LUTs} {Slice LUTs*} {CLB LUTs} {CLB LUTs*}}]
-prov_stage_field ff   [util_row $UTIL_RPT {{Slice Registers} {CLB Registers} {Register as Flip Flop}}]
-prov_stage_field bram [util_row $UTIL_RPT {{Block RAM Tile}}]
-prov_stage_field dsp  [util_row $UTIL_RPT {{DSPs} {DSP48E1} {DSP48E2}}]
-prov_stage_field iob  [util_row $UTIL_RPT {{Bonded IOB}}]
+prov_stage_field lut  [prov_util_row $UTIL_RPT {{Slice LUTs} {Slice LUTs*} {CLB LUTs} {CLB LUTs*}}]
+prov_stage_field ff   [prov_util_row $UTIL_RPT {{Slice Registers} {CLB Registers} {Register as Flip Flop}}]
+prov_stage_field bram [prov_util_row $UTIL_RPT {{Block RAM Tile}}]
+prov_stage_field dsp  [prov_util_row $UTIL_RPT {{DSPs} {DSP48E1} {DSP48E2}}]
+prov_stage_field iob  [prov_util_row $UTIL_RPT {{Bonded IOB}}]
 
 prov_stage_field drc_violations [expr {[dict exists $DRC total]     ? [dict get $DRC total]     : ""}]
 prov_stage_field drc_errors     [expr {[dict exists $DRC errors]    ? [dict get $DRC errors]    : ""}]
@@ -690,9 +671,20 @@ prov_stage_field no_clock_pins [expr {[dict exists $TC no_clock] ? [dict get $TC
 prov_stage_field unconstrained_endpoints \
     [expr {[dict exists $TC unconstrained_internal_endpoints] ? [dict get $TC unconstrained_internal_endpoints] : ""}]
 
-foreach {__cw __ids __nfound} [msg_criticals] break
-prov_stage_field critical_warnings    $__cw
-prov_stage_field critical_warning_ids [expr {[llength $__ids] ? [join $__ids {,}] : "(none)"}]
+# WHAT THE CENSUS FOUND, AND WHAT IT IS. `critical_warnings` is the number this
+# stage EMITTED, read back out of its own log; `critical_warnings_basis` says
+# which evidence produced it and what the tool's live counter said, because the
+# two differ for a structural reason and a reader who sees only one of them
+# cannot tell a quiet stage from a counter that was reset. `__complete` is the
+# one that gates: an allowlist may only be applied to a list that accounts for
+# every message.
+set __msg      [prov_msg_criticals]
+set __ids      [dict get $__msg ids]
+set __complete [dict get $__msg complete]
+prov_stage_field critical_warnings       [dict get $__msg total]
+prov_stage_field critical_warnings_basis [dict get $__msg basis]
+prov_stage_field critical_warning_ids    [expr {[llength $__ids] ? [join $__ids {,}] : "(none)"}]
+set __cw [prov_stage_get critical_warnings]
 set __er "" ; catch { set __er [get_msg_config -count -severity {ERROR}] }
 prov_stage_field errors $__er
 unset -nocomplain __er
@@ -787,22 +779,50 @@ budget_max bram [prov_stage_get bram] $EXPECT_BRAM_MAX $__from
 budget_max dsp  [prov_stage_get dsp]  $EXPECT_DSP_MAX  $__from
 unset __from
 
+# THE MESSAGE GATE. An exemption requires BOTH that every id seen is in
+# MSG_GATE_ALLOWLIST and that the id list is COMPLETE - an allowlist applied to a
+# partial reading of the log would exempt messages nobody saw.
+# MSG_GATE_ALLOWLIST defaults EMPTY (CONTRACT.md section 7).
+#
+# COMPLETENESS IS NOT "THE TWO COUNTS ARE EQUAL", which is what this test used to
+# be. The counter is reset by the very commands this stage is made of, so on any
+# impl run that emitted a message before route_design the two counts disagree and
+# the equality test refused the exemption - `Project 1-1924` from
+# write_hw_platform fires for EVERY design with no block design, so with the
+# default ALLOW_CRITICAL_WARNINGS=0 such a project was permanently red with no
+# route to green, whatever it declared. `complete` is the property the equality
+# test was reaching for: the log was read and carries at least what the tool
+# still counts, so the ids account for every message.
 if {[prov_stage_measured critical_warnings] && $__cw > 0} {
-    set __unexempt {}
-    foreach id $__ids {
-        if {[lsearch -exact $MSG_GATE_ALLOWLIST $id] < 0} { lappend __unexempt $id }
+    set __v [prov_msg_verdict $ALLOW_CRITICAL_WARNINGS $__ids \
+                              $MSG_GATE_ALLOWLIST $__complete]
+    switch -exact -- [dict get $__v verdict] {
+        allowed {
+            lappend OWNED "$__cw critical warning(s), owner=ALLOW_CRITICAL_WARNINGS=1 in\
+                           design.mk: reported, not gated. ids: [join $__ids {, }]"
+        }
+        exempt {
+            lappend OWNED "$__cw critical warning(s), owner=MSG_GATE_ALLOWLIST: every id\
+                           is allowlisted with a diagnosis in design.mk. ids: [join $__ids {, }]"
+        }
+        incomplete {
+            lappend BUDGETS "critical_warnings $__cw > budget 0 (ALLOW_CRITICAL_WARNINGS=0,\
+                             and NO exemption can be granted from this run, whatever\
+                             MSG_GATE_ALLOWLIST declares, because the id list does not\
+                             account for every message: [prov_stage_get critical_warnings_basis])"
+        }
+        default {
+            # The guard on an EMPTY unexempt list is not dead code being polite:
+            # `unlisted` with nothing unexempt would mean the census counted
+            # messages and read no ids, and a bullet ending in a bare colon is
+            # how that would reach a reader.
+            set __ux [dict get $__v unexempt]
+            lappend BUDGETS "critical_warnings $__cw > budget 0 (ALLOW_CRITICAL_WARNINGS=0;\
+                             ids not allowlisted: [expr {[llength $__ux] ? [join $__ux {, }] : {none readable in the stage log}}])"
+            unset __ux
+        }
     }
-    if {$ALLOW_CRITICAL_WARNINGS} {
-        lappend OWNED "$__cw critical warning(s), owner=ALLOW_CRITICAL_WARNINGS=1 in\
-                       design.mk: reported, not gated. ids: [join $__ids {, }]"
-    } elseif {$__nfound == $__cw && ![llength $__unexempt] && [llength $__ids]} {
-        lappend OWNED "$__cw critical warning(s), owner=MSG_GATE_ALLOWLIST: every id\
-                       is allowlisted with a diagnosis in design.mk. ids: [join $__ids {, }]"
-    } else {
-        lappend BUDGETS "critical_warnings $__cw > budget 0 (ALLOW_CRITICAL_WARNINGS=0;\
-                         ids not allowlisted: [expr {[llength $__unexempt] ? [join $__unexempt {, }] : {none readable in the stage log}}])"
-    }
-    unset __unexempt
+    unset __v
 }
 
 # --- delegated -------------------------------------------------------------
