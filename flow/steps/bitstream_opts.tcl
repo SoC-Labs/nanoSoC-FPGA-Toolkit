@@ -144,10 +144,21 @@ unset -nocomplain __cfgbvs __cfgvolt
 #
 # RATIFIED 2026-09-09 by the project owner, on the first design to reach this
 # stage, and recorded here because it is now a CHOICE rather than a default.
-# It DIVERGES from that design's own shipping bitstream, which carries Vivado's
-# inherited `Pullup` - inherited, not selected; nobody had made the decision
-# before it was put in front of them. So a bitstream built by this flow will
-# differ from the one in production on every unused pin, deliberately.
+#
+# CORRECTED THE SAME DAY: the ratification was put to the owner as "Pullnone
+# instead of the shipping build's Pullup". **The shipping build does not use
+# Pullup. It uses Pulldown** - Vivado's own default, set by no property at all.
+# Measured from the shipping routed checkpoint, writing the bitstream four ways
+# in one session and diffing the payloads: nothing-set and explicit `Pulldown`
+# both give 0 differing bytes; `Pullup` gives 598; `Pullnone` gives 307. The
+# earlier claim came from a parity harness that had forced `Pullup` to match a
+# figure, and the forced value was then mistaken for the shipped one.
+#
+# So the real divergence this default creates is **Pullnone against Pulldown**,
+# and the fact worth stating plainly is that THE SHIPPING KR260 BITSTREAM PULLS
+# EVERY UNUSED PL PIN DOWN. A project that wants to keep that behaviour sets
+# `BITSTREAM_UNUSEDPIN Pulldown` here and says why. Either way the choice is now
+# made from the measured baseline rather than an assumed one.
 #
 # The consequence is electrical and not visible in any report this flow writes,
 # which is exactly why it is a knob with a paragraph rather than a line of code.

@@ -204,6 +204,28 @@ XDC_POST_ROUTE  ?=                    # `source`d AFTER route_design, NOT
                                       # Tcl in an XDC; a DRC waiver needs it.
 ```
 
+**A CLOCK DEFINITION IS NOT AN EXCEPTION, AND THE READ WINDOW COSTS SOMETHING.**
+Added 2026-09-09. The rule below withholds `XDC_TIMING` from synthesis because an
+*exception* read at synthesis changes what synthesis builds. Clock
+**definitions** are not exceptions — and in every project shipped so far they
+live in the same file, so synthesis does not see them either.
+
+That is not free. `synth_design -gated_clock_conversion auto` converts an RTL
+clock gate into a clock enable **only on a net Vivado knows is a clock**, so with
+the definitions withheld it converts nothing — silently, with no warning and a
+byte-identical netlist. Measured on xc7z020: with `create_clock`, `auto` removes
+the LUT from the clock path, adds a BUFG and drives the flops' CE; without it,
+nothing changes. The first real design has 1 of 7 clock definitions in its
+synthesis-visible constraints and 6 implementation-only.
+
+`flow/steps/synth_setup.tcl` therefore **refuses** when conversion is enabled and
+any clock definition is implementation-only, rather than letting the knob lie.
+The fix is to give synthesis the definitions — a synthesis-visible constraint
+file holding `create_clock`/`create_generated_clock` and nothing else. **This
+generalises beyond clock gating:** any synthesis decision that depends on knowing
+what a clock is inherits the same blindness, so a project keeping all its clock
+definitions implementation-only should expect more than one such surprise.
+
 **THE ENGINE SETS THE READ WINDOW, FROM THE VARIABLE THAT NAMED THE FILE.**
 Settled 2026-09-08. `XDC_PINS` gets `USED_IN_SYNTHESIS true` and
 `USED_IN_IMPLEMENTATION true`; `XDC_TIMING` and `XDC_DRC` get

@@ -147,25 +147,132 @@ if {$SYNTH_BUFG > 0} {
 ################################################################################
 # 4. CLOCK GATING
 #
-# `-gated_clock_conversion` is OFF by default, and off is the wrong default for
-# any design that describes clock gating in RTL. With it off, a gate written as
-# `assign gclk = clk & en;` becomes exactly that: a LUT in the clock path, driven
-# onto local routing, with no global buffer and no skew control. Vivado infers no
-# enable, warns about no such thing, and routes it.
+# THE DEFAULT IS `auto`, SET DELIBERATELY 2026-09-09, because this toolkit's
+# designs are built from Arm IP that was written for ASIC and therefore
+# describes clock gating in RTL. Off is the wrong default for such a design:
+# a gate written as `assign gclk = clk & en;` becomes exactly that on an FPGA -
+# a LUT in the clock path, on local routing, with no global buffer and no skew
+# control. Vivado infers no enable, warns about no such thing, and routes it.
 #
-# `auto` converts an inferred gate into a clock ENABLE on the flops it feeds, or
-# onto a BUFGCE where that is better. `on` forces the conversion. The reason the
-# default here is still `off` is that turning it on CHANGES THE NETLIST - the
-# enable moves from the clock into the datapath - and that is an experiment to
-# run deliberately, with the ICG census in front of you, not a default somebody
-# inherits. The census is the point: on a prototyping build of this codebase
-# 3,007 clock-gating cells gated 86.6% of the flops, and no conversion setting is
-# a small change at that scale.
+# THE THREE SETTINGS, from UG901's GATED_CLOCK page - and the distinction
+# between the last two is the one that matters here:
+#
+#   off   no conversion. The gate stays in the clock path.
+#   on    convert, but ONLY where the RTL carries a `(* GATED_CLOCK = "TRUE" *)`
+#         attribute on the gated signal.
+#   auto  convert, detecting the gating pattern WITHOUT any attribute.
+#
+# `on` is the trap. ASIC-derived IP does not carry Xilinx synthesis attributes -
+# there is no reason it would - so `on` looks like the strong setting and
+# silently converts NOTHING, while reporting no error. `auto` is the setting
+# that acts on IP you did not write. If you own the RTL and want per-signal
+# control, annotate and use `on`; otherwise `auto` is the honest default.
+#
+# WHAT IT COSTS, AND WHY THIS IS STILL A KNOB. Conversion CHANGES THE NETLIST:
+# the enable moves out of the clock and into the datapath, as a CE on the flops
+# or onto a BUFGCE where that is better. That is not a small change at this
+# codebase's scale - a prototyping build censused 3,007 clock-gating cells
+# gating 86.6% of the flops. Two consequences a project should expect rather
+# than discover:
+#
+#   - BUFGCE PRESSURE. A device has a bounded number of global buffers and a
+#     bounded number of clock tracks per region. This lab has already lost time
+#     to exactly this: a MegaSoC HAPS build put 104 ICGs onto BUFGCEs against 24
+#     clock tracks per region, and the resulting failure was misread as a hold
+#     problem for long enough to earn a waiver that hid a Removal check. If a
+#     build starts failing placement or clock routing after this default
+#     changed, look here first.
+#   - EQUIVALENCE. The post-synthesis netlist no longer matches the ASIC one
+#     structurally, which matters if anyone is comparing the two.
+#
+# Set `off` to get the old behaviour back, and record why in the manifest.
 ################################################################################
 
-opt SYNTH_GATED_CLOCK_CONVERSION  off   ;# off | on | auto. `off` leaves an RTL clock gate as a LUT in the clock path
+opt SYNTH_GATED_CLOCK_CONVERSION  auto   ;# auto | on | off. `on` needs a GATED_CLOCK attribute and does nothing without one
 
 lappend SYNTH_ARGS -gated_clock_conversion $SYNTH_GATED_CLOCK_CONVERSION
+
+################################################################################
+# 4a. THE CONVERSION IS INERT WITHOUT CLOCKS, AND SAYS NOTHING ABOUT IT
+#
+# MEASURED 2026-09-09 on xc7z020, one RTL gate (`assign gclk = clk & en;`)
+# feeding 16 flops, synthesised twice:
+#
+#   -gated_clock_conversion   create_clock?   BUFG   LUT in clock path   flop CE
+#   off                       yes             0      1                   <const1>
+#   auto                      yes             1      0                   en_IBUF
+#   auto                      NO              0      1                   (no conversion)
+#
+# With the clock constrained, `auto` does exactly what it promises: the LUT
+# leaves the clock path, a global buffer appears, and the enable lands on the
+# flops. WITHOUT a `create_clock` reaching synthesis it does NOTHING - and it
+# does nothing SILENTLY. No error, no warning, a byte-identical netlist. Vivado
+# cannot recognise a gating pattern on a net it has not been told is a clock.
+#
+# That is a problem for THIS toolkit specifically, because CONTRACT section 3.3
+# reads XDC_TIMING at IMPLEMENTATION ONLY - deliberately, since an exception
+# read at synthesis changes what synthesis builds. Clock DEFINITIONS are not
+# exceptions, but they live in the same file in every project shipped so far.
+# The first real design measured: 1 of its 7 clock definitions in the
+# synthesis-visible XDC, 6 in the implementation-only one. So the default this
+# stage now sets would have converted almost nothing while reporting success.
+#
+# A silent no-op is the exact failure this repository exists to prevent, so the
+# stage REFUSES rather than proceeding. It cannot make the conversion work - the
+# fix is to give synthesis the clock definitions - but it can make the flow
+# incapable of quietly not doing what its knob says.
+################################################################################
+
+opt SYNTH_GATED_CLOCK_REQUIRE_CLOCKS  1   ;# 1 = refuse when conversion is on but clocks are invisible to synthesis
+
+## _synth_count_clocks <file-list>
+## create_clock / create_generated_clock statements at the start of a line,
+## comments ignored. A static file scan, deliberately: it needs no design open,
+## so it can refuse BEFORE synth_design has been called and a licence spent.
+proc _synth_count_clocks {files} {
+    set n 0
+    foreach f $files {
+        if {$f eq "" || ![file readable $f]} { continue }
+        set fh [open $f r]; set txt [read $fh]; close $fh
+        foreach line [split $txt "\n"] {
+            set line [string trim $line]
+            if {[string index $line 0] eq "#"} { continue }
+            if {[regexp {^create_(generated_)?clock\M} $line]} { incr n }
+        }
+    }
+    return $n
+}
+
+if {$SYNTH_GATED_CLOCK_CONVERSION ne "off"} {
+    set _gc_synth_xdc [list [flow_env FPGA_XDC_PINS]]
+    set _gc_impl_xdc  [concat [split [flow_env FPGA_XDC_TIMING] " "] \
+                              [split [flow_env FPGA_XDC_EXTRA] " "]]
+    set _gc_seen   [_synth_count_clocks $_gc_synth_xdc]
+    set _gc_unseen [_synth_count_clocks $_gc_impl_xdc]
+
+    say "gated-clock: conversion=$SYNTH_GATED_CLOCK_CONVERSION, clock definitions visible to synthesis: $_gc_seen, defined implementation-only: $_gc_unseen"
+
+    if {$_gc_unseen > 0} {
+        set _m "SYNTH_GATED_CLOCK_CONVERSION is '$SYNTH_GATED_CLOCK_CONVERSION' but $_gc_unseen clock definition(s) are in implementation-only constraints.\n"
+        append _m "  Vivado converts a gated clock only on a net it knows is a clock, so those\n"
+        append _m "  $_gc_unseen clock(s) will NOT be converted - silently, with no warning and a\n"
+        append _m "  netlist identical to conversion being off. Measured, see this file's section 4a.\n"
+        append _m "  Visible to synthesis now: $_gc_seen.\n"
+        append _m "  Three ways forward:\n"
+        append _m "    1. Put the clock DEFINITIONS in a synthesis-visible constraint file.\n"
+        append _m "       Definitions are not exceptions; only exceptions need withholding.\n"
+        append _m "    2. Set SYNTH_GATED_CLOCK_CONVERSION=off and say so in the manifest, if\n"
+        append _m "       leaving RTL gates as LUTs in the clock path is the intent.\n"
+        append _m "    3. Set SYNTH_GATED_CLOCK_REQUIRE_CLOCKS=0 to proceed anyway - the\n"
+        append _m "       conversion will still be partial, but the run will record that it was\n"
+        append _m "       known to be."
+        if {$SYNTH_GATED_CLOCK_REQUIRE_CLOCKS} {
+            die $_m
+        } else {
+            warn $_m
+        }
+    }
+}
 
 
 ################################################################################
