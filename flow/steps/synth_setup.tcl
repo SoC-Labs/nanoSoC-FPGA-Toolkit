@@ -225,52 +225,78 @@ lappend SYNTH_ARGS -gated_clock_conversion $SYNTH_GATED_CLOCK_CONVERSION
 
 opt SYNTH_GATED_CLOCK_REQUIRE_CLOCKS  1   ;# 1 = refuse when conversion is on but clocks are invisible to synthesis
 
-## _synth_count_clocks <file-list>
-## create_clock / create_generated_clock statements at the start of a line,
-## comments ignored. A static file scan, deliberately: it needs no design open,
-## so it can refuse BEFORE synth_design has been called and a licence spent.
-proc _synth_count_clocks {files} {
-    set n 0
+## _synth_clock_names <file-list>
+## The `-name` of every create_clock / create_generated_clock, plus a count of
+## any that carry no -name. A static file scan, deliberately: it needs no design
+## open, so the stage can refuse BEFORE synth_design has spent a licence.
+proc _synth_clock_names {files} {
+    set names {} ; set unnamed 0
     foreach f $files {
         if {$f eq "" || ![file readable $f]} { continue }
         set fh [open $f r]; set txt [read $fh]; close $fh
+        # Join continuations first: a definition's -name is regularly on the
+        # next physical line, and a scan that missed those would under-report
+        # exactly the multi-line definitions this design uses most.
+        regsub -all {\\[ \t]*\n} $txt " " txt
         foreach line [split $txt "\n"] {
             set line [string trim $line]
             if {[string index $line 0] eq "#"} { continue }
-            if {[regexp {^create_(generated_)?clock\M} $line]} { incr n }
+            if {![regexp {^create_(generated_)?clock\M} $line]} { continue }
+            # `--` because the pattern STARTS with a dash and regexp would
+            # otherwise read `-name...` as one of its own options.
+            if {[regexp -- {-name[ \t]+\{?([^ \t\}]+)} $line -> n]} {
+                lappend names $n
+            } else {
+                incr unnamed
+            }
         }
     }
-    return $n
+    return [list [lsort -unique $names] $unnamed]
 }
 
 if {$SYNTH_GATED_CLOCK_CONVERSION ne "off"} {
-    set _gc_synth_xdc [list [flow_env FPGA_XDC_PINS]]
+    set _gc_synth_xdc [concat [split [flow_env FPGA_XDC_PINS] " "] \
+                              [split [flow_env FPGA_XDC_CLOCKS] " "]]
     set _gc_impl_xdc  [concat [split [flow_env FPGA_XDC_TIMING] " "] \
                               [split [flow_env FPGA_XDC_EXTRA] " "]]
-    set _gc_seen   [_synth_count_clocks $_gc_synth_xdc]
-    set _gc_unseen [_synth_count_clocks $_gc_impl_xdc]
+    foreach {_gc_seen_n   _gc_seen_u}   [_synth_clock_names $_gc_synth_xdc] break
+    foreach {_gc_impl_n   _gc_impl_u}   [_synth_clock_names $_gc_impl_xdc]  break
 
-    say "gated-clock: conversion=$SYNTH_GATED_CLOCK_CONVERSION, clock definitions visible to synthesis: $_gc_seen, defined implementation-only: $_gc_unseen"
+    # THE COMPARISON IS BY NAME, NOT BY COUNT, and the difference is the whole
+    # correctness of this check. XDC_TIMING keeps its definitions - XDC_CLOCKS
+    # is EXTRACTED from it, so the same clocks are in both by construction. A
+    # count test therefore refuses a project that has already done the right
+    # thing, which is exactly what the first real run after XDC_CLOCKS landed
+    # did: 6 supplied, 6 still reported missing.
+    set _gc_missing {}
+    foreach n $_gc_impl_n {
+        if {[lsearch -exact $_gc_seen_n $n] < 0} { lappend _gc_missing $n }
+    }
 
-    if {$_gc_unseen > 0} {
-        set _m "SYNTH_GATED_CLOCK_CONVERSION is '$SYNTH_GATED_CLOCK_CONVERSION' but $_gc_unseen clock definition(s) are in implementation-only constraints.\n"
-        append _m "  Vivado converts a gated clock only on a net it knows is a clock, so those\n"
-        append _m "  $_gc_unseen clock(s) will NOT be converted - silently, with no warning and a\n"
-        append _m "  netlist identical to conversion being off. Measured, see this file's section 4a.\n"
-        append _m "  Visible to synthesis now: $_gc_seen.\n"
+    say "gated-clock: conversion=$SYNTH_GATED_CLOCK_CONVERSION, clocks visible to\
+         synthesis: [llength $_gc_seen_n] ([join $_gc_seen_n {, }]); defined only for\
+         implementation: [llength $_gc_missing]"
+
+    if {[llength $_gc_missing] || $_gc_impl_u > $_gc_seen_u} {
+        set _what [expr {[llength $_gc_missing]
+                         ? "[llength $_gc_missing] clock(s) - [join $_gc_missing {, }]"
+                         : "[expr {$_gc_impl_u - $_gc_seen_u}] unnamed clock definition(s)"}]
+        set _m "SYNTH_GATED_CLOCK_CONVERSION is '$SYNTH_GATED_CLOCK_CONVERSION' but $_what\
+                are defined only in implementation-only constraints.\n"
+        append _m "  Vivado converts a gated clock only on a net it knows is a clock, so\n"
+        append _m "  those will NOT be converted - silently, with no warning and a netlist\n"
+        append _m "  identical to conversion being off. Measured, see this file's section 4a.\n"
         append _m "  Three ways forward:\n"
-        append _m "    1. Put the clock DEFINITIONS in a synthesis-visible constraint file.\n"
-        append _m "       Definitions are not exceptions; only exceptions need withholding.\n"
-        append _m "    2. Set SYNTH_GATED_CLOCK_CONVERSION=off and say so in the manifest, if\n"
-        append _m "       leaving RTL gates as LUTs in the clock path is the intent.\n"
+        append _m "    1. Name a synthesis-visible clock file in XDC_CLOCKS. It is read at\n"
+        append _m "       synthesis and marked USED_IN_IMPLEMENTATION false, so\n"
+        append _m "       implementation still takes these from XDC_TIMING and no clock is\n"
+        append _m "       defined twice. Definitions are not exceptions.\n"
+        append _m "    2. Set SYNTH_GATED_CLOCK_CONVERSION=off and say so in the manifest,\n"
+        append _m "       if leaving RTL gates as LUTs in the clock path is the intent.\n"
         append _m "    3. Set SYNTH_GATED_CLOCK_REQUIRE_CLOCKS=0 to proceed anyway - the\n"
-        append _m "       conversion will still be partial, but the run will record that it was\n"
-        append _m "       known to be."
-        if {$SYNTH_GATED_CLOCK_REQUIRE_CLOCKS} {
-            die $_m
-        } else {
-            warn $_m
-        }
+        append _m "       conversion will still be partial, but the run will record that it\n"
+        append _m "       was known to be."
+        if {$SYNTH_GATED_CLOCK_REQUIRE_CLOCKS} { die $_m } else { warn $_m }
     }
 }
 
