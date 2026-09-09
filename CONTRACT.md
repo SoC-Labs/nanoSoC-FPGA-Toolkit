@@ -662,13 +662,19 @@ These were measured on 2026-09-08 and are not negotiable design inputs.
    Hence `BIN_STYLE` is a required board-pack key.
 6. **`doctor` reports what is on the FILESYSTEM, never what a modulefile
    claims — and it must search where the modulefiles point, not a hardcoded
-   root.** Corrected 2026-09-08: this clause used to assert that only 2021.1 and
-   2024.1 were installed. That was wrong, and wrong in an instructive way — it
-   was written by looking only in `/apps/Xilinx/Vivado`, while 2025.2 and 2026.1
-   live under `/research/CAD/Xilinx/Vivado`. `fpga-flow-doctor` derives its
-   search roots from the modulefiles and had all four right the whole time; the
-   contract was the thing that had guessed. Do not re-introduce a hardcoded
-   vendor root here or anywhere else.
+   root.** Corrected 2026-09-08: this clause used to name the two Vivado
+   versions it believed were installed. That was wrong, and wrong in an
+   instructive way — it had been written by looking in ONE vendor root while
+   the other two versions lived under a second one. `fpga-flow-doctor` derives
+   its search roots from the site's modulefiles and had all four right the whole
+   time; the contract was the thing that had guessed.
+
+   The literal paths that used to be in this paragraph have been removed, and
+   that removal is the rule restating itself: this repository's own vendor
+   scanner flagged them on the first run before publication. An absolute path
+   into a vendor install is a site fact — wrong on every other machine, and a
+   statement about what this site holds. Do not re-introduce one here or
+   anywhere else, including in prose that is warning against them.
 7. **fpgahub's board-group and target namespaces do not overlap.** Leases,
    queues and reservations address the board group; program, reset and actions
    address a target. Conflating them returns 404.

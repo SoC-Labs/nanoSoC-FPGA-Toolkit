@@ -141,6 +141,19 @@ unset -nocomplain __cfgbvs __cfgvolt
 # and because an input that needs a defined level should get it from the board
 # or from an explicit constraint, where it is visible. A project that wants the
 # pull-up sets the knob, and the value lands in the manifest.
+#
+# RATIFIED 2026-09-09 by the project owner, on the first design to reach this
+# stage, and recorded here because it is now a CHOICE rather than a default.
+# It DIVERGES from that design's own shipping bitstream, which carries Vivado's
+# inherited `Pullup` - inherited, not selected; nobody had made the decision
+# before it was put in front of them. So a bitstream built by this flow will
+# differ from the one in production on every unused pin, deliberately.
+#
+# The consequence is electrical and not visible in any report this flow writes,
+# which is exactly why it is a knob with a paragraph rather than a line of code.
+# Anything comparing a toolkit-built bitstream against the shipping one must
+# account for it, and any first load onto a board should be treated as a change
+# to the board's unused-pin behaviour, not as a like-for-like replacement.
 ################################################################################
 
 opt BITSTREAM_UNUSEDPIN  Pullnone   ;# Pullnone | Pullup | Pulldown. Vivado's own default is Pullup
