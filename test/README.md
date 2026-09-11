@@ -138,6 +138,35 @@ then get the answer wrong, calling a real extension point unrecognised. That is
 the failure this repository's third rule was written from, reproduced with the
 same numbers.
 
+### `t_init.sh` — the scaffolder, and the round trip through `make check`
+
+A scaffolder is trusted absolutely by the person running it, because they have
+nothing yet to compare its output against, so everything it gets wrong reads as
+a fact about *their* project. The central assertion is **not** that `make check`
+is clean on a fresh scaffold — it is deliberately not, and that refusal is the
+feature. It is that `make check` names **exactly** the decisions the scaffolder
+left open and nothing else. Fewer is worse than more: a decision that stops
+being reported is a value nobody chose, in a build that runs.
+
+The open set is measured, not assumed, and the suite also proves the refusal is
+**clearable** — fill in what the check names and it says `Contract complete.`,
+with no warnings. Also covered: every claimed `write` is on disk and non-empty
+and the tally agrees; every file under `templates/` is accounted for, each at
+its own path; the generated `Makefile` matches `CONTRACT.md` §2's fenced block
+*read out of the contract*; `<<FILL IN>>` lands file-for-file where the templates
+put it and `@PART@` is the one placeholder allowed to become one; a re-run keeps
+the project's edits and `--force` is what overrides that; nothing outside
+`fpga/` is touched; a refusal leaves no trace; and the part packs `--help`
+offers are `find part/ -type d`, proved by planting a hardcoded list and then
+adding a pack.
+
+Two `KNOWN-DEFECT` markers come from it, both found by asserting rather than by
+reading: `templates/design.mk.in`'s own instruction line contains a literal
+`<<FILL IN>>`, so a project that has made every real decision still fails
+`make check` until it deletes its own instructions; and `install_one`'s
+empty-output guard uses `refuse` (exit 2, documented as *nothing was written*)
+at the one point in the file that most certainly leaves a half-tree behind.
+
 ---
 
 ## Adding a suite
