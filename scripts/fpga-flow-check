@@ -86,6 +86,33 @@ import traceback
 
 ENV_PREFIX = "FPGACHECK_"
 
+# TRUE WHEN A make RECIPE LAUNCHED THIS PROCESS, and therefore when THIS
+# PROCESS'S ENVIRONMENT IS THE ENVIRONMENT A STAGE WILL GET.
+#
+# That equivalence is the whole reason the XDC_OPTIONAL condition check below
+# can exist, and it holds by construction rather than by arrangement: `check`
+# and `check-quiet` are make recipes (mk/checks.mk), `check-quiet` is a
+# prerequisite of every stage target (mk/flow.mk section 9), and a recipe's
+# environment IS make's export set - the same set `vivado_stage` hands the Tcl
+# layer. One export set, two consumers, no transcription.
+#
+# MAKELEVEL AND NOT A FLAG FROM mk/checks.mk. GNU make puts MAKELEVEL into every
+# recipe environment and nobody maintains it, so it cannot drift. A `--stage-env`
+# flag passed by the caller would be a convention, and the failure mode of a
+# convention somebody drops is that this check quietly stops asserting and
+# reports UNVERIFIED forever - which is the fail-open shape the toolkit exists to
+# stop. The cost of being indirect is one paragraph of comment; the cost of being
+# droppable is a check that goes silent without a word.
+FROM_MAKE = bool(os.environ.get("MAKELEVEL"))
+
+# A condition NAME, as opposed to a condition VALUE. Used only to choose the
+# WORDING of a refusal, never to produce one: `0 := 1` followed by `export 0` is
+# accepted by GNU make and lands in the child environment as `0=1` (measured
+# 2026-09-11), so a name outside this shape is deeply unlikely and not
+# impossible. The environment is the authority; this is the sentence that tells
+# the reader they typed a value where a name goes.
+COND_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 # Directories never walked when scanning the project: outputs, VCS metadata and
 # tool scratch. A run directory can hold hundreds of thousands of files and this
 # script has a sub-second budget.
@@ -658,6 +685,184 @@ def claimed_xdc():
             claimed.setdefault(os.path.realpath(expand(path)), []).append(var)
     return claimed
 
+
+# ---------------------------------------------------------------------------
+# XDC_OPTIONAL: THE CONDITION, WHICH NOTHING USED TO CHECK
+#
+# MEASURED 2026-09-11, and it cost a synthesis run. A project passed
+#
+#     XDC_OPTIONAL="0:<a real, present .xdc>"
+#
+# - a literal `0` where a condition VARIABLE NAME belongs. This script validated
+# the colon and stat()ed the file, printed `ok   XDC_OPTIONAL   0:...`, and the
+# report ended `Contract complete.` flist, package-ip, bd and a FULL SYNTHESIS
+# then ran, and `impl` refused at the constraint step - correctly, by name, and
+# forty minutes too late. mk/checks.mk's own header says what `check` is for:
+# "a stage refuses to start against an incomplete contract instead of failing
+# forty minutes in". A contract that cannot run had been called complete.
+#
+# WHAT THE STAGE ACTUALLY REQUIRES, read out of the stage rather than assumed -
+# flow/vivado/5_impl.tcl:218-247, and flow/common/flow_utils.tcl:232 for
+# `flow_env`:
+#
+#   * the colon must be at index >= 1 (`string first ":"`, then `if {$colon <
+#     1}`), so `:path` - an EMPTY condition - is refused as well as one with no
+#     colon at all. The old check here tested `":" not in entry` and let `:path`
+#     straight through;
+#   * the condition is resolved from THE STAGE'S ENVIRONMENT, under its own name
+#     first and then under FPGA_<name>. Neither present is a `flow_refuse` and
+#     the stage stops - deliberately not a skip, because silently dropping a
+#     constraint file and silently including one are both guesses, and either
+#     leaves a design constrained differently from the one anybody reviewed;
+#   * `flow_env` returns its default for a variable that is absent OR set to
+#     whitespace, so `export COND` with no value refuses exactly as an
+#     unexported one does;
+#   * the value is compared to the literal string "1". Anything else - `0`,
+#     `true`, `yes`, or `1` with a space around it - means NOT READ, and the
+#     stage logs that and carries on.
+#
+# WHY THE ENVIRONMENT AND NOT $(COND). mk/flow.mk exports the FPGA_* set it
+# defines and NOTHING ELSE (its section 6), so a project's own USE_<FEATURE>
+# reaches a stage only if the project's design.mk says `export`. make knows the
+# value of a variable it has not exported; the stage does not; and that
+# difference IS the property under test. Having make pass $(COND) in as a
+# `--var` would therefore report `ok` on precisely the contract the stage
+# refuses - a second, wronger implementation of the test, which is the failure
+# mk/checks.mk's division of labour exists to avoid.
+#
+# So the condition is read from THIS PROCESS'S OWN ENVIRONMENT, which under make
+# is the stage's environment exactly. See FROM_MAKE at the top of this file for
+# why that equivalence holds, and for what happens when it does not.
+# ---------------------------------------------------------------------------
+
+
+def stage_sees(name):
+    """The value a stage would read for `name`, or None.
+
+    Mirrors `flow_env` (flow/common/flow_utils.tcl:232) rather than
+    approximating it: set-but-whitespace counts as UNSET there, so `export COND`
+    with no value is a refusal and not a false. That near-miss is reachable -
+    `export USE_X` on its own line is a normal thing to write - and a check that
+    called it 0 would disagree with the stage in the quiet direction."""
+    v = os.environ.get(name)
+    if v is not None and v.strip() != "":
+        return v
+    return None
+
+
+def resolve_condition(cond):
+    """(value, the name it came from), or (None, None) - as 5_impl.tcl:230 does.
+
+    The stage spells it `flow_env $cond [flow_env FPGA_$cond "<unset>"]`: the
+    bare name wins, the FPGA_-prefixed spelling is the fallback. The prefix is
+    not decoration - mk/flow.mk exports the whole contract under exactly that
+    shape, so `BD_GLOBAL_SYNTH` is a legitimate condition that resolves through
+    FPGA_BD_GLOBAL_SYNTH without the project exporting anything of its own."""
+    v = stage_sees(cond)
+    if v is not None:
+        return v, cond
+    v = stage_sees("FPGA_" + cond)
+    if v is not None:
+        return v, "FPGA_" + cond
+    return None, None
+
+
+def xdc_optional_conditions(rep, entries):
+    """Report each COND:path by what the STAGE will do with it, not by its shape.
+
+    The three outcomes are deliberately three different statuses. An
+    unresolvable condition is a MISS, because the stage refuses and nothing
+    downstream of `check` can run. A condition whose value is outside {0,1} is a
+    WARN, because the stage RUNS - it just does not read the file, and a
+    constraint file that silently did not load is the defect CONTRACT.md section
+    9.3 is about. Everything resolved is an `ok` that SAYS WHICH FILES ARE LIVE,
+    because "read" and "not read" are the two different designs this variable
+    chooses between and a bare `ok` names neither."""
+    if not FROM_MAKE:
+        # NOT an `ok`. This entry point cannot see the stage's environment, and
+        # an `ok` that cannot see half the property is the defect this function
+        # was written for, one level down. The standalone path asks make for the
+        # contract in a SUBPROCESS (see standalone()), so the project's exports
+        # arrive in that child and never here; a hand-typed `--var` run carries
+        # whatever the user's shell happens to hold, which would be wrong in
+        # both directions. Say which entry point can settle it instead.
+        rep.warn("XDC_OPTIONAL conditions", "%d entr%s NOT VERIFIED"
+                 % (len(entries), "y" if len(entries) == 1 else "ies"),
+                 "Each entry is COND:path and the file is read only when the STAGE\n"
+                 "can see $(COND) in its environment. That environment is make's\n"
+                 "export set, and this run was not started by make - so the\n"
+                 "conditions below were NOT checked and this report says nothing\n"
+                 "about whether the flow can run:\n"
+                 + "\n".join("  %s" % e for e in entries) + "\n"
+                 "Run `make check` in the project: from there this same check is\n"
+                 "exact, because a make recipe's environment IS the stage's.")
+        return
+
+    unresolved, odd, live = [], [], []
+    for entry in entries:
+        cond, _, path = entry.partition(":")
+        val, src = resolve_condition(cond)
+        if val is None:
+            unresolved.append((cond, path))
+            continue
+        live.append("%s=%s %s %s" % (src, val, "READ" if val == "1" else "not read",
+                                     os.path.basename(path)))
+        if val != "1" and val != "0":
+            odd.append((src, val, path))
+
+    if unresolved:
+        # Name the condition AND the file. The stage's own refusal prints both,
+        # and for the same reason: the reader has to decide whether the variant
+        # should be on, and cannot do that from a variable name alone.
+        why = (
+            "The stage resolves each condition from ITS OWN ENVIRONMENT, and\n"
+            "mk/flow.mk exports the FPGA_* set it defines - a project's own\n"
+            "variable is not in it. Not exported is not 'false': flow/vivado/\n"
+            "5_impl.tcl REFUSES, because including the file and skipping it are\n"
+            "both guesses and a constraint file that silently did not load\n"
+            "leaves a design constrained differently from the one anybody\n"
+            "reviewed.\n"
+            "Unresolvable here:\n"
+            + "\n".join("  %s   (%s)" % (c, p) for c, p in unresolved))
+        literal = [c for c, _ in unresolved if not COND_NAME_RE.match(c)]
+        if literal:
+            why += ("\n"
+                    "And %s is not a variable NAME - it reads as the VALUE you\n"
+                    "meant the condition to have. XDC_OPTIONAL is COND:path, never\n"
+                    "VALUE:path. A file that should ALWAYS be read belongs in\n"
+                    "XDC_EXTRA; one that should never be read belongs outside\n"
+                    "TARGET_DIR, not behind a condition that is already false."
+                    % ", ".join("'%s'" % c for c in literal))
+        # THE REMEDY DEPENDS ON WHICH MISTAKE IT IS. Telling somebody who wrote
+        # `0:file` to "add `export 0`" is the stage's own wording, and it is the
+        # one sentence in that refusal that does not help: the fix for a literal
+        # is not to export it, it is to stop putting a value where a name goes.
+        first = unresolved[0][0]
+        if COND_NAME_RE.match(first):
+            fix = ("(add `export %s` to the project's design.mk - assigning it is "
+                   "not enough - or move the file to XDC_EXTRA and make the "
+                   "variant a different target)" % first)
+        else:
+            fix = ("(name an exported condition VARIABLE - `export USE_X := 1`, "
+                   "then XDC_OPTIONAL += USE_X:<file> - or move the file to "
+                   "XDC_EXTRA if it should always be read)")
+        rep.bad("XDC_OPTIONAL condition",
+                "%s   (not in the stage's environment)"
+                % " ".join(c for c, _ in unresolved), why, fix)
+    else:
+        rep.ok("XDC_OPTIONAL", "; ".join(live))
+
+    if odd:
+        rep.warn("XDC_OPTIONAL condition value",
+                 "%s   (neither 0 nor 1)"
+                 % ", ".join("%s=%r" % (s, v) for s, v, _ in odd),
+                 "The stage compares the value to the LITERAL STRING `1`\n"
+                 "(flow/vivado/5_impl.tcl). Every other value means the file is not\n"
+                 "read - including `true`, `yes`, `on`, and `1` with whitespace\n"
+                 "around it, which make preserves in a variable value. The values\n"
+                 "are printed above exactly as the stage will see them.\n"
+                 "These files will NOT be read:\n"
+                 + "\n".join("  %s" % p for _, _, p in odd))
 
 
 def walk_flist(path, _seen=None, _depth=0):
@@ -1325,12 +1530,19 @@ def run_checks():
     if not opt_xdc:
         rep.info("XDC_OPTIONAL", "(none)")
     else:
-        malformed = [e for e in opt_xdc if ":" not in e]
+        # THE COLON MUST BE AT INDEX >= 1, which is the stage's own test
+        # (`if {$colon < 1}`, flow/vivado/5_impl.tcl). The previous spelling here
+        # was `":" not in e`, and that is not the same rule: `:file.xdc` has a
+        # colon, has no condition, and was reported `ok` by this check and
+        # refused by the stage.
+        malformed = [e for e in opt_xdc if e.find(":") < 1]
         if malformed:
             rep.bad("XDC_OPTIONAL", " ".join(malformed),
                     "Every entry is COND:path - the file is read only when $(COND)\n"
-                    "is 1. An entry with no colon has no condition, so it is neither\n"
-                    "conditional nor read.", "XDC_OPTIONAL")
+                    "is 1. An entry with no colon, or with nothing before the colon,\n"
+                    "has no condition, so it is neither conditional nor read. The\n"
+                    "stage refuses these by the same test, one synthesis later.",
+                    "XDC_OPTIONAL")
         else:
             missing = [e for e in opt_xdc if not os.path.exists(e.partition(":")[2])]
             if missing:
@@ -1339,7 +1551,11 @@ def run_checks():
                         "to exist. 'Optional' here means the flow may not read it, not\n"
                         "that it may not be there.", "XDC_OPTIONAL")
             else:
-                rep.ok("XDC_OPTIONAL", ", ".join(e.partition(":")[0] + ":..." for e in opt_xdc))
+                # THE OTHER HALF OF THE ENTRY. Until 2026-09-11 the check stopped
+                # at the colon and the file, so a condition naming nothing the
+                # stage can resolve passed as `ok`. See the block above
+                # xdc_optional_conditions() for the measured case and the cost.
+                xdc_optional_conditions(rep, opt_xdc)
 
     xdc_coverage(rep, target_dir)
 

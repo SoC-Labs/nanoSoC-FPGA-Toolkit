@@ -491,6 +491,14 @@ XDC_EXTRA       ?=
 # A LIST of "COND:path" - included if and only if $(COND) is 1. The condition is
 # a variable NAME, resolved by the Tcl layer at read time, so the manifest can
 # record which conditional constraints were live in this run.
+#
+# THE PROJECT MUST `export` THE CONDITION. The block in section 6 below exports
+# the FPGA_* set THIS FILE defines, and a project's own USE_<FEATURE> is not in
+# it - so `USE_IDELAY := 1` alone reaches make and not the stage, and
+# flow/vivado/5_impl.tcl REFUSES rather than guessing which way an unreadable
+# condition falls. Write `export USE_IDELAY := 1`. `make check` now refuses the
+# same contract before a tool is launched; it used to report it complete, which
+# cost somebody a synthesis run on 2026-09-11.
 XDC_OPTIONAL    ?=
 # `source`d after route_design, NOT read_xdc'd. Vivado REJECTS procedural Tcl in
 # an XDC (section 9.4), and a DRC waiver needs procedural Tcl. Feeding this file

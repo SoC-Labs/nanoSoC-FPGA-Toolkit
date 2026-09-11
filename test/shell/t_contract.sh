@@ -493,4 +493,387 @@ else
     fi
 fi
 
+#=============================================================================
+# 8. XDC_OPTIONAL - THE CONDITION, WHICH `check` USED TO IGNORE ENTIRELY
+#
+# MEASURED 2026-09-11, and it cost a synthesis run. A project passed
+#
+#     XDC_OPTIONAL="0:<a real, present .xdc>"
+#
+# - a literal `0` in the place a condition VARIABLE NAME goes. `make check`
+# validated the colon, stat()ed the file, printed `ok   XDC_OPTIONAL   0:...`
+# and ended with `Contract complete.`; flist, package-ip, bd and a full
+# SYNTHESIS then ran, and `impl` refused at the constraint step. mk/checks.mk's
+# header says in as many words what `check` is for - "a stage refuses to start
+# against an incomplete contract instead of failing forty minutes in" - so a
+# contract that cannot run had been called complete, which is the one verdict
+# this entry point exists to prevent.
+#
+# THE ASSERTIONS BELOW ARE ABOUT AGREEMENT BETWEEN TWO ENTRY POINTS, not about
+# a message. flow/vivado/5_impl.tcl resolves the condition from THE STAGE'S
+# ENVIRONMENT - under its own name, then under FPGA_<name> - and refuses when it
+# is not there, because including a constraint file and skipping it are both
+# guesses. mk/flow.mk exports the FPGA_* set it defines and nothing else, so a
+# project's own condition arrives only if the project's design.mk says `export`.
+# `check` now resolves it the same way, out of its OWN environment, which under
+# make IS the stage's: `check-quiet` is a prerequisite of every stage target and
+# a recipe's environment is make's export set.
+#
+# THE FIXTURE IS A CONTRACT THAT COMPLETES. That is the whole point and it is
+# what the earlier sections' three-line fixture cannot do: a project missing TOP
+# and RTL_FLIST reports `Contract INCOMPLETE` whatever XDC_OPTIONAL says, so
+# every assertion here would pass just as happily against a checker that had
+# stopped looking at the condition altogether. Each case below takes a complete
+# project and changes ONLY the conditional-constraint lines.
+#
+# NOTHING HERE LAUNCHES A TOOL. `make check` is Python over resolved variables.
+#=============================================================================
+t_head "XDC_OPTIONAL: check resolves the condition the way the stage does"
+
+## xdc_fixture <flow dir> <name> <extra design.mk lines> -> prints the project dir
+##
+## A CONTRACT THAT COMPLETES: TOP, RTL_FLIST, XDC_PINS, PART, a board pack and a
+## TARGET_DIR, so `Contract complete.` is reachable and its disappearance means
+## something. The conditional constraint file EXISTS - the existence check sits
+## upstream of the condition check, and a fixture that tripped it would prove
+## the wrong guard.
+##
+## THE PART PACK IS WHATEVER part/ HOLDS, never a name spelled here. CONTRACT.md
+## section 6.2: the directory is the list. A fixture naming one would go red the
+## day a pack is renamed, for a reason with nothing to do with XDC_OPTIONAL.
+xdc_fixture() {
+    # TWO STATEMENTS, NOT ONE `local`. bash expands every word of a `local`
+    # before it assigns any of them, so `d="$SB/xdcproj-$name"` on the same line
+    # reads `name` while it is still unbound - which under `set -u` aborts the
+    # function, leaves the caller with an empty project path, and turns the
+    # assertions below into `make -C ''`. Caught here by the assertions going
+    # red while their mutation proofs stayed green, which is the exact signature
+    # of a proof passing for the wrong reason.
+    local flow="$1" name="$2" extra="$3" d pack
+    d="$SB/xdcproj-$name"
+    pack="$(find "$flow/part" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
+            | sed 's|.*/||' | LC_ALL=C sort | head -1)"
+    [ -n "$pack" ] || { echo "xdc_fixture: no part pack in $flow/part" >&2; return 2; }
+    t_in_sandbox "$d" || { echo "xdc_fixture: refusing to scaffold outside a sandbox" >&2; return 2; }
+    mkdir -p "$d/board" "$d/rtl" "$d/targets/demo_board" || return 2
+    printf 'FPGA_DIR := $(CURDIR)\ninclude $(FPGA_DIR)/design.mk\n' > "$d/Makefile"
+    {
+        printf 'FPGA_FLOW_DIR := %s\n' "$flow"
+        printf 'BLOCK := demo_block\n'
+        printf 'BOARD := demo_board\n'
+        printf 'BOARD_DIR := $(FPGA_DIR)/board\n'
+        printf 'PART := %s\n' "$pack"
+        printf 'TOP := demo_block\n'
+        printf 'RTL_FLIST := $(FPGA_DIR)/rtl/demo.flist\n'
+        printf 'XDC_PINS := $(FPGA_DIR)/pins.xdc\n'
+        printf '%s\n' "$extra"
+        printf 'include %s/mk/flow.mk\n' "$flow"
+    } > "$d/design.mk"
+    printf '# a board pack that names nothing real\n' > "$d/board/board.tcl"
+    printf 'module demo_block;\nendmodule\n' > "$d/rtl/demo.v"
+    printf '%s\n' "$d/rtl/demo.v" > "$d/rtl/demo.flist"
+    # XDC_PINS must carry a real constraint: a comment-only file is a WARN, and
+    # a warning in the output is not what these assertions are reading.
+    printf 'set_property PACKAGE_PIN A1 [get_ports sys_clk]\n' > "$d/pins.xdc"
+    printf '# the conditional constraint file EXISTS - the CONDITION is under test\n' \
+        > "$d/opt.xdc"
+    printf '%s' "$d"
+}
+
+## xdc_check <project> - what `make check` PRINTS.
+##
+## The exit status is deliberately dropped here and every caller asserts on
+## CONTENT. `check` exits 1 for any incomplete contract, so a proof that read
+## the status would pass against a checker that had stopped looking at
+## XDC_OPTIONAL and was merely tripping over something else - which is exactly
+## how the defect under test survived: the status was right and the report was
+## wrong.
+xdc_check() { make -C "$1" --no-print-directory check 2>&1; }
+
+## xdc_completes <project> - the report says `Contract complete.`
+xdc_completes() {
+    local out; out="$(xdc_check "$1")"
+    printf '%s\n' "$out" | grep -qF 'Contract complete.' && return 0
+    printf 'the fixture was supposed to COMPLETE and did not:\n%s\n' \
+        "$(printf '%s\n' "$out" | grep -E '^ MISS |^ WARN |required input')"
+    return 1
+}
+
+## xdc_refuses <project> <regex> - `Contract complete.` is ABSENT, and the report
+## carries that message.
+##
+## BOTH HALVES. Absence alone would be satisfied by any unrelated breakage, and
+## the message alone would not show that the verdict changed - and the verdict
+## is the defect: `check` said complete on a contract `impl` refuses.
+xdc_refuses() {
+    local proj="$1" re="$2" out
+    out="$(xdc_check "$proj")"
+    if printf '%s\n' "$out" | grep -qF 'Contract complete.'; then
+        printf 'make check reported "Contract complete." on a contract the impl stage\n'
+        printf 'refuses - which is the defect this section exists for:\n%s\n' \
+            "$(printf '%s\n' "$out" | grep -E 'XDC_OPTIONAL|Contract complete')"
+        return 1
+    fi
+    printf '%s\n' "$out" | grep -qE -- "$re" && return 0
+    printf 'make check refused, but NOT with /%s/ - this assertion was about to\n' "$re"
+    printf 'pass on an unrelated refusal:\n%s\n' \
+        "$(printf '%s\n' "$out" | sed -n '/^MISSING/,$p' | head -20)"
+    return 1
+}
+
+## xdc_reports <project> <regex> - the contract COMPLETES and the line is printed.
+## For the cases where the flow can run and the reader still has to be told
+## something: the stage will not read the file, and nothing else would say so.
+xdc_reports() {
+    local proj="$1" re="$2" out
+    out="$(xdc_check "$proj")"
+    printf '%s\n' "$out" | grep -qF 'Contract complete.' || {
+        printf 'this case was supposed to COMPLETE - the stage runs, it just does not\n'
+        printf 'read the file - and it did not:\n%s\n' \
+            "$(printf '%s\n' "$out" | grep -E '^ MISS ')"
+        return 1; }
+    printf '%s\n' "$out" | grep -qE -- "$re" && return 0
+    printf 'make check completed but printed nothing matching /%s/:\n%s\n' "$re" \
+        "$(printf '%s\n' "$out" | grep -E 'XDC_OPTIONAL' || echo '(no XDC_OPTIONAL line at all)')"
+    return 1
+}
+
+## xdc_handrun_says <flow dir> <regex> - the checker typed BY HAND, not by make.
+##
+## `env -u MAKELEVEL` and not a bare invocation. Whether a make recipe launched
+## the process is exactly what the checker keys on to decide whether its own
+## environment is the stage's, so a suite that happened to be run from inside
+## somebody else's make would otherwise exercise the opposite branch and still
+## go green.
+xdc_handrun_says() {
+    local flow="$1" re="$2" out
+    out="$(env -u MAKELEVEL "$flow/scripts/fpga-flow-check" \
+             --var BLOCK=demo_block --var BOARD=demo_board \
+             --var "FPGA_DIR=$SB" \
+             --var "XDC_OPTIONAL=USE_FOO:$SB/handrun.xdc" 2>&1)"
+    printf '%s\n' "$out" | grep -qE -- "$re" && return 0
+    printf 'fpga-flow-check run by hand printed nothing matching /%s/:\n%s\n' "$re" \
+        "$(printf '%s\n' "$out" | grep -E 'XDC_OPTIONAL' || echo '(no XDC_OPTIONAL line at all)')"
+    return 1
+}
+
+printf '# a conditional constraint file for the hand-run case\n' > "$SB/handrun.xdc"
+
+XDC_IDS="xdc_optional.exported        xdc_optional.exported.mutation
+         xdc_optional.literal         xdc_optional.literal.mutation
+         xdc_optional.unexported      xdc_optional.unexported.mutation
+         xdc_optional.blank           xdc_optional.blank.mutation
+         xdc_optional.value           xdc_optional.value.mutation
+         xdc_optional.empty_cond      xdc_optional.empty_cond.mutation
+         xdc_optional.unverified      xdc_optional.unverified.mutation"
+
+if [ -n "$MISSING" ]; then
+    for id in $XDC_IDS; do
+        t_skip "contract.$id" "mk/flow.mk includes$MISSING, which is/are not in this checkout yet, so no project can reach 'make check' here. Not a pass: this check did not run"
+    done
+elif [ ! -x "$FLOW_DIR/scripts/fpga-flow-check" ]; then
+    for id in $XDC_IDS; do
+        t_skip "contract.$id" "scripts/fpga-flow-check is not in this checkout, or is not executable - the condition check lives in it, and an unread check is not an agreeing one"
+    done
+elif ! command -v python3 >/dev/null 2>&1; then
+    for id in $XDC_IDS; do
+        t_skip "contract.$id" "no python3 on this host, and fpga-flow-check is Python - nothing here ran, and the planted faults could not be exercised either"
+    done
+else
+    #-------------------------------------------------------------------------
+    # 8.1 THE POSITIVE CONTROL. A correctly exported condition must be ACCEPTED,
+    # and the report must say WHICH conditional files are live. Everything below
+    # asserts a refusal, and a check that refused every XDC_OPTIONAL would
+    # satisfy all of it - that is the mis-aimed-guard shape section 6 plants for
+    # FLOW_MODE, for the same reason.
+    #-------------------------------------------------------------------------
+    P="$(xdc_fixture "$FLOW_DIR" exported \
+        'export USE_FOO := 1
+XDC_OPTIONAL := USE_FOO:$(FPGA_DIR)/opt.xdc')"
+    t_check contract.xdc_optional.exported \
+        "an EXPORTED condition of 1 is accepted, and the report names the file as READ" \
+        xdc_reports "$P" '^  ok +XDC_OPTIONAL +USE_FOO=1 READ opt\.xdc'
+
+    M="$(t_mutant "$SB" xdc-exported)"
+    if t_replace_line "$M" scripts/fpga-flow-check \
+        '    v = stage_sees(cond)' \
+        '    v = None   # mutation: the environment lookup stops happening'; then
+        PM="$(xdc_fixture "$M" exported-mut \
+            'export USE_FOO := 1
+XDC_OPTIONAL := USE_FOO:$(FPGA_DIR)/opt.xdc')"
+        t_check_fail contract.xdc_optional.exported.mutation \
+            "with the condition lookup neutered, a correct project is refused too and the assertion goes red" \
+            xdc_reports "$PM" '^  ok +XDC_OPTIONAL +USE_FOO=1 READ opt\.xdc'
+    else
+        t_skip contract.xdc_optional.exported.mutation "could not plant the fault: resolve_condition's environment lookup in scripts/fpga-flow-check has been reformatted, and this proof is measuring nothing until it is re-aimed"
+    fi
+
+    #-------------------------------------------------------------------------
+    # 8.2 THE MEASURED CASE: a literal value where a NAME goes.
+    #-------------------------------------------------------------------------
+    P="$(xdc_fixture "$FLOW_DIR" literal 'XDC_OPTIONAL := 0:$(FPGA_DIR)/opt.xdc')"
+    t_check contract.xdc_optional.literal \
+        "XDC_OPTIONAL=0:file is REFUSED, and the report says 0 is not a variable NAME" \
+        xdc_refuses "$P" 'is not a variable NAME'
+
+    M="$(t_mutant "$SB" xdc-literal)"
+    if t_replace_line "$M" scripts/fpga-flow-check \
+        '    return None, None' \
+        '    return "1", cond   # mutation: an unresolvable condition resolves anyway'; then
+        PM="$(xdc_fixture "$M" literal-mut 'XDC_OPTIONAL := 0:$(FPGA_DIR)/opt.xdc')"
+        t_check_fail contract.xdc_optional.literal.mutation \
+            "with an unresolvable condition resolving anyway, check says Contract complete again" \
+            xdc_refuses "$PM" 'is not a variable NAME'
+    else
+        t_skip contract.xdc_optional.literal.mutation "could not plant the fault: resolve_condition's unresolved return in scripts/fpga-flow-check has been reformatted, and this proof is measuring nothing until it is re-aimed"
+    fi
+
+    #-------------------------------------------------------------------------
+    # 8.3 THE NEAR-MISS THAT LOOKS RIGHT: a real variable, assigned, NOT
+    # exported. make resolves it; the stage never sees it; and the difference
+    # between those two is the entire property. The regex reaches into the fix
+    # text, because refusing this is only useful if the reader is told the one
+    # word that clears it.
+    #-------------------------------------------------------------------------
+    P="$(xdc_fixture "$FLOW_DIR" unexported \
+        'USE_FOO := 1
+XDC_OPTIONAL := USE_FOO:$(FPGA_DIR)/opt.xdc')"
+    t_check contract.xdc_optional.unexported \
+        "a condition make resolves but never EXPORTS is refused, and the fix names export" \
+        xdc_refuses "$P" 'add .export USE_FOO. to the project'
+
+    M="$(t_mutant "$SB" xdc-unexported)"
+    if t_replace_line "$M" scripts/fpga-flow-check \
+        '    v = os.environ.get(name)' \
+        '    v = os.environ.get(name, "1")   # mutation: absent reads as set'; then
+        PM="$(xdc_fixture "$M" unexported-mut \
+            'USE_FOO := 1
+XDC_OPTIONAL := USE_FOO:$(FPGA_DIR)/opt.xdc')"
+        t_check_fail contract.xdc_optional.unexported.mutation \
+            "with an absent variable reading as set, the unexported project passes and the assertion goes red" \
+            xdc_refuses "$PM" 'add .export USE_FOO. to the project'
+    else
+        t_skip contract.xdc_optional.unexported.mutation "could not plant the fault: stage_sees' environment read in scripts/fpga-flow-check has been reformatted, and this proof is measuring nothing until it is re-aimed"
+    fi
+
+    #-------------------------------------------------------------------------
+    # 8.4 EXPORTED AND EMPTY. `export USE_FOO` on its own line is a normal thing
+    # to write, and make puts USE_FOO='' in the child environment - measured.
+    # flow_env returns its DEFAULT for a set-but-blank variable, so the stage
+    # refuses exactly as it does for an unexported one. A check that called this
+    # 0 would disagree with the stage in the quiet direction: the file would be
+    # reported as deliberately not read, and the stage would refuse to start.
+    #-------------------------------------------------------------------------
+    P="$(xdc_fixture "$FLOW_DIR" blank \
+        'export USE_FOO :=
+XDC_OPTIONAL := USE_FOO:$(FPGA_DIR)/opt.xdc')"
+    t_check contract.xdc_optional.blank \
+        "an EXPORTED but empty condition is refused, as flow_env's blank-is-unset makes the stage do" \
+        xdc_refuses "$P" 'XDC_OPTIONAL condition +USE_FOO'
+
+    M="$(t_mutant "$SB" xdc-blank)"
+    if t_replace_line "$M" scripts/fpga-flow-check \
+        '    if v is not None and v.strip() != "":' \
+        '    if v is not None:   # mutation: blank counts as a value, unlike flow_env'; then
+        PM="$(xdc_fixture "$M" blank-mut \
+            'export USE_FOO :=
+XDC_OPTIONAL := USE_FOO:$(FPGA_DIR)/opt.xdc')"
+        t_check_fail contract.xdc_optional.blank.mutation \
+            "with blank counting as a value, an empty export reads as 0 and the assertion goes red" \
+            xdc_refuses "$PM" 'XDC_OPTIONAL condition +USE_FOO'
+    else
+        t_skip contract.xdc_optional.blank.mutation "could not plant the fault: stage_sees' blank-is-unset test in scripts/fpga-flow-check has been reformatted, and this proof is measuring nothing until it is re-aimed"
+    fi
+
+    #-------------------------------------------------------------------------
+    # 8.5 A VALUE OUTSIDE {0,1}. The stage compares to the LITERAL STRING `1`,
+    # so `true` means NOT READ - and the flow still runs, which is why this is a
+    # WARN and not a refusal. A reader who wrote `export USE_FOO := true` has a
+    # build that works and a constraint file that never loaded, and nothing else
+    # in the run says so.
+    #-------------------------------------------------------------------------
+    P="$(xdc_fixture "$FLOW_DIR" value \
+        'export USE_FOO := true
+XDC_OPTIONAL := USE_FOO:$(FPGA_DIR)/opt.xdc')"
+    t_check contract.xdc_optional.value \
+        "a condition that is neither 0 nor 1 WARNS - the flow runs, the file is not read" \
+        xdc_reports "$P" "^ WARN +XDC_OPTIONAL condition value +USE_FOO='true'"
+
+    M="$(t_mutant "$SB" xdc-value)"
+    if t_replace_line "$M" scripts/fpga-flow-check \
+        '        if val != "1" and val != "0":' \
+        '        if False:   # mutation: every value is inside the declared domain'; then
+        PM="$(xdc_fixture "$M" value-mut \
+            'export USE_FOO := true
+XDC_OPTIONAL := USE_FOO:$(FPGA_DIR)/opt.xdc')"
+        t_check_fail contract.xdc_optional.value.mutation \
+            "with the domain test disabled, 'true' passes without a word and the assertion goes red" \
+            xdc_reports "$PM" "^ WARN +XDC_OPTIONAL condition value +USE_FOO='true'"
+    else
+        t_skip contract.xdc_optional.value.mutation "could not plant the fault: the 0-or-1 domain test in scripts/fpga-flow-check has been reformatted, and this proof is measuring nothing until it is re-aimed"
+    fi
+
+    #-------------------------------------------------------------------------
+    # 8.6 AN EMPTY CONDITION. The stage's test is `string first ":"` then
+    # `if {$colon < 1}`, so `:file.xdc` is refused there. The check's test was
+    # `":" not in entry`, which is NOT the same rule and let it straight
+    # through. The mutation restores that exact shipped line.
+    #
+    # THE REGEX IS ANCHORED ON THE MALFORMED-ENTRY MESSAGE, and the first draft
+    # of this case was not. An empty condition is now caught TWICE - once as a
+    # malformed entry, and again as a condition the stage's environment cannot
+    # resolve, because "" resolves to nothing - so with the malformed test put
+    # back to its shipped shape the project is STILL refused, by the second
+    # rule, and a proof that grepped for `MISS  XDC_OPTIONAL` reported a
+    # restored defect as fixed. Defence in depth is a good property of the
+    # checker and a trap for a test that greps loosely; section 2 above carries
+    # the same warning about RUN_TAG for the same reason.
+    #-------------------------------------------------------------------------
+    P="$(xdc_fixture "$FLOW_DIR" emptycond 'XDC_OPTIONAL := :$(FPGA_DIR)/opt.xdc')"
+    t_check contract.xdc_optional.empty_cond \
+        "an entry with nothing before the colon is refused, as the stage's colon<1 test does" \
+        xdc_refuses "$P" 'nothing before the colon'
+
+    M="$(t_mutant "$SB" xdc-emptycond)"
+    if t_replace_line "$M" scripts/fpga-flow-check \
+        '        malformed = [e for e in opt_xdc if e.find(":") < 1]' \
+        '        malformed = [e for e in opt_xdc if ":" not in e]'; then
+        PM="$(xdc_fixture "$M" emptycond-mut 'XDC_OPTIONAL := :$(FPGA_DIR)/opt.xdc')"
+        t_check_fail contract.xdc_optional.empty_cond.mutation \
+            "with the shipped ':' not in entry test restored, the malformed-entry refusal stops happening and the assertion goes red" \
+            xdc_refuses "$PM" 'nothing before the colon'
+    else
+        t_skip contract.xdc_optional.empty_cond.mutation "could not plant the fault: the malformed-entry test in scripts/fpga-flow-check has been reformatted, and this proof is measuring nothing until it is re-aimed"
+    fi
+
+    #-------------------------------------------------------------------------
+    # 8.7 THE ENTRY POINT THAT CANNOT KNOW, AND SAYS SO.
+    #
+    # Typed by hand, this process's environment is the USER'S SHELL and not the
+    # stage's: the standalone path asks make for the contract in a SUBPROCESS,
+    # so a project's exports arrive in that child and never here. An answer from
+    # the wrong environment would be wrong in both directions - a green on a
+    # condition the project never exported, a red on one it did - so this entry
+    # point reports the condition UNVERIFIED and names the one that can settle
+    # it. An `ok` that cannot see half the property is the defect this whole
+    # section is about, and repeating it here would be the same mistake wearing
+    # a different hat.
+    #-------------------------------------------------------------------------
+    t_check contract.xdc_optional.unverified \
+        "run by hand, the checker reports the condition NOT VERIFIED rather than ok" \
+        xdc_handrun_says "$FLOW_DIR" '^ WARN +XDC_OPTIONAL conditions +1 entry NOT VERIFIED'
+
+    M="$(t_mutant "$SB" xdc-unverified)"
+    if t_replace_line "$M" scripts/fpga-flow-check \
+        'FROM_MAKE = bool(os.environ.get("MAKELEVEL"))' \
+        'FROM_MAKE = True   # mutation: a hand run claims the stage environment'; then
+        t_check_fail contract.xdc_optional.unverified.mutation \
+            "with a hand run claiming the stage's environment, it answers from the wrong one and the assertion goes red" \
+            xdc_handrun_says "$M" '^ WARN +XDC_OPTIONAL conditions +1 entry NOT VERIFIED'
+    else
+        t_skip contract.xdc_optional.unverified.mutation "could not plant the fault: the FROM_MAKE line in scripts/fpga-flow-check has been reformatted, and this proof is measuring nothing until it is re-aimed"
+    fi
+fi
+
+
 t_summary

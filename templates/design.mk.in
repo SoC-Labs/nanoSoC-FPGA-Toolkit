@@ -359,11 +359,24 @@ XDC_EXTRA       ?=
 # A LIST of "COND:path". Each is included IFF $(COND) is 1, so a build variant
 # is a variable rather than an edited file:
 #
+#     export USE_IDELAY := 1
 #     XDC_OPTIONAL += USE_IDELAY:$(TARGET_DIR)/$(BLOCK).idelay.xdc
 #
-# The condition is a make variable YOU set. Read the packaging trap in section
-# 5 first: if the RTL side of that variant is a `+define+`, the constraint may
-# be the only half of it that actually took effect.
+# THE `export` IS NOT OPTIONAL AND IT IS NOT DECORATION. The condition is a make
+# variable YOU set, and the implementation stage resolves it from ITS
+# ENVIRONMENT: mk/flow.mk exports the FPGA_* set it defines, and yours is not in
+# it. An assigned-but-unexported condition is not read as false - the stage
+# REFUSES, because reading the file and skipping it are both guesses about a
+# design somebody has to review. `make check` refuses it too, before a tool is
+# launched.
+#
+# COND IS A NAME, NEVER A VALUE. `XDC_OPTIONAL += 0:...` and `1:...` are the
+# mistake this line exists to stop: a file that should always be read belongs in
+# XDC_EXTRA, and one that should never be read belongs outside TARGET_DIR.
+#
+# Read the packaging trap in section 5 first: if the RTL side of that variant is
+# a `+define+`, the constraint may be the only half of it that actually took
+# effect.
 XDC_OPTIONAL    ?=
 
 # ═══════════════════════════════════════════════════════════════════════════
