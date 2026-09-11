@@ -161,7 +161,12 @@ untouched one.
 - **It stops at `.xsa`.** Vitis and PetaLinux consume that artefact and have
   their own lifecycle.
 - **It does not do DFX or ProtoCompiler yet.** Both are real back-ends with
-  stage graphs of their own; both are out of phase 1.
+  stage graphs of their own; both are out of phase 1. `FLOW_MODE` named them
+  until 2026-09-11, and naming them was the problem: `protocompiler` selected
+  nothing at all, and `dfx` selected out-of-context synthesis and none of the
+  partition handling that makes it a flow. Both are refused now, along with
+  `project`, whose `launch_runs` path no stage implements either. `direct` is
+  the default and the only accepted value.
 - **It ships no vendor collateral.** No encrypted IP, no board files, no
   bitstreams, no `.dcp`. `make hooks-install` puts a scanner in front of every
   commit, merge, patch and push to keep it that way.

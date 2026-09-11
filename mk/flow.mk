@@ -346,8 +346,63 @@ PART_DIR        ?= $(if $(strip $(PART)),$(FPGA_FLOW_DIR)/part/$(strip $(PART)),
 BOARD_PART      ?=
 BOARD_REPO_PATHS?=
 
-# project | direct | dfx | protocompiler
-FLOW_MODE       ?= project
+# -- FLOW_MODE: ONE NAME, BECAUSE ONE PATH IS IMPLEMENTED --------------------
+# CONTRACT.md section 3.3 used to declare four modes - `project | direct | dfx |
+# protocompiler` - and this line used to default to `project`. Here is what each
+# of the four was measured to do, on 2026-09-11, by reading every consumer of
+# the variable in this repository:
+#
+#   direct         the in-memory checkpoint flow. It is the one that runs, and
+#                  it is the one every stage has always run.
+#   project        CHANGED NOTHING. flow/vivado/4_synth.tcl said so in its own
+#                  header: it does not implement `launch_runs synth_1`. The
+#                  value reached exactly two things - the `flow_mode` line in
+#                  the manifest, and a NOT-COVERED bullet in the gate saying
+#                  the declaration had been ignored.
+#   protocompiler  CHANGED NOTHING, and unlike `project` no stage so much as
+#                  named it. Accepted by `make check`, consumed by nothing.
+#   dfx            changed ONE line: flow/steps/synth_setup.tcl derived
+#                  `-mode out_of_context` from it. Nothing anywhere in this
+#                  repository mentions a partition, a pblock, HD.RECONFIGURABLE
+#                  or a partial bitstream, so what that name selected was the
+#                  single most dangerous half of DFX with none of the machinery
+#                  that makes it safe: out-of-context synthesis of a BOARD-LEVEL
+#                  top inserts NO IO BUFFER on any port, implementation places
+#                  the result happily, and the bitstream configures a device
+#                  whose pins are connected to nothing. synth_setup.tcl's own
+#                  section 7 says exactly that, and README.md says DFX is out of
+#                  phase 1.
+#
+# So the default was a SILENT SUBSTITUTION inside a toolkit written to stop
+# them. Every run this repository has ever produced declared one flow and
+# executed another, and the only place that was visible was a not-covered note
+# in a gate file. The default is now the thing that runs, and the three names
+# that named nothing are REFUSED BY NAME rather than quietly mapped onto
+# `direct`: a refusal is something a reader can act on in the second it costs,
+# and a substitution is something they find out about from a bitstream.
+#
+# REFUSING `dfx` COSTS NOTHING, which is why it is refused rather than kept as
+# the one mode with a measurable effect. The out-of-context synthesis it
+# selected is still reachable, by the knob that actually owns it:
+# `make synth SYNTH_MODE=out_of_context` asks for precisely the same
+# synth_design command, is recorded in the manifest as the explicit choice it
+# is, and does not also promise a stage graph this toolkit does not have.
+FLOW_MODE       ?= direct
+
+# THE REFUSAL IS AT PARSE TIME, not in `make check`. `check` is a prerequisite
+# of the stage targets and of nothing else, so a FLOW_MODE nobody implements
+# would still reach `make env`, `make status`, `make vivado-shell` and any stage
+# script run by hand out of `make env` - and this file exports the value into
+# every one of those environments a few hundred lines below. A guard that fires
+# after the value has been handed to a tool is a report, not a guard.
+#
+# The Tcl layer refuses the same values again in flow_boot, for the reason the
+# RUN_TAG guards are duplicated there too (section 2): a guard that lives only
+# in the layer above the one that can do the damage stops existing the moment
+# somebody runs the stage directly.
+ifneq ($(strip $(FLOW_MODE)),direct)
+$(error FLOW_MODE is '$(FLOW_MODE)' and the only mode this toolkit implements is 'direct' - the in-memory checkpoint flow that every stage has always run. 'project' named the `launch_runs synth_1` path, which flow/vivado/4_synth.tcl states in its own header that it does not implement; 'protocompiler' is named by no stage at all; 'dfx' selected out-of-context synthesis and NONE of the partition, pblock or partial-bitstream handling that would make it a flow, which on a board-level top is a bitstream with no IO buffer on any pin. If out-of-context synthesis is what you want, ask for it by the knob that owns it: make synth SYNTH_MODE=out_of_context. Otherwise set FLOW_MODE=direct, or leave it unset)
+endif
 # The value set for PLATFORM is declared by the board pack's `platform` key and
 # validated against the pack schema (CONTRACT.md section 8). It is deliberately
 # NOT enumerated here: a legal-values list maintained in two places is the
@@ -1323,7 +1378,6 @@ bitstream: dirs check-quiet
 	    echo "      so without it the firmware and the fabric agree only by"; \
 	    echo "      coincidence. write_hw_platform needs a block design:"; \
 	    echo "        BD_TCL      = $(if $(strip $(BD_TCL)),$(BD_TCL),(unset))"; \
-	    echo "        FLOW_MODE   = $(FLOW_MODE)"; \
 	    echo "      CONTRACT.md section 4 lists .xsa as asserted for every"; \
 	    echo "      bitstream. If this design genuinely cannot produce one, that"; \
 	    echo "      is a contract question - raise it, do not delete the test."; \

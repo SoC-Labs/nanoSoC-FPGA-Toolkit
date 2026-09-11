@@ -153,9 +153,16 @@
 #     compares strings.
 #   * PER-FILE defines, and anything applied inside a packaged IP that the row
 #     did not name with `ip`.
-#   * ANYTHING IN direct MODE. Non-project mode has no fileset: the generics
-#     and defines are arguments to synth_design and there is nothing to query.
-#     This hook refuses rather than reporting a clean sheet it did not read.
+#   * ANYTHING IN A SESSION WITH NO SOURCE FILESET. Generics and defines are
+#     arguments to synth_design; the fileset properties this hook reads are a
+#     second copy of them, and where there is no fileset there is nothing to
+#     query. It refuses rather than reporting a clean sheet it did not read.
+#     (This used to say "anything in direct mode". That was wrong, and measured
+#     wrong: the synthesis stage opens `create_project -in_memory` before it
+#     reads a source, because an IP resolves against the part that is set when
+#     it is read - and an in-memory project HAS a sources_1 fileset carrying
+#     GENERIC and VERILOG_DEFINE. The test is whether a fileset is there, never
+#     which mode the run declared.)
 #
 # ------------------------------------------------------------------------------
 # HOW TO REPRODUCE THE MEASUREMENT WITHOUT RUNNING A STAGE
@@ -364,12 +371,15 @@ proc rtl_assert_fileset {} {
     if {$fs eq ""} { catch { set fs [get_filesets -quiet sources_1] } }
     if {$fs eq ""} {
         flow_refuse "no source fileset in this session." \
-            "  In FLOW_MODE=direct there is no project and no fileset: generics" \
-            "  and defines are arguments to synth_design and NOTHING HERE CAN" \
-            "  READ THEM. A clean sheet would be a sheet this hook never read," \
-            "  so it refuses." \
-            "  Either assert this at post_synth on the elaborated design, or" \
-            "  delete this hook file. FLOW_MODE is in `make env`."
+            "  Generics and defines are arguments to synth_design; the fileset" \
+            "  properties this hook reads are the second copy of them, and with" \
+            "  no fileset open NOTHING HERE CAN READ THEM. A clean sheet would" \
+            "  be a sheet this hook never read, so it refuses." \
+            "  The toolkit's own synthesis stage opens an in-memory project" \
+            "  before it reads a source, so the usual cause is a stage seam" \
+            "  earlier than that one, or a project step override that replaced" \
+            "  it. Either assert this at post_synth on the elaborated design," \
+            "  or delete this hook file."
     }
     set nm ""
     catch { set nm [get_property -quiet NAME $fs] }

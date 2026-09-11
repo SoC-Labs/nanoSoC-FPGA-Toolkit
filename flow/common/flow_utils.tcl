@@ -62,7 +62,9 @@
 #   FPGA_TARGET_DIR    ""                 target collateral (board top, XDC, BD)
 #   FPGA_TOP           ""                 the BOARD-LEVEL top module
 #   FPGA_DESIGN_NAME   $FPGA_BLOCK        block-design name, when a BD is used
-#   FPGA_FLOW_MODE     project            project | direct | dfx | protocompiler
+#   FPGA_FLOW_MODE     direct             direct, and REFUSED otherwise - see
+#                                        flow_boot. It is the only mode any
+#                                        stage in this toolkit implements
 #   FPGA_PLATFORM      bare               bare | pynq
 #   FPGA_SYS_CLK_FREQ_HZ ""               ALSO compiled into firmware (sec 3.4)
 #   FPGA_RTL_FLIST     ""                 the master flist
@@ -779,7 +781,40 @@ proc flow_boot {} {
     set IN_WORK_DIR    [flow_env FPGA_IN_WORK_DIR   $WORK_DIR]
     set SYNTH_OUT_DIR  [flow_env FPGA_SYNTH_OUT_DIR $OUT_DIR]
 
-    set FLOW_MODE [flow_env FPGA_FLOW_MODE project]
+    # FLOW_MODE NAMES A PATH THAT IS IMPLEMENTED, OR IT IS REFUSED.
+    #
+    # This default used to be `project`, and CONTRACT.md section 3.3 used to
+    # declare four modes. Three of them named nothing: `project` and
+    # `protocompiler` changed no behaviour anywhere in this repository, and
+    # `dfx` changed exactly one line - flow/steps/synth_setup.tcl derived
+    # `-mode out_of_context` from it, with no partition, pblock or
+    # partial-bitstream handling behind it, which on a board-level top is a
+    # netlist with no IO buffer on any port. mk/flow.mk carries the full
+    # reasoning above its own copy of this refusal.
+    #
+    # THE REFUSAL IS DUPLICATED HERE ON PURPOSE, exactly as the run-tag guards
+    # above are. mk/flow.mk's guard only protects the values that arrive
+    # through make. A stage script is explicitly runnable by hand out of
+    # `make env` - flow_need_env's own message says so - and an FPGA_FLOW_MODE
+    # left over in a shell, or typed into one, would otherwise reach a tool
+    # with nothing between it and a design. A default is the same hazard with
+    # nobody to blame: an unset variable silently meaning `project` is how this
+    # toolkit came to declare one flow and run another for its whole life.
+    set FLOW_MODE [flow_env FPGA_FLOW_MODE direct]
+    if {$FLOW_MODE ne "direct"} {
+        flow_refuse "FPGA_FLOW_MODE is '$FLOW_MODE'." \
+            "  The only mode this toolkit implements is 'direct' - the" \
+            "  in-memory checkpoint flow every stage here actually runs." \
+            "  'project' named a launch_runs path no stage implements," \
+            "  'protocompiler' is named by no stage at all, and 'dfx'" \
+            "  selected out-of-context synthesis with none of the partition" \
+            "  handling that would make it a flow - on a board-level top that" \
+            "  is a bitstream with no IO buffer on any pin." \
+            "  For out-of-context synthesis, set the knob that owns it:" \
+            "  SYNTH_MODE=out_of_context. Otherwise unset FPGA_FLOW_MODE." \
+            "  mk/flow.mk refuses the same values at make parse time; this" \
+            "  copy is what catches a stage run by hand."
+    }
     set PLATFORM  [flow_env FPGA_PLATFORM  bare]
 
     # Runtime is measured from stage LAUNCH when make tells us when that was,
