@@ -75,7 +75,15 @@ printf 'FLOW_DIR %s\n' "$FLOW_DIR"
 printf 'suites   %d discovered by glob in %s\n' "${#SUITES[@]}" "$SHELL_DIR"
 
 pass=0; fail=0; failed=""
+A_PASS=0; A_FAIL=0; A_XFAIL=0; A_SKIP=0
+holes=""; nosummary=""; MUT_RAN=""; MUT_HOLE=""
 start=$SECONDS
+
+# Each suite's own summary line is the only place its assertion counts exist, so
+# capture the output rather than streaming it straight through. The file is read
+# back immediately and the suite's output is printed unchanged.
+CAP="$(mktemp -d "${TMPDIR:-/tmp}/fpga-flow-run.XXXXXXXX")"
+trap 'rm -rf "$CAP"' EXIT
 
 for t in "${SUITES[@]}"; do
     name="$(basename "$t" .sh)"
@@ -87,15 +95,41 @@ for t in "${SUITES[@]}"; do
     # checkout on a noexec filesystem, or a missing shebang would otherwise be
     # reported as a failing test rather than as an environment problem - and
     # the difference matters at three in the morning.
-    if bash "$t"; then
+    rc=0
+    bash "$t" > "$CAP/$name.out" 2>&1 || rc=$?
+    cat "$CAP/$name.out"
+    if [ "$rc" -eq 0 ]; then
         pass=$((pass + 1))
     else
         fail=$((fail + 1)); failed="$failed $name"
     fi
+
+    # "<file>.sh: N passed, N failed, N known-defect, N skipped"
+    sline="$(grep -E ': [0-9]+ passed, [0-9]+ failed,' "$CAP/$name.out" | tail -1)"
+    if [ -z "$sline" ]; then
+        nosummary="$nosummary $name"
+        continue
+    fi
+    set -- $(printf '%s' "$sline" | sed -E 's/.*: ([0-9]+) passed, ([0-9]+) failed, ([0-9]+) known-defect, ([0-9]+) skipped.*/\1 \2 \3 \4/')
+    A_PASS=$((A_PASS + $1)); A_FAIL=$((A_FAIL + $2))
+    A_XFAIL=$((A_XFAIL + $3)); A_SKIP=$((A_SKIP + $4))
+    # Planted faults this suite rejected, by assertion id. Counted at RUNTIME:
+    # three suites plant their faults inside loops, so a grep of the source
+    # would under-report them and the ledger would be wrong in the safe-looking
+    # direction.
+    MUT_RAN="$MUT_RAN $name=$(grep -cE '^  ok +[A-Za-z0-9_.]*\.mutation([. ]|$)' "$CAP/$name.out")"
+    [ "$1" -eq 0 ] && [ "$4" -gt 0 ] && MUT_HOLE="$MUT_HOLE $name"
+    # A SUITE THAT ASSERTED NOTHING AND SKIPPED INSTEAD IS A HOLE, and today it
+    # reports as a file that passed. t_summary cannot catch this: a suite that
+    # does `t_skip all "no tclsh"` HAS recorded something, so it is not the
+    # empty suite t_summary refuses. But nothing in the toolkit was measured.
+    if [ "$1" -eq 0 ] && [ "$4" -gt 0 ]; then holes="$holes $name"; fi
 done
 
 printf '\n===== suite: %d file(s) passed, %d failed, %ds =====\n' \
     "$pass" "$fail" "$((SECONDS - start))"
+printf 'assertions: %d passed, %d failed, %d known-defect, %d skipped\n' \
+    "$A_PASS" "$A_FAIL" "$A_XFAIL" "$A_SKIP"
 
 if [ "$fail" -gt 0 ]; then
     printf 'failed:%s\n' "$failed"
@@ -107,4 +141,95 @@ if [ "$pass" -eq 0 ]; then
     printf 'Zero suites executed measures nothing; it does not measure zero defects.\n'
     exit 1
 fi
-exit 0
+
+#-----------------------------------------------------------------------------
+# COVERAGE IS HOST-DEPENDENT, AND A GREEN LINE MUST NOT HIDE THAT
+#
+# Every suite here skips rather than fails when a precondition is absent - no
+# tclsh, no fixture, a sandbox path with a space in it - and a skip carries its
+# reason, which is right. What was missing is the AGGREGATE: a CI box without
+# tclsh skips five whole suites and still prints "0 failed", because the runner
+# counted FILES. The numbers below make the difference visible, and these two
+# gates make it fatal.
+#
+#   a HOLE          a suite that asserted nothing at all and skipped instead.
+#                   Nothing in the area it covers was measured on this host.
+#   the SKIP RATIO  more than SKIP_MAX_PCT of assertions skipped. Default 10.
+#
+# Both are overridable for the host that genuinely cannot run something, but the
+# override has to be TYPED - which is the whole point. FPGA_TEST_ALLOW_HOLES=1
+# says "I know five suites did not run"; it does not say it for you.
+#-----------------------------------------------------------------------------
+SKIP_MAX_PCT="${FPGA_TEST_SKIP_MAX_PCT:-10}"
+rc=0
+
+if [ -n "$nosummary" ]; then
+    printf 'suites that printed NO summary line:%s\n' "$nosummary"
+    printf '  A suite that exits without a summary crashed, however green the line above.\n'
+    rc=1
+fi
+
+if [ -n "$holes" ] && [ "${FPGA_TEST_ALLOW_HOLES:-0}" != 1 ]; then
+    printf 'suites that measured NOTHING on this host:%s\n' "$holes"
+    printf '  Each asserted zero times and skipped instead, so the area it covers is\n'
+    printf '  untested here. That is a hole, not a pass. Read the SKIP reasons above -\n'
+    printf '  usually a missing tclsh or an absent fixture - or set\n'
+    printf '  FPGA_TEST_ALLOW_HOLES=1 to accept them deliberately.\n'
+    rc=1
+fi
+
+if [ $((A_PASS + A_SKIP)) -gt 0 ]; then
+    pct=$(( (A_SKIP * 100) / (A_PASS + A_SKIP) ))
+    if [ "$pct" -gt "$SKIP_MAX_PCT" ]; then
+        printf '%d%% of assertions were SKIPPED (limit %d%%).\n' "$pct" "$SKIP_MAX_PCT"
+        printf '  A run that skipped most of what it was going to measure is not a\n'
+        printf '  green run. Raise the limit with FPGA_TEST_SKIP_MAX_PCT= if this host\n'
+        printf '  genuinely cannot run them.\n'
+        rc=1
+    fi
+fi
+
+#-----------------------------------------------------------------------------
+# THE MUTATION LEDGER
+#
+# test/MUTATION_COVERAGE declares how many planted faults each suite must
+# reject. Deleting a proof otherwise costs one `ok` line and nothing else - the
+# suite still exits 0 - so a guard can lose its only evidence that it can fail
+# and the run stays green. See that file's header for why the comparison is red
+# in BOTH directions.
+#
+# Suites that did not run are not compared: run.sh's hole gate has already
+# reported them, and failing the same cause twice teaches the reader to skim.
+#-----------------------------------------------------------------------------
+LEDGER="$HERE/MUTATION_COVERAGE"
+if [ -z "$FILTER" ] && [ -f "$LEDGER" ]; then
+    mut_bad=""; mut_total=0
+    for entry in $MUT_RAN; do
+        mname="${entry%%=*}"; mgot="${entry##*=}"
+        case " $MUT_HOLE " in *" $mname "*) continue ;; esac
+        mwant="$(awk -v n="$mname" '$1==n {print $2; exit}' "$LEDGER")"
+        mut_total=$((mut_total + mgot))
+        if [ -z "$mwant" ]; then
+            mut_bad="$mut_bad
+  $mname is not in the ledger at all - it rejected $mgot planted fault(s) that
+    nothing has declared. Add the line."
+        elif [ "$mgot" -lt "$mwant" ]; then
+            mut_bad="$mut_bad
+  $mname rejected $mgot planted fault(s); the ledger declares $mwant.
+    A PROOF WAS DROPPED. Something that used to be proven able to fail is not."
+        elif [ "$mgot" -gt "$mwant" ]; then
+            mut_bad="$mut_bad
+  $mname rejected $mgot planted fault(s); the ledger declares $mwant.
+    A proof was added. Read the new case, then update test/MUTATION_COVERAGE."
+        fi
+    done
+    printf 'mutation:   %d planted faults rejected\n' "$mut_total"
+    if [ -n "$mut_bad" ]; then
+        printf 'test/MUTATION_COVERAGE disagrees with what ran:%s\n' "$mut_bad"
+        rc=1
+    fi
+elif [ -n "$FILTER" ]; then
+    printf 'mutation:   ledger NOT checked - a filtered run measures a subset\n'
+fi
+
+exit $rc

@@ -1,0 +1,53 @@
+# test/MUTATION_COVERAGE - how many planted faults this suite must reject
+#
+# WHY A NUMBER IN A FILE
+#
+# Every assertion in test/shell is paired with a mutation proof: plant one fault
+# in a throwaway copy of the toolkit, show the same assertion goes red, throw
+# the copy away. That discipline is the reason a green suite here means
+# something. It has one hole, and it is structural.
+#
+# DELETE A PROOF AND NOTHING GOES RED. The suite prints one fewer `ok` line and
+# exits 0. test/run.sh keys on exit status, so a guard can lose the only
+# evidence it can fail, and the run stays green with a slightly smaller number
+# in a line nobody diffs. That is the same shape as the defect the proofs exist
+# to catch, one level up - and this repository has already shipped it once, in a
+# gate that graded from a counter every rebuilding command silently reset.
+#
+# So the counts are declared HERE, in a file whose whole content is the claim,
+# and asserted by test/run.sh against what each suite actually rejected. A count
+# that does not match is red IN BOTH DIRECTIONS:
+#
+#   fewer than declared   a proof was dropped. Something is now unproven, and
+#                         nothing else in the suite would have said so.
+#   more than declared    a proof was added and this file was not updated. Not a
+#                         defect - an unreviewed change to what the suite claims
+#                         to prove, and bumping the number is the thirty seconds
+#                         in which somebody reads the new case.
+#
+# THIS FILE IS NOT A BUDGET THAT RATCHETS ITSELF. Nothing edits it
+# automatically, and that is deliberate: a floor the flow raises to whatever
+# today's run produced records history, not intent.
+#
+# A suite that did not run at all (no tclsh, absent fixture) is NOT compared -
+# it is already reported by run.sh's hole gate, and failing it twice for one
+# cause would train the reader to ignore both.
+#
+# A proof is counted by its assertion id: an id containing `.mutation` is a
+# planted fault the suite rejected. That is the runtime count, not a grep of the
+# source, because three of these suites plant their faults inside loops.
+#
+# Format:  <suite name>  <count>
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+
+t_assert_stage   12
+t_bd              3
+t_contract       13
+t_flist          22
+t_flow_utils     23
+t_measure        19
+t_packs          34
+t_provenance     23
+t_seams          10
+t_verdicts        9

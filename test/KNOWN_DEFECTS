@@ -1,0 +1,125 @@
+# test/KNOWN_DEFECTS - what this toolkit does not do, written down where the
+# suite lives rather than in somebody's head.
+#
+# Two kinds of entry, and the difference matters:
+#
+#   DEFECT     an assertion that is CORRECT and that the toolkit does not
+#              satisfy. Where the suite can express it, it is marked with
+#              t_known_defect - which is NOT red today, and goes RED the moment
+#              it starts passing, because a defect marker that outlives its
+#              defect is how a suite starts lying about what it covers.
+#
+#   UNPROVEN   the toolkit may well be right; nothing has ever demonstrated it.
+#              These are not failures. They are the difference between "tested"
+#              and "believed", and the reason to write them here is that a green
+#              suite is otherwise indistinguishable from a complete one.
+#
+# Adding a line here is not a way to make something go quiet. A DEFECT line is a
+# statement that the toolkit is wrong, with the fix written next to it. An
+# UNPROVEN line is a statement about the limits of the evidence, with what would
+# settle it written next to it.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+
+#=============================================================================
+# DEFECT
+#=============================================================================
+
+## flow/common/flow_utils.tcl :: ::part_alias is not validated against the schema
+# The alias table is the only place in the engine where a pack's spelling
+# appears, and nothing checks that the names on either side of it are real. A
+# dead alias is invisible: `device -> part_name` sat here reading as a promise
+# that `part device` returns the full part string, when the schema declares
+# `device` as the die and the alias therefore never fired. Removed 2026-09-08,
+# found by reading, not by a test.
+# part/pack_api.tcl validates its OWN alias table at source time. This second
+# table does not, so the next dead alias will be just as invisible.
+# FIX: either validate this table against the pack schema at source time, or
+# delete it and move its three entries into pack_api.tcl's table - there should
+# not be two. Recorded in CONTRACT.md section 8.
+
+## FLOW_MODE=project is the default, and no stage implements it
+# CONTRACT.md section 3 declares `project | direct | dfx | protocompiler`, and
+# mk/flow.mk:350 defaults to `project`. scripts/fpga-flow-check:1201 DOES
+# enum-validate the value, so a typo is refused - that part is right, and `dfx`
+# does reach something real (flow/steps/synth_setup.tcl:391 switches synthesis
+# to out_of_context for it).
+# What is wrong is that `project` NAMES A PATH NOTHING RUNS. flow/vivado/
+# 4_synth.tcl:64 says so in its own header: it does not implement `launch_runs
+# synth_1`, it runs the in-memory `direct` path whatever the mode says.
+# 4_synth.tcl:1056 and 5_impl.tcl:871 record the difference honestly, as a
+# NOTCOV line in the stage manifest - which is the right instinct at the wrong
+# severity. Every run this toolkit has ever produced declared one flow and
+# executed another, and the only place that is visible is a not-covered note.
+# `protocompiler` is worse: accepted by the checker, consumed by nothing at all.
+# FIX: default to `direct`, since that is what runs, and refuse `project` and
+# `protocompiler` in mk/flow.mk until a stage implements them. A declared mode
+# that silently maps onto a different one is the class of silent substitution
+# this toolkit was built to stop.
+
+#=============================================================================
+# UNPROVEN
+#=============================================================================
+
+## the deploy tier has never touched a board
+# scripts/fpga-flow-deploy (1390 lines), mk/deploy.mk and the fpgahub hooks have
+# been exercised against fixtures and against the CLI's own dry-run paths.
+# Nothing in this repository has ever programmed a device. Every claim about
+# what happens when a lease is held, a program fails, or a board is already
+# busy is a claim about code that has been read, not run.
+# WOULD SETTLE IT: one deploy against a real KR260 with a lease, and one against
+# a board that is already leased by somebody else.
+
+## the part/board split is a one-implementation contract
+# CONTRACT.md section 1 splits the reference toolkit's single `tech` concept into
+# a toolkit-side part pack and a project-side board pack. Three part packs ship;
+# one of them (xck26-sfvc784-2LV-c) has ever built anything. One board pack
+# exists, in one project.
+# An interface with one implementation is a description of that implementation.
+# The reference toolkit's tech-pack API got two things wrong before it settled,
+# and it settled by acquiring a second consumer.
+# WOULD SETTLE IT: a second board on a different part, built end to end by
+# somebody who did not write the pack API.
+
+## no stage script is unit-tested
+# flow/vivado/{1_flist,2_package_ip,3_bd,4_synth,5_impl,6_bitstream}.tcl is 5181
+# lines and needs Vivado to run, so the suite reaches it only through fixtures
+# of its OUTPUT. t_measure, t_assert_stage and t_verdicts test the graders; the
+# stages themselves are covered by the fact that a bitstream came out matching a
+# known-good one, which is an integration result for one design on one part.
+# The five flow/steps/*.tcl files are in the same position.
+# WOULD SETTLE IT: the parts of each stage that do not call a tool, factored out
+# and driven under tclsh the way flow_utils.tcl now is.
+
+## fpga-flow-{doctor,init,hooks} are named by no test
+# doctor reports what a host has; init scaffolds a project; hooks lists seams.
+# All three have been run by hand and none is asserted on. init is the one that
+# matters: a project scaffolded wrong fails later, in a stage, in a way that
+# reads as the project's fault.
+# WOULD SETTLE IT: scaffold into a sandbox with fpga-flow-init, then run
+# `make check` against the result and assert it is clean. The pieces for that
+# already exist in test/lib/harness.sh (t_project, t_sandbox).
+
+## mk/flow.mk: 1709 lines, and only its parse-time guards are tested
+# t_contract.sh covers the `$(error)` guards thoroughly - 13 planted faults
+# rejected - because a make conditional that stops matching FAILS OPEN and the
+# build just proceeds. Nothing covers the rest of the file: the stage graph, the
+# ~70-variable surface, the ordering of the `?=` chains, or any recipe.
+# That gap is why this file has NOT been split into per-area fragments, though
+# it is past the length a reader can hold. Everything in a makefile interacts by
+# expansion order, and three separate defects in this file during its first
+# fortnight were exactly that: a `:=` that snapshotted before the includes ran,
+# a rule whose target expanded at parse time and resolved to the filesystem
+# root, and an `$(if)` whose prose contained a comma. A split moves every line
+# in the file past those same hazards with 27 assertions standing behind it, for
+# no functional gain, on the one component with demonstrated bitstream parity.
+# WOULD SETTLE IT, in this order: a suite that drives `make -n` over the stage
+# graph and asserts the prerequisite chain and the resolved variable surface;
+# THEN the split. Not the other way round.
+
+## ci/ is 4312 lines and is exercised only by t_verdicts
+# t_verdicts covers ci/lib.sh's verdict and exit-code layer thoroughly - 9
+# planted faults rejected. capability.sh, tier.sh, deploy-gates.sh and
+# check-vendor-collateral.sh are not named by any test.
+# WOULD SETTLE IT: tier.sh's selection logic is pure text-in/text-out and could
+# be driven from the harness today.

@@ -6,7 +6,8 @@ toolkit.
 
 ```
 part/
-  pack_api.tcl              the schema, the loader, the validator, both APIs
+  pack_schema.tcl           the schema: WHAT a pack may declare
+  pack_api.tcl              the loader, the validator, both APIs, the cross-checks
   README.md                 this file
   xc7z020clg400-1/part.tcl  Zynq-7000    XC7Z020   CLG400  -1
   xck26-sfvc784-2LV-c/      Zynq US+     XCK26     SFVC784 -2LV c
@@ -64,7 +65,8 @@ the board does.
 
 ## 2. One engine, two roles
 
-`pack_api.tcl` implements **one** schema-driven engine. Every command is
+`pack_api.tcl` implements **one** schema-driven engine, over the tables in
+`pack_schema.tcl`. Every command is
 `pack_<verb> <role> ...`; the two public families are `interp alias` lines at
 the bottom of the file:
 
@@ -346,7 +348,7 @@ and `bitstream_compress` should become a `design.mk` knob.
    `part_set`, a deleted required key, `has_ps` true with `ps_type` removed, and
    above all a legacy primitive in a `*_primitive` key.
 
-There is **no table of keys in this README**. The schema in `pack_api.tcl` is
+There is **no table of keys in this README**. The schema in `pack_schema.tcl` is
 the only copy, each row carries the description the validator prints, and
 `part_keys <group>` or `fpga-flow-part-get --part <p> --all` enumerates it. The
 reference toolkit keeps a documentation table beside its schema and its own

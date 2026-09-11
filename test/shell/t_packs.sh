@@ -1094,7 +1094,12 @@ t_check packs.contract.cfgbvs \
 # board pack tried. When pack_api.tcl was fixed the marker went red by itself -
 # "KNOWN-DEFECT marker is STALE - this now PASSES" - and became this assertion.
 M="$(t_mutant "$SB" cfgbvs-part-only)"
-if t_replace_line "$M" part/pack_api.tcl \
+# part/pack_schema.tcl, not pack_api.tcl: the schema rows moved into their own
+# file on 2026-09-11. This proof found that by itself - t_replace_line refused to
+# plant a fault it could not locate and the suite skipped WITH THE REASON, which
+# is the whole point of a mutation that fails loudly rather than silently
+# matching nothing.
+if t_replace_line "$M" part/pack_schema.tcl \
        '    cfgbvs                no  str   config' \
        '    cfgbvs_moved_away     no  str   config'; then
     t_check_fail packs.contract.cfgbvs.mutation \

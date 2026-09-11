@@ -77,6 +77,40 @@ rendered explicitly.
 Every guard's own conditional line is then replaced, in a copy, with one that
 can never be true — and the same command must be **accepted**.
 
+### `t_flow_utils.sh` — the boot layer everything else stands on
+
+`flow/common/flow_utils.tcl` is sourced by every Vivado stage and produces
+almost no artefact of its own, which is what makes it dangerous: a guard that
+stopped guarding, a hook that stopped running, a knob that stopped registering
+and an exit code that collapsed into its neighbour all leave a run that looks
+exactly like a correct one. The stage finishes, the bitstream appears, and
+nothing says which of the two designs it built.
+
+25 properties, each with a planted-fault proof: the **shadow guard** (`proc`
+silently replaces a command — the reference toolkit's equivalent has fired in
+anger, on a helper that shadowed a builtin and aborted a route stage 2.5 hours
+in); `flow_config` rejecting a typo'd key; **exit 1 and exit 2 staying
+distinct**; `flow_assert_input` telling *absent*, *zero-byte* and *empty
+directory* apart; `opt` registering a knob by the act of reading it, and
+`flow_env` deliberately not; the seam list's four validations; a mistyped seam
+at a **call site**, which otherwise disarms the guard it was arming, silently
+and forever; hooks being optional, recorded, run in the caller's scope, and able
+to **abort the stage**; a project step override replacing the toolkit's file
+wholesale; the knob census reading files rather than running them; the pack
+alias table; and `try_step`.
+
+Everything runs under bare `tclsh`. This file is also what keeps that true: the
+day a helper starts calling a Vivado command unguarded, these drivers stop
+sourcing and say so, instead of taking the whole tool-free suite with them.
+
+Two of its own bugs are worth recording, because both are the defect classes the
+toolkit exists to stop, found inside the thing meant to find them. A `catch`
+around `flow_seam_assert` trapped nothing, because `die` **exits** — so the
+driver never resumed and reported success on an exit it had not observed. And
+every proof initially shared one mutant, which accumulates faults, so the
+fifteenth proof passed or failed for the first proof's reason. Each proof now
+gets a clean copy.
+
 ### `t_verdicts.sh` — `ci/lib.sh`
 
 That `ci_unverified` counts as a **failure**; that `ci_exit` is non-zero when an
@@ -149,19 +183,73 @@ Two conventions worth keeping:
 
 ---
 
+## Two ledgers, and why a number lives in a file
+
+`run.sh` aggregates every suite's counts and prints them:
+
+```
+===== suite: 10 file(s) passed, 0 failed, 60s =====
+assertions: 376 passed, 0 failed, 0 known-defect, 0 skipped
+mutation:   168 planted faults rejected
+```
+
+**`MUTATION_COVERAGE`** declares how many planted faults each suite must reject.
+Deleting a proof otherwise costs one `ok` line and nothing else — the suite
+still exits 0, so a guard can lose the only evidence that it *can* fail while
+the run stays green. The comparison is red in **both** directions: fewer than
+declared means a proof was dropped, more means one was added and nobody read it.
+
+**`KNOWN_DEFECTS`** holds two kinds of entry, and the difference is the point.
+A `DEFECT` is an assertion that is correct and that the toolkit does not satisfy
+— marked with `t_known_defect` where the suite can express it, so the marker
+goes **red** if the bug is ever fixed. An `UNPROVEN` entry is not a failure: it
+records something that may well be right and that nothing has ever demonstrated,
+with what would settle it written next to it. A green suite is otherwise
+indistinguishable from a complete one.
+
+---
+
+## Coverage is host-dependent, and the summary says so
+
+Every suite skips rather than fails when a precondition is absent, and carries
+its reason. What that hid until 2026-09-11 was the **aggregate**: on a host with
+no `tclsh`, five suites skip themselves whole — 263 of 376 assertions vanish —
+and the old runner still printed `10 file(s) passed, 0 failed`, because it
+counted *files*.
+
+Two gates now make that fatal:
+
+| gate | fires when | override |
+|---|---|---|
+| **hole** | a suite asserted nothing at all and skipped instead | `FPGA_TEST_ALLOW_HOLES=1` |
+| **skip ratio** | more than 10% of assertions skipped | `FPGA_TEST_SKIP_MAX_PCT=` |
+
+The hole gate is the one that matters: five whole suites bailing out is only
+five `SKIP` lines, so the ratio alone would have read as 4% and passed.
+
+---
+
 ## What these suites do **not** cover yet
 
-- **`ci/assert-stage.sh` has no suite of its own.** It has been exercised by hand
-  against fixture run directories — a clean run, a stale manifest, an exceeded
-  budget, a delegation with no owner, a missing verdict, both `--optional`
-  paths — but by hand is not by CI, and this file is where that gap is recorded
-  rather than in somebody's memory. A `t_assert_stage.sh` is the obvious next
-  suite, and the fixtures it needs are a manifest and a gate file in a
-  `mktemp -d`.
-- **`test/python/` and `test/fixtures/` are empty.** `scripts/fpga-flow-check`
-  is only exercised here through its seam and step reporting.
-- **Nothing here runs a stage.** These suites judge the contract and the
-  verdict layer. What a stage produces is judged by `ci/assert-stage.sh`, on the
-  artefacts, after the fact.
+- **No stage script is unit-tested.** `flow/vivado/*.tcl` is 5181 lines and
+  needs Vivado, so the suites reach it only through fixtures of its *output*.
+  `t_measure`, `t_assert_stage` and `t_verdicts` test the graders. The stages
+  themselves rest on one integration result: a bitstream that matched a
+  known-good one, for one design on one part.
+- **The deploy tier has never touched a board.** `scripts/fpga-flow-deploy`,
+  `mk/deploy.mk` and the fpgahub hooks are exercised against fixtures and
+  dry-run paths only.
+- **`fpga-flow-{doctor,init,hooks}` are named by no test.** `init` is the one
+  that matters: a project scaffolded wrong fails later, inside a stage, in a way
+  that reads as the project's fault. `t_project` and `t_sandbox` already provide
+  what a suite for it would need.
+- **`ci/` is 4312 lines and only `ci/lib.sh` is covered** — thoroughly, by
+  `t_verdicts`. `capability.sh`, `tier.sh`, `deploy-gates.sh` and
+  `check-vendor-collateral.sh` are not named by any test.
+
+Every item above is also in `KNOWN_DEFECTS`, which is the file that goes stale
+if one of them is fixed and not deleted.
+
+---
 
 Copyright (C) 2026, SoC Labs (www.soclabs.org)
