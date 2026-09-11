@@ -77,6 +77,21 @@ rendered explicitly.
 Every guard's own conditional line is then replaced, in a copy, with one that
 can never be true — and the same command must be **accepted**.
 
+It also covers the one thing in `scripts/fpga-flow-check` that has to agree with
+a *stage* rather than with a make conditional: **`XDC_OPTIONAL`'s condition**.
+`COND:path` is read iff `$(COND)` is 1, and `impl` resolves `COND` from its
+**environment** — so an un-`export`ed condition makes the stage refuse. The check
+validated the colon and the file and never the condition, so
+`XDC_OPTIONAL="0:<a real .xdc>"` — a literal value where a name goes — reported
+`ok` and `Contract complete.`, and a full synthesis ran before `impl` refused.
+The fixture here is a contract that **completes**, because the defect is a
+verdict and not a message: exported-and-1 is accepted and reported as *READ*;
+a literal, an unexported name, and an exported-but-empty one are each refused;
+a value outside `{0,1}` warns that the file will not be read; `:path` is refused
+by the stage's own `colon < 1` rule; and the same checker **typed by hand** —
+where this process's environment is not the stage's — reports the condition
+`NOT VERIFIED` instead of `ok`.
+
 ### `t_flow_utils.sh` — the boot layer everything else stands on
 
 `flow/common/flow_utils.tcl` is sourced by every Vivado stage and produces

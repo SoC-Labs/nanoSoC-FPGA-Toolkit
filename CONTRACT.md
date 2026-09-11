@@ -229,11 +229,30 @@ XDC_TIMING      ?=                    # implementation only
 XDC_DRC         ?=                    # implementation only
 XDC_EXTRA       ?=                    # a LIST, order preserved
 XDC_OPTIONAL    ?=                    # a LIST of "COND:path" — included iff
-                                      #   $(COND) is 1. e.g. USE_IDELAY:...
+                                      #   $(COND) is 1, and the project must
+                                      #   `export` COND. e.g. USE_IDELAY:...
 XDC_POST_ROUTE  ?=                    # `source`d AFTER route_design, NOT
                                       # read_xdc'd. Vivado rejects procedural
                                       # Tcl in an XDC; a DRC waiver needs it.
 ```
+
+**`XDC_OPTIONAL`'s CONDITION IS A NAME, AND IT HAS TO BE EXPORTED.** Added
+2026-09-11, from a build that cost a synthesis run. The implementation stage
+resolves `COND` from **its environment** — under its own name, then under
+`FPGA_<COND>` — because §6's export block carries the `FPGA_*` set the engine
+defines and nothing else. So `USE_IDELAY := 1` reaches make and not the stage,
+and the stage **refuses**: reading the file and skipping it are both guesses,
+and a constraint file that silently did not load leaves a design constrained
+differently from the one anybody reviewed (§9.3). Write `export USE_IDELAY := 1`.
+A set-but-empty `export USE_IDELAY` is refused identically — `flow_env` treats
+whitespace as unset. The value is compared to the **literal string** `1`;
+everything else, `true` and `yes` included, means *not read*.
+
+`0:path` is not a condition. It is the **value** in the place the **name** goes,
+and it was reported `ok  XDC_OPTIONAL  0:...` followed by `Contract complete.`
+until `make check` learned to resolve the condition the same way the stage does.
+A file that should always be read is `XDC_EXTRA`; one that should never be read
+belongs outside `TARGET_DIR`.
 
 **A CLOCK DEFINITION IS NOT AN EXCEPTION, AND THE READ WINDOW COSTS SOMETHING.**
 Added 2026-09-09. The rule below withholds `XDC_TIMING` from synthesis because an
