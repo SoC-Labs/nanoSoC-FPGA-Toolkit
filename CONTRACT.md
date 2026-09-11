@@ -693,6 +693,19 @@ part_keys part_summary` — and the same set spelled `board_*`.
 The engine must reach both through **one shim** that owns an alias table, so a
 pack spelling a key differently is a table entry rather than forty call sites.
 
+That table is **validated against the schema when the shim binds** — which is
+the earliest moment it can be, since `flow_utils.tcl` is sourced before the pack
+API and has no schema to check against when the table is declared. A row whose
+target is not a key, whose *name* is a key (so it can never fire), that maps a
+name to itself, or that duplicates a spelling `pack_api.tcl`'s own pack-facing
+table already resolves, is refused with what to delete. **No spelling may stand
+in both tables.** The two tables answer different questions — what a *pack
+writes* versus what a *stage asks for* — and stay separate; what is forbidden is
+the same spelling appearing twice, one copy of it doing nothing. A dead alias is
+invisible rather than wrong-looking, which is how `device → part_name` survived
+in that table reading as a promise that `part device` returns the full part
+string when the schema declares `device` as the bare die.
+
 ---
 
 ## 9. Facts about this codebase that constrain the design

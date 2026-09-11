@@ -127,12 +127,22 @@ alias table. That table is for what a *stage script* asks for; the one in
 `pack_api.tcl` is for what a *pack* writes. They are different questions and are
 deliberately not shared.
 
-> **Known sharp edge.** `flow_utils.tcl`'s `::part_alias` maps `device` →
-> `part_name`. This schema declares `device` as a key in its own right — the
-> bare `xc7z020`, not the full part string — so the alias never fires and
-> `part device` returns `xc7z020` rather than `xc7z020clg400-1`. Ask for
-> `part_name` when you want the string that reaches the tool. That file is
-> owned elsewhere; this is a note, not a fix.
+> **They are not shared, and no *spelling* may stand in both.** The sharp edge
+> that used to be recorded here — `::part_alias` mapping `device` → `part_name`,
+> a row that could never fire because this schema declares `device` as a key in
+> its own right — is closed. `flow_pack_alias_check` now validates that table
+> against `<role>_keys` when the shim binds, which is the first moment in the
+> boot path where both the table and this schema exist, and refuses four shapes:
+> a target this schema does not declare, a name that *is* a key here, a name
+> mapped to itself, and a name `::pack_alias_spec` below already canonicalises.
+>
+> That last one is why the engine-facing table is now one row long. Five of its
+> six rows were spellings this file already resolved, and deleting them changed
+> nothing any stage can observe. **If you add a row to `::pack_alias_spec` for a
+> spelling `flow_utils.tcl` also carries, the flow will refuse to boot until one
+> of the two is deleted** — and the refusal says which file to edit. That is the
+> intended behaviour: two places to read a spelling, one of them doing nothing,
+> is how the `device` row survived.
 
 ---
 

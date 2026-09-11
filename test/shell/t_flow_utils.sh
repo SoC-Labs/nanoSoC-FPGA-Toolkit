@@ -371,15 +371,81 @@ EOF
 
 # --- the part/board shim -----------------------------------------------------
 # ::part_alias is THE ONLY PLACE in the engine where a pack's spelling appears.
+#
+# Driven over EVERY row of the shipped table rather than one spelling written
+# out here. The table is the data; a driver carrying its own copy of one row
+# goes quietly vacuous the day that row is deleted, and that is not
+# hypothetical - this driver used to name 'name -> part_name', which was deleted
+# on 2026-09-11 as a duplicate of part/pack_api.tcl's own table.
+#
+# The stub pack API knows the alias TARGETS AND NOTHING ELSE, so every NAME in
+# the table has to arrive at its value THROUGH the alias and has no other way in.
 cat > "$D/pack_alias.tcl" <<EOF
 $LOAD
-proc part_get  {k} { if {\$k eq "part_name"} { return "xcfake-1" } ; error "no \$k" }
-proc part_has  {k} { return [expr {\$k eq "part_name"}] }
-proc part_keys {}  { return {part_name} }
-if {[part name] ne "xcfake-1"} { puts "the alias did not resolve: [part name]"; exit 1 }
-if {[part part_name] ne "xcfake-1"} { puts "the direct key broke"; exit 3 }
+set ::targets {}
+foreach n [array names ::part_alias] { lappend ::targets \$::part_alias(\$n) }
+proc part_has  {k} { return [expr {[lsearch -exact \$::targets \$k] >= 0}] }
+proc part_get  {k} { if {[part_has \$k]} { return "VALUE:\$k" } ; error "no key \$k" }
+proc part_keys {}  { return \$::targets }
+foreach n [array names ::part_alias] {
+    if {[part \$n] ne "VALUE:\$::part_alias(\$n)"} {
+        puts "'part \$n' did not resolve through the alias to \$::part_alias(\$n)"
+        exit 1
+    }
+    if {![part_have \$n]} { puts "'part_have \$n' said no for a key the alias reaches"; exit 1 }
+}
+foreach t \$::targets {
+    if {[part \$t] ne "VALUE:\$t"} { puts "the direct key '\$t' broke"; exit 3 }
+}
 exit 0
 EOF
+
+# How many rows the shipped table has. A table with none makes the driver above
+# prove nothing, which is a SKIP with the reason and never a green line - and
+# the shell has to be the one to decide that, because the driver cannot report
+# "inapplicable" and "held" through the same exit status.
+cat > "$D/alias_count.tcl" <<EOF
+$LOAD
+puts [array size ::part_alias]
+EOF
+
+# --- the alias tables against the real schema --------------------------------
+# The whole point of flow_pack_alias_check is that it runs against the REAL
+# pack schema, so this driver loads the real part/pack_api.tcl out of \$env(TK)
+# rather than stubbing one. No pack is loaded and none is needed: the check
+# validates the table against what the SCHEMA declares, which part/pack_api.tcl
+# builds at source time, not against what any one pack happens to set.
+cat > "$D/pack_shim_real.tcl" <<EOF
+$LOAD
+source [file join \$env(TK) part pack_api.tcl]
+flow_pack_shim
+exit 0
+EOF
+
+# $1 = driver, $2 = "" to require a clean bind, else a substring the refusal
+# must carry. Asserting the WORDING and not just the exit status is what keeps
+# these proofs honest: the good case here is a clean bind, so every planted
+# fault shows up as a refusal, and a proof that accepted any non-zero exit would
+# pass just as happily against a mutant whose sed merely broke the Tcl.
+cat > "$D/alias_wording.sh" <<'SH_EOF'
+#!/bin/sh
+out="$(TK="$TK" tclsh "$1" 2>&1)"; rc=$?
+if [ -z "$2" ]; then
+  [ "$rc" -eq 0 ] || { echo "exit $rc, wanted 0 - the shipped tables did not validate:"; echo "$out"; exit 1; }
+  printf '%s' "$out" | grep -qF -- "pack accessors bound" \
+    || { echo "the shim exited 0 without reporting a bind:"; echo "$out"; exit 1; }
+  for tbl in ::part_alias ::board_alias; do
+    printf '%s' "$out" | grep -qF -- "$tbl: " \
+      || { echo "the shim bound without $tbl reporting that it was checked:"; echo "$out"; exit 1; }
+  done
+  exit 0
+fi
+[ "$rc" -eq 1 ] || { echo "exit $rc, wanted 1 - a check ran and came out red:"; echo "$out"; exit 1; }
+printf '%s' "$out" | grep -qF -- "FLOW-FAIL" || { echo "not a die - no FLOW-FAIL in:"; echo "$out"; exit 1; }
+printf '%s' "$out" | grep -qF -- "$2" || { echo "refused, but not for '$2':"; echo "$out"; exit 1; }
+exit 0
+SH_EOF
+chmod +x "$D/alias_wording.sh"
 
 # part_have must PROBE, not die. A pack API may treat an unknown key as an
 # error; the engine needs the probing form, so the native call is wrapped once
@@ -697,8 +763,19 @@ fi
 rm -f "$KS/RAN"
 
 t_head "the pack shim: one alias table, and a probe that never dies"
-t_check futils.pack.alias "'part name' resolves through ::part_alias to the pack's own spelling" \
-    env TK="$FLOW_DIR" tclsh "$D/pack_alias.tcl"
+# EVERY row of the shipped table, or a skip saying there were none. A table with
+# no rows leaves nothing for the alias path to resolve, and a green line under
+# that would report a property that was never exercised.
+N_ALIAS="$(env TK="$FLOW_DIR" tclsh "$D/alias_count.tcl" 2>/dev/null | tail -1)"
+case "${N_ALIAS:-x}" in
+    ''|*[!0-9]*) N_ALIAS=-1 ;;
+esac
+if [ "$N_ALIAS" -gt 0 ]; then
+    t_check futils.pack.alias "every spelling in ::part_alias resolves to its target's value, and the targets still resolve directly" \
+        env TK="$FLOW_DIR" tclsh "$D/pack_alias.tcl"
+else
+    t_skip futils.pack.alias "::part_alias holds no rows (count reported: ${N_ALIAS}), so there is no aliased spelling to resolve - the property is unexercised, not satisfied"
+fi
 t_check futils.pack.probe "part_have answers 'no' for a pack API that treats an unknown key as an error" \
     env TK="$FLOW_DIR" tclsh "$D/pack_probe.tcl"
 t_check futils.pack.shim_missing "flow_pack_shim names the missing accessor instead of failing later inside a stage" \
@@ -717,13 +794,133 @@ if t_mutate "$M" "$FU_REL" 's/^    if {$mode eq "have"} { return 0 }$//'; then
 else
     t_skip futils.pack.probe.mutation "flow_pack_read's probe return has been rewritten - the sed expression no longer matches"
 fi
+# ALL FOUR of the shim's refusals go at once, and they have to: with only the
+# _get and _has tests neutered the shim reaches flow_pack_alias_check, which
+# calls ${domain}_keys on a pack API that is not there and leaves by a raw Tcl
+# error - also exit 1. The proof would then pass for a reason it did not
+# measure. One fault per copy still holds; the fault is "this shim refuses
+# nothing", and it now takes four edits to express.
 M="$(y_mut pack-shim_missing)" || M=""
 if t_mutate "$M" "$FU_REL" -e 's/        if {!\[flow_have ${domain}_get\]} {/        if {0} {/' \
-                                 -e 's/        if {!\[flow_have ${domain}_has\]} {/        if {0} {/'; then
-    t_check_fail futils.pack.shim_missing.mutation "with the binding check removed the shim reports success over a pack API that was never loaded" \
+                                 -e 's/        if {!\[flow_have ${domain}_has\]} {/        if {0} {/' \
+                                 -e 's/        if {!\[flow_have ${domain}_keys\]} {/        if {0} {/' \
+                                 -e 's/^        flow_pack_alias_check $domain$//'; then
+    t_check_fail futils.pack.shim_missing.mutation "with every one of the shim's refusals removed it reports success over a pack API that was never loaded" \
         sh -c 'TK="$1" tclsh "$2"; [ $? -eq 1 ]' _ "$M" "$D/pack_shim_missing.tcl"
 else
-    t_skip futils.pack.shim_missing.mutation "flow_pack_shim's accessor check has been rewritten - the sed expression no longer matches"
+    t_skip futils.pack.shim_missing.mutation "flow_pack_shim's accessor checks have been rewritten - the sed expressions no longer match"
+fi
+
+t_head "the alias tables are CHECKED against the pack schema, not merely read"
+#-----------------------------------------------------------------------------
+# WHY THESE PROOFS USE t_check AND NOT t_check_fail.
+#
+# Everywhere else in this file the good case is a REFUSAL and the planted fault
+# makes the toolkit accept, so "the assertion went non-zero" is the whole
+# property. Here it runs the other way round: the good case is a CLEAN BIND and
+# the planted fault is a bad row in the alias table, so the fault shows up AS
+# the refusal. A t_check_fail would then go green against any non-zero exit -
+# including a mutant whose sed merely broke the Tcl, which is a proof that
+# cannot tell the fault it planted from a typo. So each mutant below is asserted
+# to exit 1 AND to name the row it rejected and why. The ids still carry
+# `.mutation`, which is what test/MUTATION_COVERAGE counts.
+#
+# `device -> part_name` is not an invented fault. It is the row that stood in
+# ::part_alias until 2026-09-08, reproduced character for character: it was
+# found by reading, and the check below is what would have found it instead.
+#-----------------------------------------------------------------------------
+
+# Plant ONE extra row in ::part_alias, in its own copy of the toolkit. Prints
+# the mutant path, or nothing when the sed no longer matches - which the caller
+# turns into a SKIP with the reason, never a silent pass.
+y_part_row() {
+    local m; m="$(y_mut "$1")" || return 1
+    [ -n "$m" ] || return 1
+    t_mutate "$m" "$FU_REL" \
+        "s/^array set ::part_alias {\$/array set ::part_alias {\\n    $2/" || return 1
+    printf '%s' "$m"
+}
+
+t_check futils.pack.alias_schema "the SHIPPED ::part_alias and ::board_alias validate against the real pack schema, and the shim SAYS it checked them" \
+    env TK="$FLOW_DIR" "$D/alias_wording.sh" "$D/pack_shim_real.tcl" ""
+
+M="$(y_part_row alias-dead 'device      part_name')"
+if [ -n "$M" ]; then
+    t_check futils.pack.alias_schema.mutation.dead "the 2026-09-08 row put back - 'device -> part_name' - is refused as one that can NEVER FIRE, because 'device' is a schema key in its own right" \
+        env TK="$M" "$D/alias_wording.sh" "$D/pack_shim_real.tcl" "'device' IS A part SCHEMA KEY"
+else
+    t_skip futils.pack.alias_schema.mutation.dead "could not plant the row: the 'array set ::part_alias {' line in $FU_REL has changed shape, so the sed expression no longer matches"
+fi
+
+M="$(y_part_row alias-target 'widget      no_such_key')"
+if [ -n "$M" ]; then
+    t_check futils.pack.alias_schema.mutation.target "a row whose TARGET is not a schema key is refused, naming the target rather than the key a stage would have asked for" \
+        env TK="$M" "$D/alias_wording.sh" "$D/pack_shim_real.tcl" "'no_such_key' is not a part schema key"
+else
+    t_skip futils.pack.alias_schema.mutation.target "could not plant the row: the 'array set ::part_alias {' line in $FU_REL has changed shape"
+fi
+
+# 'zork' is deliberately NOT a schema key. A self-map whose name IS one would be
+# caught by the never-fires test too, and the proof could not then say which of
+# the two checks did the work.
+M="$(y_part_row alias-selfmap 'zork        zork')"
+if [ -n "$M" ]; then
+    t_check futils.pack.alias_schema.mutation.selfmap "a row mapping a name to ITSELF is refused as the no-op it is - flow_pack_read skips it by construction" \
+        env TK="$M" "$D/alias_wording.sh" "$D/pack_shim_real.tcl" "AN ALIAS FROM A NAME TO ITSELF"
+else
+    t_skip futils.pack.alias_schema.mutation.selfmap "could not plant the row: the 'array set ::part_alias {' line in $FU_REL has changed shape"
+fi
+
+# part/pack_api.tcl's own table maps part,speed -> speed_grade. flow_pack_read
+# probes the raw key first, so the pack API answers it and this row is inert.
+M="$(y_part_row alias-shadowed 'speed       speed_grade')"
+if [ -n "$M" ]; then
+    t_check futils.pack.alias_schema.mutation.shadowed "a spelling part/pack_api.tcl ALREADY resolves to the same target is refused - that is the 'there should not be two' hazard, per spelling" \
+        env TK="$M" "$D/alias_wording.sh" "$D/pack_shim_real.tcl" "part/pack_api.tcl ALREADY resolves 'speed'"
+else
+    t_skip futils.pack.alias_schema.mutation.shadowed "could not plant the row: the 'array set ::part_alias {' line in $FU_REL has changed shape"
+fi
+
+# The worse half of the same hazard: part,arch -> family in the pack API, so the
+# engine returns family while this table documents device. The pack API wins.
+M="$(y_part_row alias-diverted 'arch        device')"
+if [ -n "$M" ]; then
+    t_check futils.pack.alias_schema.mutation.diverted "a spelling the two tables resolve DIFFERENTLY is refused, and the message says which one the engine actually returns" \
+        env TK="$M" "$D/alias_wording.sh" "$D/pack_shim_real.tcl" "resolves 'arch' to 'family'"
+else
+    t_skip futils.pack.alias_schema.mutation.diverted "could not plant the row: the 'array set ::part_alias {' line in $FU_REL has changed shape"
+fi
+
+# One body, two domains - which is only true if the board table is reached. A
+# check that looped over `part` alone would pass every proof above.
+M="$(y_mut alias-board)" || M=""
+if t_mutate "$M" "$FU_REL" 's/^array set ::board_alias {}$/array set ::board_alias {sys_clk_freq_hz oscillator_hz}/'; then
+    t_check futils.pack.alias_schema.mutation.board "the BOARD table is validated too, not only the part one" \
+        env TK="$M" "$D/alias_wording.sh" "$D/pack_shim_real.tcl" "'sys_clk_freq_hz' IS A board SCHEMA KEY"
+else
+    t_skip futils.pack.alias_schema.mutation.board "could not plant the row: the 'array set ::board_alias {}' line in $FU_REL has changed shape"
+fi
+
+# Deleting the table is the one edit that turns every alias in a domain off in
+# SILENCE: flow_pack_read asks `info exists tbl($key)`, which answers 'no entry'
+# just as happily for an array that does not exist.
+M="$(y_mut alias-no-table)" || M=""
+if t_mutate "$M" "$FU_REL" 's/^array set ::board_alias {}$//'; then
+    t_check futils.pack.alias_schema.mutation.no_table "a table that has been DELETED is refused - an absent array reads as 'no entry' for every key" \
+        env TK="$M" "$D/alias_wording.sh" "$D/pack_shim_real.tcl" "there is no ::board_alias array"
+else
+    t_skip futils.pack.alias_schema.mutation.no_table "could not delete the table: the 'array set ::board_alias {}' line in $FU_REL has changed shape"
+fi
+
+# A GATE NEVER INVENTS A VERDICT FROM MISSING DATA. With the schema listing
+# empty there is nothing to validate the table against, and a green line there
+# would report a check that measured nothing.
+M="$(y_mut alias-no-schema)" || M=""
+if t_replace_line "$M" part/pack_api.tcl 'proc pack_keys {role {group ""}} {' 'proc pack_keys {role {group ""}} { return {} ;'; then
+    t_check futils.pack.alias_schema.mutation.no_schema "with the schema listing EMPTY the shim refuses, rather than reporting a table it had nothing to check against" \
+        env TK="$M" "$D/alias_wording.sh" "$D/pack_shim_real.tcl" "listed no schema keys at all"
+else
+    t_skip futils.pack.alias_schema.mutation.no_schema "could not empty the listing: pack_keys' proc line in part/pack_api.tcl has changed shape"
 fi
 
 t_head "try_step reports what happened, and carries on"
@@ -751,9 +948,11 @@ fi
 #-----------------------------------------------------------------------------
 # WHAT IS NOT PROVED HERE, AND WHY
 #
-# 24 of the 27 properties above carry a paired planted-fault proof. Three do
-# not, and the reason is that the fault they would plant is already planted
-# elsewhere rather than that nobody got to them:
+# 25 of the 28 properties above carry a paired planted-fault proof, 32 proofs in
+# all - the alias-table check accounts for eight of them on its own, one per
+# shape of row it refuses plus the two ways its own inputs can go missing.
+# Three properties carry none, and the reason is that the fault they would plant
+# is already planted elsewhere rather than that nobody got to them:
 #
 #   futils.seams.ok        asserts the SHIPPED seams.txt is well formed. The
 #                          three seams.* proofs corrupt a copy of that file in

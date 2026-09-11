@@ -23,39 +23,15 @@
 
 #=============================================================================
 # DEFECT
+#
+# EMPTY as of 2026-09-11, and that is a statement about what has been LOOKED
+# FOR, not a claim that none exist. Both entries that stood here were fixed on
+# the same day they were written down - which is the argument for writing them
+# down, and also the warning: each was a real defect that no assertion ever went
+# red about. MUTATION_COVERAGE catches a proof that gets deleted. Neither ledger
+# catches a defect nobody wrote an assertion for. The UNPROVEN list below is
+# where the next one is most likely hiding.
 #=============================================================================
-
-## flow/common/flow_utils.tcl :: ::part_alias is not validated against the schema
-# The alias table is the only place in the engine where a pack's spelling
-# appears, and nothing checks that the names on either side of it are real. A
-# dead alias is invisible: `device -> part_name` sat here reading as a promise
-# that `part device` returns the full part string, when the schema declares
-# `device` as the die and the alias therefore never fired. Removed 2026-09-08,
-# found by reading, not by a test.
-# part/pack_api.tcl validates its OWN alias table at source time. This second
-# table does not, so the next dead alias will be just as invisible.
-# FIX: either validate this table against the pack schema at source time, or
-# delete it and move its three entries into pack_api.tcl's table - there should
-# not be two. Recorded in CONTRACT.md section 8.
-
-## FLOW_MODE=project is the default, and no stage implements it
-# CONTRACT.md section 3 declares `project | direct | dfx | protocompiler`, and
-# mk/flow.mk:350 defaults to `project`. scripts/fpga-flow-check:1201 DOES
-# enum-validate the value, so a typo is refused - that part is right, and `dfx`
-# does reach something real (flow/steps/synth_setup.tcl:391 switches synthesis
-# to out_of_context for it).
-# What is wrong is that `project` NAMES A PATH NOTHING RUNS. flow/vivado/
-# 4_synth.tcl:64 says so in its own header: it does not implement `launch_runs
-# synth_1`, it runs the in-memory `direct` path whatever the mode says.
-# 4_synth.tcl:1056 and 5_impl.tcl:871 record the difference honestly, as a
-# NOTCOV line in the stage manifest - which is the right instinct at the wrong
-# severity. Every run this toolkit has ever produced declared one flow and
-# executed another, and the only place that is visible is a not-covered note.
-# `protocompiler` is worse: accepted by the checker, consumed by nothing at all.
-# FIX: default to `direct`, since that is what runs, and refuse `project` and
-# `protocompiler` in mk/flow.mk until a stage implements them. A declared mode
-# that silently maps onto a different one is the class of silent substitution
-# this toolkit was built to stop.
 
 #=============================================================================
 # UNPROVEN
