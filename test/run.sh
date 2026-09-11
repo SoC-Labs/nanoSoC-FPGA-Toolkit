@@ -117,7 +117,15 @@ for t in "${SUITES[@]}"; do
     # three suites plant their faults inside loops, so a grep of the source
     # would under-report them and the ledger would be wrong in the safe-looking
     # direction.
-    MUT_RAN="$MUT_RAN $name=$(grep -cE '^  ok +[A-Za-z0-9_.]*\.mutation([. ]|$)' "$CAP/$name.out")"
+    # Rejections AND skipped proofs. A proof that skipped for a stated reason
+    # (no tclsh, running as uid 0, a port that answers) is NOT a proof somebody
+    # deleted, and reporting it as one would fail the same cause twice - run.sh
+    # already grades skips through the hole and ratio gates. Counting both keeps
+    # the ledger answering exactly one question: does this suite still CARRY the
+    # proofs it claims?
+    _mok=$(grep -cE '^  ok +[A-Za-z0-9_.]*\.mutation([. ]|$)' "$CAP/$name.out")
+    _msk=$(grep -cE '^  -- +[A-Za-z0-9_.]*\.mutation([. ]|$)' "$CAP/$name.out")
+    MUT_RAN="$MUT_RAN $name=$((_mok + _msk)):$_mok:$_msk"
     [ "$1" -eq 0 ] && [ "$4" -gt 0 ] && MUT_HOLE="$MUT_HOLE $name"
     # A SUITE THAT ASSERTED NOTHING AND SKIPPED INSTEAD IS A HOLE, and today it
     # reports as a file that passed. t_summary cannot catch this: a suite that
@@ -203,15 +211,18 @@ fi
 #-----------------------------------------------------------------------------
 LEDGER="$HERE/MUTATION_COVERAGE"
 if [ -z "$FILTER" ] && [ -f "$LEDGER" ]; then
-    mut_bad=""; mut_total=0
+    mut_bad=""; mut_total=0; mut_skipped=""
     for entry in $MUT_RAN; do
-        mname="${entry%%=*}"; mgot="${entry##*=}"
+        mname="${entry%%=*}"; _rest="${entry#*=}"
+        mgot="${_rest%%:*}"; _tail="${_rest#*:}"
+        mrej="${_tail%%:*}"; mskp="${_tail##*:}"
         case " $MUT_HOLE " in *" $mname "*) continue ;; esac
         mwant="$(awk -v n="$mname" '$1==n {print $2; exit}' "$LEDGER")"
-        mut_total=$((mut_total + mgot))
+        mut_total=$((mut_total + mrej))
+        [ "$mskp" -gt 0 ] && mut_skipped="$mut_skipped $mname($mskp)"
         if [ -z "$mwant" ]; then
             mut_bad="$mut_bad
-  $mname is not in the ledger at all - it rejected $mgot planted fault(s) that
+  $mname is not in the ledger at all - it carries $mgot planted fault(s) that
     nothing has declared. Add the line."
         elif [ "$mgot" -lt "$mwant" ]; then
             mut_bad="$mut_bad
@@ -224,6 +235,7 @@ if [ -z "$FILTER" ] && [ -f "$LEDGER" ]; then
         fi
     done
     printf 'mutation:   %d planted faults rejected\n' "$mut_total"
+    [ -n "$mut_skipped" ] && printf '            proofs SKIPPED (precondition absent):%s\n' "$mut_skipped"
     if [ -n "$mut_bad" ]; then
         printf 'test/MUTATION_COVERAGE disagrees with what ran:%s\n' "$mut_bad"
         rc=1

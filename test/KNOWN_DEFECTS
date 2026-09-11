@@ -94,6 +94,30 @@
 # `tier.sh static deploy` runs deploy. Nothing says a name was dropped.
 # FIX: refuse a second positional, naming both.
 
+## scripts/fpga-flow-doctor :: a tool that cannot start is reported `ok`
+# `run()` (:107) merges stderr into stdout and discards the exit status, so a
+# tclsh that exits 127 with a linker error is reported PRESENT and **the
+# linker's error is printed as its version**. Carried as
+# t_known_defect doctor.tool.version.garbage.
+# FIX: grade the exit status; a non-zero probe is "present but unusable", which
+# usable() already has a state for.
+
+## scripts/fpga-flow-doctor :: a silent version answer loses the line entirely
+# A tool that answers nothing has its version line dropped rather than reported
+# unknown - and doctor applies the OPPOSITE rule to disk one section later.
+# Carried as t_known_defect doctor.tool.version.silent.
+# FIX: report `unknown`, the way the disk section already does.
+
+## scripts/fpga-flow-doctor :: an untraversable install reads as "not installed"
+# An install under a directory you cannot traverse - the group-restricted mount
+# doctor's own header was written from - is reported as "no bin/vivado",
+# identical to a root nobody installed, and the note sends the reader to the
+# module-tree owner. usable()'s third state is unreachable there: os.path.isfile
+# fails the same on EACCES as on ENOENT, so the traversal loop never runs, and
+# such installs are dropped from the report entirely.
+# Carried as t_known_defect doctor.state.untraversable.
+# FIX: distinguish EACCES from ENOENT at the isfile call.
+
 #=============================================================================
 # UNPROVEN
 #=============================================================================
@@ -128,9 +152,23 @@
 # WOULD SETTLE IT: the parts of each stage that do not call a tool, factored out
 # and driven under tclsh the way flow_utils.tcl now is.
 
-## fpga-flow-{doctor,hooks} are named by no test
-# doctor reports what a host has; hooks lists seams. Both have been run by hand
-# and neither is asserted on.
+## `make help-hooks` and scripts/fpga-flow-hooks are named by no test
+# CORRECTING MY OWN ENTRY, 2026-09-11. This used to read "doctor reports what a
+# host has; hooks lists seams... which t_seams.sh already knows how to check".
+# That named the wrong script. `scripts/fpga-flow-hooks` is the GIT-HOOK
+# installer - core.hooksPath, the vendor-collateral pre-commit/pre-push - and
+# its own header line 16 exists to stop exactly this confusion: "THESE ARE GIT
+# HOOKS. THEY ARE NOT FLOW HOOKS." The thing that lists seams out of seams.txt
+# is `make help-hooks` (mk/help.mk:13). I conflated the two while writing the
+# entry, in a file that warns about it in capitals.
+# They also need different suites. fpga-flow-hooks wants `git init` throwaway
+# repos, four subcommands (install/uninstall/status/selftest), the
+# refusal-on-existing-hooks path and the submodule `.git`-is-a-file case - a
+# precondition class (git, and a repo to mutate) that no suite here has yet.
+# `make help-hooks` needs none of that and is the cheaper of the two.
+# CLOSED for `doctor` on 2026-09-11: test/shell/t_doctor.sh, 29 proofs, driven
+# against a stub PATH and a sandbox MODULEPATH so host-dependence is controlled
+# rather than asserted.
 # CLOSED for `init` on 2026-09-11: test/shell/t_init.sh, 20 planted faults. What
 # it cost is the useful part of this entry - the round trip it was supposed to
 # be ("scaffold, then `make check` is clean") was WRONG. A fresh scaffold is
@@ -138,9 +176,8 @@
 # assertion is that the refusal names exactly the decisions the scaffolder left
 # open and nothing else. Writing the suite also turned up two defects in
 # fpga-flow-init that reading it had not.
-# WOULD SETTLE IT for the other two: doctor is pure host-inspection output and
-# could be driven from the harness today; hooks answers from seams.txt and the
-# steps directory, which t_seams.sh already knows how to check.
+# WOULD SETTLE IT: start with `make help-hooks`, which answers from seams.txt
+# and the steps directory - t_seams.sh already knows how to check that shape.
 
 ## mk/flow.mk: 1709 lines, and only its parse-time guards are tested
 # t_contract.sh covers the `$(error)` guards thoroughly - 13 planted faults
