@@ -86,9 +86,10 @@ and an exit code that collapsed into its neighbour all leave a run that looks
 exactly like a correct one. The stage finishes, the bitstream appears, and
 nothing says which of the two designs it built.
 
-27 properties, 24 of them with a paired planted-fault proof (the three
-without are proved from the other side, and the file says which and why): the
-**shadow guard** (`proc`
+28 properties, 25 of them with a paired planted-fault proof — 32 proofs in all,
+because the alias-table check carries eight on its own (the three properties
+without a proof are proved from the other side, and the file says which and
+why): the **shadow guard** (`proc`
 silently replaces a command — the reference toolkit's equivalent has fired in
 anger, on a helper that shadowed a builtin and aborted a route stage 2.5 hours
 in); `flow_config` rejecting a typo'd key; **exit 1 and exit 2 staying
@@ -99,7 +100,20 @@ at a **call site**, which otherwise disarms the guard it was arming, silently
 and forever; hooks being optional, recorded, run in the caller's scope, and able
 to **abort the stage**; a project step override replacing the toolkit's file
 wholesale; the knob census reading files rather than running them; the pack
-alias table; and `try_step`.
+alias table, **validated against the pack schema** so that a row which can never
+fire is refused rather than read past; and `try_step`.
+
+That last one is the defect this file was extended for. `::part_alias` is the
+only place in the engine where a pack's spelling appears, and nothing checked
+that the names on either side of it were real — so `device → part_name` sat
+there for weeks reading as a promise that `part device` returns the full part
+string, when the schema declares `device` as the bare die. It was removed by
+*reading*. The eight proofs now plant that exact row back, plus a target no
+schema declares, a name mapped to itself, a spelling `pack_api.tcl` already
+resolves (the same way and a different way), the same fault in the board table,
+a deleted table, and an empty schema listing — the last of which must make the
+shim **refuse**, because a check with nothing to check against has measured
+nothing.
 
 Everything runs under bare `tclsh`. This file is also what keeps that true: the
 day a helper starts calling a Vivado command unguarded, these drivers stop

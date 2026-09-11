@@ -109,6 +109,7 @@ foreach __c {
     fresh_report flow_have flow_env flow_need_env flow_knob_dump flow_knob_scan
     flow_assert_input flow_seams flow_hook flow_hook_exists flow_hook_path
     flow_step flow_steps_available flow_boot flow_banner flow_pack_shim
+    flow_pack_alias_check
     flow_pack_read part board part_have board_have
 } {
     if {[llength [info commands $__c]]} {
@@ -623,25 +624,240 @@ proc flow_step {name} {
 # the full part string. It returns the die. Two names for two different things,
 # one of which silently loses a package and a speed grade, is exactly the class
 # of confusion an alias table is supposed to remove. Removed 2026-09-08, found
-# by the pack API's own author.
+# BY READING - which is why it survived as long as it did, and why
+# flow_pack_alias_check below exists.
 #
-# THE STANDING HAZARD: this table is NOT validated against the schema, so the
-# next dead alias will be just as invisible. part/pack_api.tcl validates its own
-# alias table at source time; this second table does not. Either it should, or
-# there should not be two tables. Recorded in CONTRACT §8.
+# WHAT MAY STAND IN THESE TABLES, now that something checks. Every row is
+# `<what a stage asks for>   <what the schema calls it>`, and four shapes are
+# refused at boot, each of them a row that LOOKS like a mapping and is not:
+#
+#   the target is not a schema key   the alias resolves to nothing, and the
+#                                    eventual failure names the key the stage
+#                                    asked for rather than the row that is wrong
+#   the NAME is a schema key         it can never fire - flow_pack_read probes
+#                                    the raw key first and the pack answers it.
+#                                    This is the `device` row above, verbatim
+#   the name maps to itself          flow_pack_read skips it by construction, so
+#                                    it does nothing at all
+#   part/pack_api.tcl already
+#   canonicalises the name           the pack API's own table answers the raw
+#                                    probe, so this row is never consulted - and
+#                                    if the two tables disagree, the pack API
+#                                    wins and this one documents a value the
+#                                    engine does not return
+#
+# THE FOURTH SHAPE IS WHAT EMPTIED THESE TABLES ON 2026-09-11, and it is the
+# "there should not be two" half of the defect. Five of the six rows that stood
+# here were already answered elsewhere: `name`, `min_vivado`, `clk_freq_hz` and
+# board `name` are all in part/pack_api.tcl's own alias table, mapping to the
+# same targets; `platform -> platform` was a self-map whose name is a board
+# schema key in its own right. Deleting all five changed NOTHING a stage can
+# observe - every one of those six spellings still resolves, four through the
+# pack API and two because they were always schema keys - which is the
+# demonstration that they were duplicates rather than the load-bearing rows they
+# read as.
+#
+# The alternative fix was to delete this table outright and move its rows into
+# part/pack_api.tcl. It was not taken, for two reasons. CONTRACT.md section 8
+# requires the engine to reach both packs "through one shim that owns an alias
+# table", so deleting it is a contract change; and part/pack_schema.tcl section
+# 1e states that the pack-facing table canonicalises WHAT A PACK WRITES while
+# this one canonicalises WHAT A STAGE ASKS FOR. Moving `buffer` across would
+# make `part_set buffer BUFG` a legal thing for a pack to write, widening the
+# pack-facing surface for the engine's convenience. Enforcing that no SPELLING
+# appears in both tables gets the same guarantee without either cost.
+#
+# `buffer -> global_buffer` is the one row that earns its place: nothing else in
+# this toolkit resolves it, so deleting it would break `part buffer` today.
 array set ::part_alias {
-    name        part_name
     buffer      global_buffer
-    min_vivado  min_vivado_version
 }
-array set ::board_alias {
-    name        board_name
-    clk_freq_hz sys_clk_freq_hz
-    platform    platform
+
+# EMPTY, AND THAT IS A FINDING RATHER THAN AN OMISSION - see above. It is still
+# declared, because flow_pack_read reads it through `info exists tbl($key)`,
+# which answers "no entry" just as happily for an array that does not exist:
+# deleting the line would turn every future board alias off in silence, so
+# flow_pack_alias_check refuses an absent table rather than an empty one.
+array set ::board_alias {}
+
+
+# Validate one domain's alias table against the pack schema: the four shapes of
+# dead row documented above, plus the two ways this check's own inputs can be
+# missing, which it refuses rather than passes.
+#
+# WHY IT RUNS FROM flow_pack_shim AND NOT AT SOURCE TIME. This file is sourced
+# BEFORE the pack API - flow_boot sources part/pack_api.tcl, in section 9 below
+# - so at the moment these tables are defined there is no schema to check them
+# against. part/pack_api.tcl validates its OWN alias table at source time
+# precisely because it owns the schema by then; this one cannot, and that
+# asymmetry is the whole reason the second table went unchecked for as long as
+# it did. The shim is the first point in the boot path where the table and the
+# schema both exist, and the last point before a stage can read a pack value,
+# which makes it the only place the check is both possible and early. A check
+# that ran later - on first use, say - would validate only the rows something
+# happened to ask for, and a dead row is dead exactly because nothing asks.
+#
+# IT READS THE SCHEMA THROUGH ${domain}_keys, the accessor CONTRACT.md section 8
+# publishes, rather than through ::pack_schema. part/pack_schema.tcl's own
+# header says that a consumer reaching past the accessors into the tables is the
+# coupling the accessors exist to prevent, and a validator is not exempt from
+# that.
+#
+# IT REPORTS EVERY PROBLEM AT ONCE, each with what to do about it. A validator
+# that stops at the first costs an edit-and-rerun cycle per row, and the cycles
+# are where people stop reading the message and start guessing - the same rule
+# pack_validate follows for missing keys, for the same reason.
+proc flow_pack_alias_check {domain} {
+    upvar #0 ${domain}_alias tbl
+
+    # THE TABLE ITSELF CAN GO MISSING AND NOTHING DOWNSTREAM WOULD SAY SO.
+    # flow_pack_read asks `info exists tbl($key)`, which is 0 both for "no such
+    # entry" and for "no such array", so deleting the declaration switches every
+    # alias in that domain off without a word. Check the array, not only its
+    # contents.
+    if {![array exists tbl]} {
+        die "there is no ::${domain}_alias array." \
+            "  flow_pack_read reads every $domain spelling through it and asks" \
+            "  'info exists', which answers 'no entry' for an array that is not" \
+            "  there - so every $domain alias would be off and the only symptom" \
+            "  would be a stage dying on a key the pack does declare." \
+            "  Declare it in flow/common/flow_utils.tcl section 8. An EMPTY" \
+            "  table is legitimate and is spelled: array set ::${domain}_alias {}"
+    }
+
+    # The schema this table has to agree with. An empty listing is NOT a clean
+    # table - it is a check with nothing to check against, and reporting a pass
+    # from it would be the gate inventing a verdict from missing data.
+    set keys [${domain}_keys]
+    if {![llength $keys]} {
+        die "the $domain pack API listed no schema keys at all." \
+            "  ${domain}_keys is what ::${domain}_alias is validated against, so" \
+            "  an empty listing means the table was NOT checked - and a check" \
+            "  that measured nothing must not come out green." \
+            "  Either part/pack_schema.tcl did not parse into the $domain" \
+            "  schema, or ${domain}_keys is not part/pack_api.tcl's own." \
+            "  scripts/fpga-flow-part-probe --role $domain says which."
+    }
+
+    # part/pack_api.tcl's canonicaliser, which is the only way to ask whether
+    # the OTHER table already answers a spelling. Guarded rather than assumed:
+    # pack_key is not one of the accessors CONTRACT.md section 8 publishes, so a
+    # different pack API may not offer it - and in that case this check SAYS it
+    # did not run rather than passing three checks and implying four.
+    set can_ask_api [flow_have pack_key]
+    if {!$can_ask_api} {
+        warn "this pack API offers no 'pack_key', so ::${domain}_alias was NOT"
+        warn "  checked for spellings the pack API's own table already resolves."
+        warn "  The other three checks in flow_pack_alias_check did run."
+    }
+
+    set problems {}
+    foreach name [lsort [array names tbl]] {
+        set to $tbl($name)
+
+        # (1) A SELF-MAP IS A NO-OP WEARING THE COSTUME OF A MAPPING.
+        # flow_pack_read skips a row whose target equals its name - deliberately,
+        # so a pack API that raises on an unknown key is not asked the same
+        # question twice - so the row does nothing whatsoever, while reading as
+        # though the engine's spelling were being translated.
+        if {$to eq $name} {
+            lappend problems \
+                "  $name -> $to : AN ALIAS FROM A NAME TO ITSELF." \
+                "      flow_pack_read skips a row whose target is its own name," \
+                "      so this one does nothing at all." \
+                "      If '$name' is already a $domain schema key, delete the" \
+                "      row - the key resolves without it. If it is not, the row" \
+                "      has lost its real target and needs it back."
+            continue
+        }
+
+        # (2) THE 2026-09-08 DEFECT, AND THE ONE THIS PROC WAS WRITTEN FOR. A
+        # row whose NAME is a schema key in its own right CAN NEVER FIRE:
+        # flow_pack_read probes the raw key first, the pack answers it, and the
+        # alias is never reached. Nothing about the row looks wrong - it is
+        # invisible - and it reads as a promise about what `<domain> <name>`
+        # returns. `device -> part_name` stood here claiming `part device` gave
+        # the full part string; it gave the die, one package and one speed grade
+        # short, and every reader of this table was told otherwise.
+        if {[lsearch -exact $keys $name] >= 0} {
+            lappend problems \
+                "  $name -> $to : '$name' IS A $domain SCHEMA KEY." \
+                "      The row can NEVER FIRE. flow_pack_read probes the raw" \
+                "      key first and the pack answers it, so '$domain $name'" \
+                "      returns $name's own value, never '$to'." \
+                "      Delete the row. A stage that wants '$to' has to ask for" \
+                "      '$to': the two are different facts, and a row saying" \
+                "      otherwise is read as a promise the engine does not keep."
+            continue
+        }
+
+        # (3) A target the schema does not declare resolves to nothing. The
+        # alias probe fails exactly as the raw probe did, so the engine dies
+        # naming the key the STAGE asked for - not the row that is wrong.
+        if {[lsearch -exact $keys $to] < 0} {
+            lappend problems \
+                "  $name -> $to : '$to' is not a $domain schema key." \
+                "      Nothing declares it, so the row resolves to nothing and" \
+                "      the failure it eventually causes names '$name' rather" \
+                "      than this row." \
+                "      Fix the target's spelling, or add the key to" \
+                "      part/pack_schema.tcl if it is a fact a pack should state."
+            continue
+        }
+
+        # (4) THE SECOND TABLE. part/pack_api.tcl owns a pack-facing alias table
+        # and canonicalises through it INSIDE ${domain}_has, which
+        # flow_pack_read calls on the raw key before it ever consults this one.
+        # So a spelling that table resolves is answered there and this row is
+        # inert; and where the two disagree, the pack API wins while this table
+        # documents a target the engine never returns.
+        if {$can_ask_api} {
+            set canon [pack_key $domain $name]
+            if {$canon eq $to} {
+                lappend problems \
+                    "  $name -> $to : part/pack_api.tcl ALREADY resolves '$name'." \
+                    "      Its own table maps it to the same '$to', and" \
+                    "      flow_pack_read probes the raw key first, so this row" \
+                    "      is never consulted." \
+                    "      Delete it here. A spelling standing in both tables is" \
+                    "      the 'there should not be two' hazard: two places to" \
+                    "      read, one of which is doing nothing."
+            } elseif {$canon ne $name} {
+                lappend problems \
+                    "  $name -> $to : part/pack_api.tcl resolves '$name' to '$canon'," \
+                    "      AND IT WINS. flow_pack_read probes the raw key first" \
+                    "      and the pack API canonicalises it there, so the" \
+                    "      engine returns '$canon' while this row says '$to'." \
+                    "      Delete whichever of the two rows is wrong. They" \
+                    "      answer the same question and only one is ever used."
+            }
+        }
+    }
+
+    if {[llength $problems]} {
+        die "::${domain}_alias does not agree with the $domain pack schema." \
+            {*}$problems \
+            "  This table is the ONLY place in the engine where a pack's" \
+            "  spelling appears (flow/common/flow_utils.tcl section 8), which is" \
+            "  why a row that cannot fire is invisible rather than wrong-looking," \
+            "  and why it is checked here rather than read." \
+            "  Checked against the [llength $keys] keys ${domain}_keys lists."
+    }
+
+    # SAID BY THE CHECK ITSELF, not by its caller. A confirmation printed
+    # alongside the call site survives the call site being deleted, and a log
+    # line claiming a check that no longer runs is the defect class this whole
+    # file is written against - it is how the `device` row stayed invisible.
+    # Delete the call and this line goes with it.
+    say "::${domain}_alias: [array size tbl] row(s) checked against the\
+         [llength $keys] keys ${domain}_keys lists"
 }
 
 # Build `part`/`part_have` over part_get/part_has, and the same for board. One
-# body, two domains, so the two can never drift apart.
+# body, two domains, so the two can never drift apart - and the same loop
+# validates that domain's alias table, because this proc is the one moment in
+# the boot path where the table and the schema it has to agree with both exist
+# (see flow_pack_alias_check's header for why that is not source time).
 proc flow_pack_shim {} {
     foreach domain {part board} {
         if {![flow_have ${domain}_get]} {
@@ -655,6 +871,16 @@ proc flow_pack_shim {} {
                 "  to declare from one it declared as empty, and every" \
                 "  conditional feature would have to guess."
         }
+        if {![flow_have ${domain}_keys]} {
+            die "the pack API defines no '${domain}_keys'." \
+                "  CONTRACT.md section 8 lists it among the engine-facing" \
+                "  accessors, and it is the schema listing ::${domain}_alias is" \
+                "  validated against. Without it the table would be bound" \
+                "  UNCHECKED, and an alias that can never fire is invisible" \
+                "  rather than wrong-looking - which is the whole reason the" \
+                "  check exists."
+        }
+        flow_pack_alias_check $domain
     }
     say "pack accessors bound: part/part_have over part_get, board/board_have over board_get"
 }
