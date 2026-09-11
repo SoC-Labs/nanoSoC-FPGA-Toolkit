@@ -57,6 +57,43 @@
 # Expressed as t_known_defect init.exitcode.emptywrite, so it goes RED when fixed.
 # FIX: `fail` (exit 1), not `refuse`.
 
+## ci/tier.sh :: an unknown tier name can select NOTHING and exit 0
+# Acceptance is a REGEX match (`grep -q " $WANT "`, ci/tier.sh:124); selection is
+# string EQUALITY (:228/:231). A name that matches the regex but equals no tier
+# passes acceptance and then selects nothing. MEASURED:
+#   ci/tier.sh 'stati.' --only  ->  exit 0, 9 skipped, 0 run,
+#                                   "All recorded gates passed."
+# Without --only the same name selects EVERY tier including deploy, because the
+# prefix walk never finds its stopping point. A CI job with a typo'd tier name
+# goes GREEN having run nothing - the exact failure the verdict layer exists to
+# prevent. Carried as t_known_defect tier.refuse.regex_name and
+# tier.select.empty_is_never_green; fixing the first retires both.
+# FIX: make acceptance string equality, the same test selection uses.
+
+## ci/tier.sh :: the static tier's Tcl gate reports findings about files it never opened
+# `tclsh - "$f"` (ci/tier.sh:300-307). A standard tclsh does not consume the `-`,
+# so the script reads stdin and `$f` lands in $argv. Every open fails, the
+# one-liner exits 2 - its OWN "could not read" code - and the caller grades any
+# non-zero as unbalanced. MEASURED: the static tier FAILS with
+# `static.tcl.complete unbalanced braces/brackets/quotes` while an independent
+# `info complete` over the same files finds ZERO unbalanced. False RED, not false
+# green - but the static tier cannot pass on any host with a tclsh, and it is a
+# gate inventing a specific finding from a file it never read.
+# FIX: `tclsh "$script" "$f"`, and make the reader distinguish "could not read"
+# from "did not balance".
+
+## ci/tier.sh and ci/capability.sh :: an option with no operand never terminates
+# `--fpga-dir` (tier.sh:118) and `--require`/`--conf` (capability.sh:114-115) do
+# `shift 2`. With one argument left the shift FAILS and shifts nothing, so the
+# argv loop spins forever: no verdict, no output, the runner held until an
+# external timeout. Confirmed hanging for both.
+# FIX: check `$#` before `shift 2`, and refuse with exit 2 naming the option.
+
+## ci/tier.sh :: a second tier name is silently discarded
+# `WANT="$1"` (:121) inside the argv loop, so the LAST name wins:
+# `tier.sh static deploy` runs deploy. Nothing says a name was dropped.
+# FIX: refuse a second positional, naming both.
+
 #=============================================================================
 # UNPROVEN
 #=============================================================================
