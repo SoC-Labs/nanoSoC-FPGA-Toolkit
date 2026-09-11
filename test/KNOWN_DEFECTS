@@ -24,14 +24,38 @@
 #=============================================================================
 # DEFECT
 #
-# EMPTY as of 2026-09-11, and that is a statement about what has been LOOKED
-# FOR, not a claim that none exist. Both entries that stood here were fixed on
-# the same day they were written down - which is the argument for writing them
-# down, and also the warning: each was a real defect that no assertion ever went
-# red about. MUTATION_COVERAGE catches a proof that gets deleted. Neither ledger
-# catches a defect nobody wrote an assertion for. The UNPROVEN list below is
-# where the next one is most likely hiding.
+# This section was EMPTY for about an hour on 2026-09-11, between the two
+# original entries being fixed and the two below arriving from the first suite
+# ever written for fpga-flow-init. That is worth leaving on the record, because
+# the empty section was accurate and useless at the same time: it was a
+# statement about what had been LOOKED FOR, never a claim that none existed.
+#
+# Note what both generations have in common. Every entry here was found by
+# somebody READING code, and not one was ever caught by an assertion going red.
+# MUTATION_COVERAGE catches a proof that gets deleted. Neither ledger catches a
+# defect nobody wrote an assertion for. The UNPROVEN list below is the map of
+# where the next one is hiding.
 #=============================================================================
+
+## scripts/fpga-flow-init :: the template's own instructions count as unfilled work
+# `templates/design.mk.in:12` reads "#   1. Fill in every <<FILL IN>>. ..." - a
+# literal marker inside the instructions. A project that has made every real
+# decision still gets `MISS UNFILLED PLACEHOLDERS  1 marker(s) in 1 file(s)`
+# pointing at a comment, and the only way to clear it is to delete the
+# instructions telling you what to do. Nothing in the next-steps text says so.
+# Expressed as t_known_defect init.complete.decisions, so it goes RED when fixed.
+# FIX: in the TEMPLATE, not the checker - spell the instruction without a
+# literal marker.
+
+## scripts/fpga-flow-init :: an empty write refuses (exit 2) instead of failing (exit 1)
+# `install_one` line 293: `[ -s "$dst" ] || refuse "wrote an empty $dst..."`.
+# CONTRACT section 10 reserves exit 2 for "refused - nothing was written", and
+# this path runs AFTER expand() created the file and after earlier templates are
+# already installed. Measured: rc=2 with files already on disk. The script's own
+# header says why it matters - "a caller that cannot tell those apart retries the
+# wrong one".
+# Expressed as t_known_defect init.exitcode.emptywrite, so it goes RED when fixed.
+# FIX: `fail` (exit 1), not `refuse`.
 
 #=============================================================================
 # UNPROVEN
@@ -67,14 +91,19 @@
 # WOULD SETTLE IT: the parts of each stage that do not call a tool, factored out
 # and driven under tclsh the way flow_utils.tcl now is.
 
-## fpga-flow-{doctor,init,hooks} are named by no test
-# doctor reports what a host has; init scaffolds a project; hooks lists seams.
-# All three have been run by hand and none is asserted on. init is the one that
-# matters: a project scaffolded wrong fails later, in a stage, in a way that
-# reads as the project's fault.
-# WOULD SETTLE IT: scaffold into a sandbox with fpga-flow-init, then run
-# `make check` against the result and assert it is clean. The pieces for that
-# already exist in test/lib/harness.sh (t_project, t_sandbox).
+## fpga-flow-{doctor,hooks} are named by no test
+# doctor reports what a host has; hooks lists seams. Both have been run by hand
+# and neither is asserted on.
+# CLOSED for `init` on 2026-09-11: test/shell/t_init.sh, 20 planted faults. What
+# it cost is the useful part of this entry - the round trip it was supposed to
+# be ("scaffold, then `make check` is clean") was WRONG. A fresh scaffold is
+# deliberately incomplete and `make check` is supposed to refuse it, so the real
+# assertion is that the refusal names exactly the decisions the scaffolder left
+# open and nothing else. Writing the suite also turned up two defects in
+# fpga-flow-init that reading it had not.
+# WOULD SETTLE IT for the other two: doctor is pure host-inspection output and
+# could be driven from the harness today; hooks answers from seams.txt and the
+# steps directory, which t_seams.sh already knows how to check.
 
 ## mk/flow.mk: 1709 lines, and only its parse-time guards are tested
 # t_contract.sh covers the `$(error)` guards thoroughly - 13 planted faults
