@@ -127,7 +127,20 @@ MARKER = re.compile(r"<<\s*FILL\s+IN")
 # sets declared once in CONTRACT §3.3 and §9.5 with no directory behind them, so
 # "a single declared list" (CONTRACT §6) is the correct form. If any of them
 # ever grows a directory, it moves.
-FLOW_MODES = ("project", "direct", "dfx", "protocompiler")   # §3.3 Target
+#
+# A CLOSED SET STILL HAS TO BE CLOSED AROUND SOMETHING THAT EXISTS. See
+# FLOW_MODES below: a declared list is only as honest as the code behind each
+# entry, and nothing in this file can tell an implemented value from a name.
+# FLOW_MODE IS A SET OF ONE, AND THAT IS THE FIX, NOT AN OVERSIGHT. It listed
+# four until 2026-09-11 - project, direct, dfx, protocompiler - and three of
+# them named a path nothing in the toolkit ran. `project` defaulted, so every
+# build ever produced declared one flow and executed another; this file was the
+# gate that waved it through, because an enum can only check a value against a
+# list and cannot check the list against the code. mk/flow.mk now refuses the
+# other three at parse time, so a project reaching this check has already been
+# stopped; this copy is what catches a hand-run `--var FLOW_MODE=...`. See
+# CONTRACT §3.3 for the measurement of what each of the four did.
+FLOW_MODES = ("direct",)                                     # §3.3 Target
 PLATFORMS = ("bare", "pynq")                                 # §3.3 Target
 FW_HEX_FORMATS = ("byte", "word")                            # §3.3 Firmware
 BIN_STYLES = ("zynq7", "zynqmp")                             # §3.3, §9.5
@@ -1198,7 +1211,7 @@ def run_checks():
     optional(rep, "TARGET_DIR", target_dir, "no separate target collateral")
 
     # --- modes ---------------------------------------------------------------
-    enum(rep, "FLOW_MODE", FLOW_MODES, "defaults to project")
+    enum(rep, "FLOW_MODE", FLOW_MODES, "defaults to direct")
     enum(rep, "PLATFORM", PLATFORMS, "defaults to bare")
 
     # --- RTL -----------------------------------------------------------------

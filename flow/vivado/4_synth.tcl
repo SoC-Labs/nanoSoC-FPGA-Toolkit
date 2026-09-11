@@ -61,11 +61,17 @@
 #
 # WHAT THIS FILE DOES NOT DO
 # ===========================================================================
-# It does not implement FLOW_MODE=project's `launch_runs synth_1` path. Every
-# mode runs the same in-memory synthesis and writes the same checkpoint, because
-# the checkpoint is the artefact CONTRACT.md section 4 grades in every mode. When
-# FLOW_MODE is anything but `direct` the difference is announced, recorded in the
-# manifest and listed in the gate's NOT-covered section - never silently ignored.
+# It does not implement a `launch_runs synth_1` path. It runs an in-memory
+# synthesis and writes a checkpoint, which is the artefact CONTRACT.md section 4
+# grades.
+#
+# That sentence used to end "...FLOW_MODE=project's launch_runs path", and the
+# variable used to default to `project` - so every run this toolkit ever
+# produced declared one flow and executed another, with the difference recorded
+# only as a not-covered bullet in the gate. It is now refused instead: `direct`
+# is the default and the only accepted value, at make parse time in mk/flow.mk
+# and again in flow_boot for a stage run by hand. If a launch_runs path is ever
+# written, it gets a mode name on the day it runs and not before.
 #
 # Copyright (C) 2026, SoC Labs (www.soclabs.org)
 ################################################################################
@@ -568,9 +574,10 @@ step "constraints"
 
 proc read_pin_xdc {path} {
     read_xdc $path
-    # The project-mode half of the same decision. Guarded rather than assumed:
-    # in a checkpoint flow there is no constraints fileset and `get_files` has
-    # nothing to return, which is not an error - it is the other flow.
+    # The FILESET half of the same decision. Guarded rather than assumed: what
+    # `get_files` returns depends on whether a fileset exists at this point, and
+    # an empty answer is not an error - a pure checkpoint flow has no fileset to
+    # hang a property on, and the read window is then the stage itself.
     catch {
         set __o [get_files -quiet [file tail $path]]
         if {[llength $__o]} {
@@ -585,9 +592,10 @@ foreach f $XDC_PINS { read_pin_xdc $f }
 
 # Clock definitions: read here, and marked NOT used in implementation, because
 # implementation takes the same definitions from XDC_TIMING. Marking rather than
-# merely not-reading matters in project mode, where the file joins a fileset
-# that later stages also open - without the property Vivado would apply it at
-# implementation too and every clock would be defined twice.
+# merely not-reading is belt and braces, and the braces are what is load-bearing
+# here: whenever the file lands in a fileset a later stage also opens, Vivado
+# would otherwise apply it at implementation too and every clock would be
+# defined twice.
 proc read_clocks_xdc {path} {
     read_xdc $path
     catch {
@@ -1053,12 +1061,41 @@ lappend NOTCOV "whether the design read is the design anyone asked for. Selectio
                 stage - is where a swap shows"
 lappend NOTCOV "power. report_power with no switching activity is a vectorless\
                 estimate and is off by default (REPORT_POWER)"
-if {$FLOW_MODE ne "direct"} {
-    lappend NOTCOV "FLOW_MODE is '$FLOW_MODE' and this stage ran the in-memory\
-                    checkpoint flow. The project-mode launch_runs path, DFX\
-                    partition handling and ProtoCompiler are NOT implemented by\
-                    this stage; what it writes is what CONTRACT.md section 4\
-                    grades in every mode"
+# THE FLOW_MODE BULLET WAS HERE, and it read: "FLOW_MODE is '$FLOW_MODE' and
+# this stage ran the in-memory checkpoint flow." It was true, and it was the
+# ONLY place in a run where the substitution was visible - a toolkit built to
+# refuse silent substitutions recording its own in a not-covered note. Both
+# layers now refuse every mode but `direct` (mk/flow.mk at parse time, flow_boot
+# in flow/common/flow_utils.tcl for a stage run by hand), so the bullet could
+# only ever say that `direct` ran the direct flow. A not-covered line that
+# covers nothing is noise in the one section of this file a reader is meant to
+# read closely, so it is gone rather than left to be skimmed past.
+#
+# WHAT IT WAS HALF-REACHING FOR SURVIVES IT, because SYNTH_MODE survives the
+# mode that used to derive it. An out-of-context synthesis inserts NO IO BUFFER
+# on any port, and nothing in this flow after this point can tell that netlist
+# from a board-level one: implementation places it, the router routes it, and
+# write_bitstream produces an image that configures a device whose pins are
+# connected to nothing. `iob` in the manifest above is the measurement - the
+# Bonded IOB row read back out of the utilization report - and this gate does
+# not grade it, so the gap is STATED rather than left implied.
+if {![info exists SYNTH_MODE]} {
+    # A project override replaced flow/steps/synth_setup.tcl and did not leave
+    # the knob behind. The honest answer is that this gate cannot tell, which is
+    # not the same answer as "buffers were inserted" (CONTRACT.md section 7).
+    lappend NOTCOV "which synthesis mode ran, and therefore whether any IO buffer\
+                    was inserted at all. A project step override replaced\
+                    synth_setup and left no SYNTH_MODE for this gate to read; an\
+                    out-of-context netlist has no buffer on any port and measures\
+                    [prov_stage_get iob] bonded IOB either way"
+} elseif {$SYNTH_MODE eq "out_of_context"} {
+    lappend NOTCOV "whether this netlist is a WHOLE DEVICE. SYNTH_MODE=out_of_context,\
+                    so synthesis inserted NO IO buffer on any port and\
+                    reports/utilization_synth.rpt measured [prov_stage_get iob]\
+                    bonded IOB. That is correct for a packaged IP or a\
+                    reconfigurable module, and for a board-level top it is a\
+                    bitstream that configures unconnected pins - nothing\
+                    downstream of this stage can tell the two cases apart"
 }
 if {[llength $GENERICS]} {
     lappend NOTCOV "whether each of the [llength $GENERICS] RTL_PARAMS generic(s)\

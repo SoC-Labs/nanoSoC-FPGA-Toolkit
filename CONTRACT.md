@@ -155,10 +155,35 @@ TARGET_DIR      ?= $(FPGA_DIR)/targets/$(TARGET)
 PART_DIR        ?= $(FPGA_FLOW_DIR)/part/$(PART)
 BOARD_PART      ?=                    # e.g. xilinx.com:kr260_som:part0:1.1
 BOARD_REPO_PATHS?=
-FLOW_MODE       ?= project            # project | direct | dfx | protocompiler
+FLOW_MODE       ?= direct             # direct. THE ONLY ACCEPTED VALUE - see below
 PLATFORM        ?= bare               # bare | pynq
 SYS_CLK_FREQ_HZ ?=                    # ALSO compiled into firmware. See §3.4
 ```
+
+**`FLOW_MODE` DECLARES ONE VALUE BECAUSE ONE PATH IS IMPLEMENTED. Corrected
+2026-09-11.** This read `project | direct | dfx | protocompiler` and defaulted
+to `project`, and three of those four names selected nothing:
+
+| value | what it actually changed, measured |
+|---|---|
+| `direct` | the in-memory checkpoint flow. The one that runs, and always has |
+| `project` | **nothing.** `flow/vivado/4_synth.tcl` states in its own header that it does not implement `launch_runs synth_1` |
+| `protocompiler` | **nothing**, and no stage so much as named it |
+| `dfx` | **one line**: `-mode out_of_context` in `flow/steps/synth_setup.tcl`. No partition, no pblock, no `HD.RECONFIGURABLE`, no partial bitstream |
+
+So the default named a flow nothing ran: every build this toolkit has produced
+declared one and executed another, visible only as a NOT-covered bullet in the
+gate. `dfx` was worse than inert — out-of-context synthesis of a **board-level
+top inserts no IO buffer on any port**, and the bitstream configures a device
+whose pins are connected to nothing.
+
+The three are now **refused by name**, at make parse time in `mk/flow.mk` and
+again in `flow_boot` for a stage run by hand. A mode name is added on the day a
+stage implements it, not before — §0: a declared capability that silently maps
+onto a different one is the failure this document exists to prevent. The
+out-of-context synthesis `dfx` selected is unchanged and reachable by the knob
+that owns it, `SYNTH_MODE=out_of_context`, which is recorded in the manifest as
+the deliberate choice it is.
 
 **RTL**
 ```
@@ -230,8 +255,8 @@ any clock definition is implementation-only, rather than letting the knob lie.
 `create_clock`/`create_generated_clock` and nothing else. It is read at
 synthesis and marked `USED_IN_IMPLEMENTATION false`, because implementation
 takes the same definitions from `XDC_TIMING`; marking rather than merely not
-reading matters in project mode, where the file joins a fileset later stages
-also open, and without the property every clock would be defined twice. **This
+reading is what holds wherever the file lands in a fileset a later stage also
+opens, because without the property every clock would be defined twice. **This
 generalises beyond clock gating:** any synthesis decision that depends on knowing
 what a clock is inherits the same blindness, so a project keeping all its clock
 definitions implementation-only should expect more than one such surprise.

@@ -150,14 +150,25 @@ PART_DIR         ?= $(FPGA_FLOW_DIR)/part/$(PART)
 BOARD_PART       ?=
 BOARD_REPO_PATHS ?=
 
-# How the flow drives the tool:
-#   project        a Vivado project on disk. What the GUI opens. The default.
+# How the flow drives the tool. There is ONE value, and every other one is
+# refused at make parse time:
 #   direct         non-project mode: read, synth, opt, place, route by script.
-#                  Faster, reproducible, and there is no project to inspect
+#                  Reproducible, and there is no project on disk to inspect
 #                  afterwards -- checkpoints are the only artefact.
-#   dfx            dynamic function exchange (partial reconfiguration).
-#   protocompiler  a prototyping-system flow with its own partitioner.
-FLOW_MODE        ?= project
+#
+# This used to offer `project`, `dfx` and `protocompiler` too, and defaulted to
+# `project`. None of the three ran: `project` named a `launch_runs` path no
+# stage implements, `protocompiler` was consumed by nothing anywhere, and `dfx`
+# changed exactly one synthesis argument with none of the partition handling
+# behind it. Setting one of them selected a not-covered bullet in the gate
+# saying the declaration had been ignored -- the toolkit telling you, in the
+# quietest place it has, that it built something other than what the manifest
+# claimed. If you want the out-of-context synthesis `dfx` used to select, ask
+# for it by its own knob: `make synth SYNTH_MODE=out_of_context`.
+#
+# The bd stage still builds a real .xpr under the work directory, and that is
+# the one the GUI opens. It is a fact about that stage, not about FLOW_MODE.
+FLOW_MODE        ?= direct
 
 # What runs on the board once it is programmed:
 #   bare   a bitstream and firmware you built. The default.

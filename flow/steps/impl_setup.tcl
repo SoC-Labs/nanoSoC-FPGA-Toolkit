@@ -238,29 +238,11 @@ if {[llength $IMPL_POST_ROUTE_TCL]} {
 }
 
 
-################################################################################
-# 6. THE PROJECT-MODE MIRROR
-#
-# In FLOW_MODE=project the run object carries the strategy. Same values, second
-# hand-over path, one source - see synth_setup.tcl section 9.
-################################################################################
-
-if {[flow_have get_runs]} {
-    if {![catch {get_runs impl_1} __run] && [llength $__run]} {
-        catch { set_property STEPS.OPT_DESIGN.ARGS.DIRECTIVE       $IMPL_OPT_DIRECTIVE      $__run }
-        catch { set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE     $IMPL_PLACE_DIRECTIVE    $__run }
-        catch { set_property STEPS.PHYS_OPT_DESIGN.ARGS.DIRECTIVE  $IMPL_PHYS_OPT_DIRECTIVE $__run }
-        catch { set_property STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE     $IMPL_ROUTE_DIRECTIVE    $__run }
-        catch { set_property STEPS.PHYS_OPT_DESIGN.IS_ENABLED      $IMPL_PHYS_OPT           $__run }
-        catch { set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.IS_ENABLED $IMPL_POST_ROUTE_PHYS_OPT $__run }
-        if {$IMPL_INCREMENTAL_REF ne ""} {
-            catch { set_property AUTO_INCREMENTAL_CHECKPOINT 0 $__run }
-            catch { set_property INCREMENTAL_CHECKPOINT $IMPL_INCREMENTAL_REF $__run }
-        }
-        say "project-mode: strategy mirrored onto [get_property NAME $__run]"
-    }
-    unset -nocomplain __run
-}
+# THE PROJECT-MODE MIRROR WAS HERE, AND IT IS GONE, for the reason written out
+# at the end of synth_setup.tcl: it hand-delivered these directives to
+# `get_runs impl_1` for a FLOW_MODE=project that no stage implements and that
+# both layers now refuse. There is no run object in an in-memory flow, so it
+# never fired; what it did do was read like evidence that project mode worked.
 
 foreach {__var __extra} [list IMPL_OPT_ARGS   $IMPL_OPT_EXTRA_ARGS \
                               IMPL_PLACE_ARGS $IMPL_PLACE_EXTRA_ARGS \

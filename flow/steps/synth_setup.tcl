@@ -381,22 +381,31 @@ unset -nocomplain __k __v
 # configures a device whose pins are not connected to anything. Vivado does not
 # warn: out-of-context is a legitimate thing to ask for.
 #
-# So it follows FLOW_MODE rather than being a free knob, and the mismatch is
-# announced.
+# IT USED TO BE DERIVED FROM FLOW_MODE, and that was the whole of this toolkit's
+# `dfx` support: `FLOW_MODE=dfx` set this one argument and nothing else - no
+# partition definition, no pblock, no HD.RECONFIGURABLE, no partial bitstream.
+# A mode name that flipped the most dangerous switch in DFX and implemented none
+# of the machinery that makes it safe is worse than no support at all, so the
+# name is now refused at both layers (mk/flow.mk, and flow_boot in
+# flow/common/flow_utils.tcl) and this is a free knob again.
+#
+# THAT MAKES THIS KNOB THE ONLY ROUTE TO AN OUT-OF-CONTEXT SYNTHESIS, which is
+# the point of refusing the mode rather than deleting the capability: somebody
+# who genuinely wants one asks for it by name, it is recorded in the manifest as
+# the deliberate choice it is, and the gate says what it costs. The warning
+# below is now the only announcement there is, so it stays.
 ################################################################################
 
-opt SYNTH_MODE  ""   ;# "" = derive from FLOW_MODE. default | out_of_context
+opt SYNTH_MODE  "default"   ;# default | out_of_context. See the warning below
 
-if {$SYNTH_MODE eq ""} {
-    set SYNTH_MODE [expr {$FLOW_MODE eq "dfx" ? "out_of_context" : "default"}]
-}
 lappend SYNTH_ARGS -mode $SYNTH_MODE
 if {$SYNTH_MODE eq "out_of_context"} {
     warn "-mode out_of_context: NO I/O BUFFERS will be inserted. That is right"
     warn "  for a reconfigurable module or a packaged IP and wrong for a"
     warn "  board-level top - the bitstream would configure a device with no"
     warn "  buffer on any pin, and nothing in the flow after this point can"
-    warn "  tell the two cases apart. FLOW_MODE is '$FLOW_MODE'."
+    warn "  tell the two cases apart. It was asked for by SYNTH_MODE; nothing"
+    warn "  else in this toolkit can turn it on."
 }
 
 
@@ -470,27 +479,14 @@ if {[llength $__params]} {
 unset -nocomplain __d __n __p __defs __params
 
 
-################################################################################
-# 9. THE PROJECT-MODE MIRROR
-#
-# In FLOW_MODE=project the run object carries the strategy, not the command line,
-# and `launch_runs` ignores anything this file put in a list. So the same values
-# are written onto the synthesis run when there is one. ONE source of values, two
-# ways of handing them over - a second literal here is a second thing to be
-# wrong, and the one that is wrong is always the one you are not reading.
-################################################################################
-
-if {[flow_have get_runs]} {
-    if {![catch {get_runs synth_1} __run] && [llength $__run]} {
-        catch { set_property STEPS.SYNTH_DESIGN.ARGS.DIRECTIVE $SYNTH_DIRECTIVE $__run }
-        catch { set_property STEPS.SYNTH_DESIGN.ARGS.FLATTEN_HIERARCHY $SYNTH_FLATTEN_HIERARCHY $__run }
-        catch { set_property STEPS.SYNTH_DESIGN.ARGS.GATED_CLOCK_CONVERSION $SYNTH_GATED_CLOCK_CONVERSION $__run }
-        catch { set_property STEPS.SYNTH_DESIGN.ARGS.FSM_EXTRACTION $SYNTH_FSM_EXTRACTION $__run }
-        catch { set_property STEPS.SYNTH_DESIGN.ARGS.RETIMING $SYNTH_RETIMING $__run }
-        say "project-mode: strategy mirrored onto [get_property NAME $__run]"
-    }
-    unset -nocomplain __run
-}
+# THE PROJECT-MODE MIRROR WAS HERE, AND IT IS GONE - not because it was wrong,
+# but because it mirrored the knobs above onto `get_runs synth_1` for a
+# FLOW_MODE=project that no stage implements and that both layers now refuse.
+# Every stage opens `create_project -in_memory`, which has no runs, so the block
+# could never fire; a reader finding it would reasonably conclude that project
+# mode was partly supported, which is the same substitution in another form.
+# If a launch_runs path is ever written, its strategy hand-over belongs in the
+# stage that creates the run, next to the run.
 
 if {[llength [split $SYNTH_EXTRA_ARGS]]} {
     foreach __a [split $SYNTH_EXTRA_ARGS] {

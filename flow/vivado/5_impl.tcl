@@ -281,9 +281,10 @@ if {![llength $XDC_IMPL]} {
 foreach e $XDC_IMPL {
     foreach {f role} $e break
     read_xdc $f
-    # The project-mode half of the same decision (CONTRACT.md section 3.3): the
-    # engine sets the read window from the variable that named the file. In a
-    # checkpoint flow there is no constraints fileset, which is not an error.
+    # The FILESET half of the same decision (CONTRACT.md section 3.3): the
+    # engine sets the read window from the variable that named the file. An
+    # empty `get_files` is not an error - a pure checkpoint flow has no
+    # constraints fileset, and the stage that reads the file IS the window.
     catch {
         set __o [get_files -quiet [file tail $f]]
         if {[llength $__o]} {
@@ -868,11 +869,17 @@ if {!$ILA_ON} {
     lappend NOTCOV "on-chip observability: no debug core is in this image\
                     (ILA_ENABLE=0), so nothing in it can be probed at run time"
 }
-if {$FLOW_MODE ne "direct"} {
-    lappend NOTCOV "FLOW_MODE is '$FLOW_MODE' and this stage ran the in-memory\
-                    checkpoint flow. The project-mode launch_runs path, DFX\
-                    partition handling and ProtoCompiler are NOT implemented here"
-}
+# THE FLOW_MODE BULLET WAS HERE, saying this stage had run the in-memory flow
+# whatever FLOW_MODE declared. Every mode but `direct` is now refused - by
+# mk/flow.mk at parse time and by flow_boot for a stage run by hand - so the
+# bullet can only say that `direct` ran the direct flow, and a not-covered line
+# that covers nothing trains a reader to skim the section that matters most.
+#
+# The one real gap it stood in front of is recorded where it can be MEASURED
+# rather than guessed: 4_synth.tcl states an out-of-context netlist and the
+# Bonded IOB count it measured. This stage inherits that netlist through a
+# checkpoint and has no way to tell it from a board-level one, which is exactly
+# why the statement belongs to the stage that knew.
 
 
 set GATE [prov_gate impl impl [list \
