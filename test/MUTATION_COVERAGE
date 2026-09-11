@@ -45,7 +45,7 @@ t_assert_stage   12
 t_bd              3
 t_contract       13
 t_flist          22
-t_flow_utils     23
+t_flow_utils     24
 t_measure        19
 t_packs          34
 t_provenance     23

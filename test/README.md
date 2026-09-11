@@ -86,7 +86,9 @@ and an exit code that collapsed into its neighbour all leave a run that looks
 exactly like a correct one. The stage finishes, the bitstream appears, and
 nothing says which of the two designs it built.
 
-25 properties, each with a planted-fault proof: the **shadow guard** (`proc`
+27 properties, 24 of them with a paired planted-fault proof (the three
+without are proved from the other side, and the file says which and why): the
+**shadow guard** (`proc`
 silently replaces a command — the reference toolkit's equivalent has fired in
 anger, on a helper that shadowed a builtin and aborted a route stage 2.5 hours
 in); `flow_config` rejecting a typo'd key; **exit 1 and exit 2 staying

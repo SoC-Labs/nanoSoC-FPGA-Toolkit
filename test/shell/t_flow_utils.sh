@@ -508,6 +508,13 @@ t_check futils.exit.die "die exits 1 - a check ran and came out red" \
     sh -c 'TK="$1" tclsh "$2"; [ $? -eq 1 ]' _ "$FLOW_DIR" "$D/die.tcl"
 t_check futils.exit.refuse "flow_refuse exits 2 - nothing was measured at all" \
     sh -c 'TK="$1" tclsh "$2"; [ $? -eq 2 ]' _ "$FLOW_DIR" "$D/refuse.tcl"
+M="$(y_mut exit-die)" || M=""
+if t_mutate "$M" "$FU_REL" '/^proc die/,/^}/s/^    exit 1$/    exit 0/'; then
+    t_check_fail futils.exit.die.mutation "with die exiting 0 a failed check reports success and the stage graph carries on to the next stage" \
+        sh -c 'TK="$1" tclsh "$2"; [ $? -eq 1 ]' _ "$M" "$D/die.tcl"
+else
+    t_skip futils.exit.die.mutation "die no longer contains a bare 'exit 1' line"
+fi
 M="$(y_mut exit-refuse)" || M=""
 if t_mutate "$M" "$FU_REL" '/^proc flow_refuse/,/^}/s/^    exit 2$/    exit 1/'; then
     t_check_fail futils.exit.refuse.mutation "with flow_refuse exiting 1, a broken contract is indistinguishable from a failed check" \
@@ -740,5 +747,30 @@ if t_mutate "$M" "$FU_REL" 's/^if {\[info exists ::flow_utils_loaded\]} { return
 else
     t_skip futils.idempotent.mutation "the load guard has been rewritten - the sed expression no longer matches"
 fi
+
+#-----------------------------------------------------------------------------
+# WHAT IS NOT PROVED HERE, AND WHY
+#
+# 24 of the 27 properties above carry a paired planted-fault proof. Three do
+# not, and the reason is that the fault they would plant is already planted
+# elsewhere rather than that nobody got to them:
+#
+#   futils.seams.ok        asserts the SHIPPED seams.txt is well formed. The
+#                          three seams.* proofs corrupt a copy of that file in
+#                          each of the three ways it can be wrong, which is the
+#                          same assertion driven from the other side.
+#   futils.steps.from_dir  asserts the step list comes from the directory.
+#                          t_seams.sh plants exactly this defect - a hardcoded
+#                          five-entry list against a seven-entry directory, the
+#                          reference toolkit's own numbers - and is the right
+#                          place for it.
+#   futils.hook.none       asserts an unset FPGA_HOOKS_DIR yields 0/""/0.
+#                          Removing the empty-string guard leaves [file join ""
+#                          post_impl.tcl], which does not exist either, so the
+#                          proof would pass for the wrong reason. A proof that
+#                          cannot distinguish the fault from the fix is worse
+#                          than no proof, and saying so is better than shipping
+#                          one.
+#-----------------------------------------------------------------------------
 
 t_summary
