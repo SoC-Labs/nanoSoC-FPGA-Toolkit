@@ -51,7 +51,7 @@
 #
 # Copyright (C) 2026, SoC Labs (www.soclabs.org)
 
-t_assert_stage   12
+t_assert_stage   13
 t_bd              3
 t_contract       26
 t_doctor         32
@@ -62,5 +62,5 @@ t_measure        19
 t_packs          34
 t_provenance     23
 t_seams          10
-t_tier           16
+t_tier           24
 t_verdicts        9

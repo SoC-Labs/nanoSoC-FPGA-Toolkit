@@ -610,6 +610,54 @@ else
     t_skip assert.stages.agree.mutation "could not plant the fault: the STAGES assignment in assert-stage.sh has changed shape"
 fi
 
+#-----------------------------------------------------------------------------
+# AN OPTION WITH NO OPERAND MUST REFUSE, NOT SPIN
+#
+# `shift 2` with one argument left FAILS and shifts nothing, so the argv loop
+# never terminates: no verdict, no output, and a CI runner held until an
+# external timeout kills it. That is worse than a wrong answer, because a job
+# that never finishes produces no evidence about why.
+#
+# The same line existed in ci/tier.sh and ci/capability.sh and was fixed there
+# on 2026-09-11; this one survived because nothing drove assert-stage's argument
+# loop. It was found by reading, and this is the assertion that stops it coming
+# back.
+#
+# DRIVEN UNDER `timeout`, and the timeout IS the assertion: a spin shows up as
+# 124, which is neither the 2 this must return nor a pass.
+#-----------------------------------------------------------------------------
+t_head "an option with no operand refuses instead of spinning"
+
+## no_operand_refuses <toolkit> - exit 2 within 5s, and SAY which option
+no_operand_refuses() {
+    local tk="$1" out rc=0
+    out="$(timeout 5 "$tk/ci/assert-stage.sh" impl --fpga-dir 2>&1)" || rc=$?
+    [ "$rc" -eq 2 ] || { printf 'exit %s, wanted 2 (124 = it spun)\n%s\n' "$rc" "$out"; return 1; }
+    t_contains "$out" -- '--fpga-dir' || { printf 'refused without naming the option:\n%s\n' "$out"; return 1; }
+    return 0
+}
+
+if ! command -v timeout >/dev/null 2>&1; then
+    t_skip assert.argv.missing_operand \
+        "no coreutils timeout on PATH - a spin would hang this suite instead of failing it, and an assertion that can hang the runner is worse than the one it guards"
+else
+    t_check assert.argv.missing_operand \
+        "--fpga-dir with nothing after it exits 2 within 5s and names the option" \
+        no_operand_refuses "$FLOW_DIR"
+
+    M="$(t_mutant "$SB" argv-missing-operand)"
+    if t_replace_line "$M" ci/assert-stage.sh \
+            '        --fpga-dir) need_operand "$#" --fpga-dir "a project fpga/ directory"' \
+            '        --fpga-dir) FPGA_PROJECT_DIR="${2:-}"; shift 2 ;; #'; then
+        t_check_fail assert.argv.missing_operand.mutation \
+            "with the guard removed the argv loop spins and the 5s timeout fires - the defect verbatim, as it stood before 2026-09-14" \
+            no_operand_refuses "$M"
+    else
+        t_skip assert.argv.missing_operand.mutation \
+            "could not plant the fault: the --fpga-dir arm of assert-stage.sh's argv loop has changed shape"
+    fi
+fi
+
 t_summary
 
 # Copyright (C) 2026, SoC Labs (www.soclabs.org)

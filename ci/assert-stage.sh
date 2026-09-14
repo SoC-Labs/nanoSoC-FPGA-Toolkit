@@ -89,12 +89,35 @@ trap 'echo; echo "assert-stage: interrupted"; exit 130' INT
 #-----------------------------------------------------------------------------
 STAGES="flist package-ip bd synth impl bitstream"
 
+## need_operand <remaining argc> <option> <what it takes>
+## `shift 2` WITH ONE ARGUMENT LEFT FAILS AND SHIFTS NOTHING, so the argv loop
+## below spins forever: no verdict, no output, the runner held until an external
+## timeout. Measured in ci/tier.sh and ci/capability.sh on 2026-09-11 and fixed
+## there; this script had the identical line and was found by the team that
+## fixed those two.
+##
+## THERE ARE THREE COPIES OF THIS GUARD - here, ci/tier.sh and ci/capability.sh -
+## and that is worth one sentence rather than a silent duplication. tier.sh and
+## this script source ci/lib.sh and could share one; ci/capability.sh does NOT
+## source it, deliberately or otherwise, so hoisting the guard into lib.sh would
+## either leave a copy behind anyway or change capability.sh's dependency shape.
+## Five lines in three places, each naming its own script in the message, was
+## judged the smaller risk. If capability.sh ever takes a dependency on lib.sh,
+## collapse all three.
+need_operand() {
+    [ "$1" -ge 2 ] && return 0
+    echo "assert-stage: $2 takes $3 after it, and nothing followed it." >&2
+    echo "  Nothing was measured. Exit 2 is 'unusable arguments', not a failing gate." >&2
+    exit 2
+}
+
 STAGE=""
 FPGA_PROJECT_DIR=""
 OPTIONAL=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        --fpga-dir) FPGA_PROJECT_DIR="${2:-}"; shift 2 ;;
+        --fpga-dir) need_operand "$#" --fpga-dir "a project fpga/ directory"
+                    FPGA_PROJECT_DIR="$2"; shift 2 ;;
         --optional) OPTIONAL=1; shift ;;
         # The split of $STAGES is the point here: one stage per line, from the
         # one list, so `--list` cannot disagree with the argument check below.

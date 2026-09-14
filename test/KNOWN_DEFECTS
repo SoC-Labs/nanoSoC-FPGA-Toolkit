@@ -37,43 +37,6 @@
 # where the next one is hiding.
 #=============================================================================
 
-## ci/tier.sh :: an unknown tier name can select NOTHING and exit 0
-# Acceptance is a REGEX match (`grep -q " $WANT "`, ci/tier.sh:124); selection is
-# string EQUALITY (:228/:231). A name that matches the regex but equals no tier
-# passes acceptance and then selects nothing. MEASURED:
-#   ci/tier.sh 'stati.' --only  ->  exit 0, 9 skipped, 0 run,
-#                                   "All recorded gates passed."
-# Without --only the same name selects EVERY tier including deploy, because the
-# prefix walk never finds its stopping point. A CI job with a typo'd tier name
-# goes GREEN having run nothing - the exact failure the verdict layer exists to
-# prevent. Carried as t_known_defect tier.refuse.regex_name and
-# tier.select.empty_is_never_green; fixing the first retires both.
-# FIX: make acceptance string equality, the same test selection uses.
-
-## ci/tier.sh :: the static tier's Tcl gate reports findings about files it never opened
-# `tclsh - "$f"` (ci/tier.sh:300-307). A standard tclsh does not consume the `-`,
-# so the script reads stdin and `$f` lands in $argv. Every open fails, the
-# one-liner exits 2 - its OWN "could not read" code - and the caller grades any
-# non-zero as unbalanced. MEASURED: the static tier FAILS with
-# `static.tcl.complete unbalanced braces/brackets/quotes` while an independent
-# `info complete` over the same files finds ZERO unbalanced. False RED, not false
-# green - but the static tier cannot pass on any host with a tclsh, and it is a
-# gate inventing a specific finding from a file it never read.
-# FIX: `tclsh "$script" "$f"`, and make the reader distinguish "could not read"
-# from "did not balance".
-
-## ci/tier.sh and ci/capability.sh :: an option with no operand never terminates
-# `--fpga-dir` (tier.sh:118) and `--require`/`--conf` (capability.sh:114-115) do
-# `shift 2`. With one argument left the shift FAILS and shifts nothing, so the
-# argv loop spins forever: no verdict, no output, the runner held until an
-# external timeout. Confirmed hanging for both.
-# FIX: check `$#` before `shift 2`, and refuse with exit 2 naming the option.
-
-## ci/tier.sh :: a second tier name is silently discarded
-# `WANT="$1"` (:121) inside the argv loop, so the LAST name wins:
-# `tier.sh static deploy` runs deploy. Nothing says a name was dropped.
-# FIX: refuse a second positional, naming both.
-
 ## the deploy tier has never touched a board
 # scripts/fpga-flow-deploy (1390 lines), mk/deploy.mk and the fpgahub hooks have
 # been exercised against fixtures and against the CLI's own dry-run paths.
@@ -148,9 +111,17 @@
 # graph and asserts the prerequisite chain and the resolved variable surface;
 # THEN the split. Not the other way round.
 
-## ci/ is 4312 lines and is exercised only by t_verdicts
-# t_verdicts covers ci/lib.sh's verdict and exit-code layer thoroughly - 9
-# planted faults rejected. capability.sh, tier.sh, deploy-gates.sh and
-# check-vendor-collateral.sh are not named by any test.
-# WOULD SETTLE IT: tier.sh's selection logic is pure text-in/text-out and could
-# be driven from the harness today.
+## ci/deploy-gates.sh and ci/check-vendor-collateral.sh are named by no test
+# CLOSED for tier.sh and capability.sh on 2026-09-14 (t_tier.sh, 24 proofs) and
+# for assert-stage.sh's argument loop on the same day. Between them those suites
+# found FIVE defects, two of which were a gate reporting a verdict it had not
+# measured - a CI job with a typo'd tier name exiting 0 having run nothing, and
+# a Tcl checker naming files it never opened.
+# The two that remain are judged not trivial, and the reason is the fixture, not
+# the logic: deploy-gates.sh (746 lines) wants a deploy manifest covering six
+# time-ordered moments; check-vendor-collateral.sh (1364) wants a throwaway git
+# repository with staged content and revisions - a precondition class no suite
+# here has yet.
+# WOULD SETTLE IT: each carries a cheap foothold, `--selftest` and `--arm-only`.
+# Those are claims the files make about THEMSELVES, so driving them from outside
+# is where that suite starts, not where it finishes.
