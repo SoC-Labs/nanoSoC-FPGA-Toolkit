@@ -270,7 +270,10 @@ check_draws_no_warning() {
 ## way to answer it is to delete the line.
 ##
 ## <keep|strip> is about design.mk's COMMENTS only, and it exists to isolate one
-## defect - see init.complete.decisions below. `strip` deletes them too.
+## defect - see init.complete.decisions below, which is the assertion that runs
+## with `keep`. `strip` deletes the comments too, so an assertion that only ever
+## ran with `strip` cannot see a marker sitting in one, and that is exactly where
+## the defect init.complete.decisions retired used to live.
 ##
 ## Nothing here spells a marker's text: every edit is driven by MARKER_RE, so a
 ## template that grows a new one is answered rather than silently skipped.
@@ -403,21 +406,32 @@ else
             layout_matches_the_contract "$SC_DIR/fpga"
     fi
 
-    # -- the positive control, and one defect it isolates ---------------------
+    # -- the positive control, and the defect it isolates ---------------------
     t_check init.complete \
         "filling in what the check names reaches 'Contract complete.' - the refusal is clearable" \
         scaffold_completes_clean "$FLOW_DIR" "complete" strip
 
-    # templates/design.mk.in line 12 is an INSTRUCTION - `#  1. Fill in every
-    # <<FILL IN>>.` - and it contains a literal marker, so fpga-flow-check counts
-    # the sentence telling you to fill things in as a thing to fill in. A project
-    # that has made every real decision still gets `UNFILLED PLACEHOLDERS 1
-    # marker(s) in 1 file(s)` pointing at a comment, and the only way to clear it
-    # is to delete its own instructions. Nothing in the next-steps text says so.
-    # The fix is in the template, not the checker: spell the instruction without
-    # a literal marker. Reported, not fixed here.
-    t_known_defect init.complete.decisions \
-        "making every DECISION should be enough; design.mk's own instruction line carries a literal marker and keeps check red" \
+    # THE SAME ROUND TRIP WITHOUT DELETING THE COMMENTS, which is what a real
+    # project does: it fills the values in and keeps the instructions that told
+    # it how. This ran as a t_known_defect until 2026-09-14, because
+    # templates/design.mk.in's own step 1 - `Fill in every <<FILL IN>>` - spelled
+    # the marker literally, so fpga-flow-check counted the sentence telling you
+    # to fill things in as a thing to fill in: a project that had made every real
+    # decision still got `UNFILLED PLACEHOLDERS  1 marker(s) in 1 file(s)`
+    # pointing at a comment, and the only way to clear it was to delete its own
+    # instructions. Nothing in the next-steps text said so.
+    #
+    # The fix was in the TEMPLATE, not the checker. A checker taught to ignore
+    # comments would stop seeing a marker in every Tcl and XDC comment the
+    # templates ship - which is most of them, and the place a forgotten marker is
+    # least visible. The scan is right; the sentence moved.
+    #
+    # `keep` rather than `strip` IS the assertion. The control above deletes
+    # design.mk's comments along with everything else, so it stays green with the
+    # defect fully in place, and this line is the only thing between that and a
+    # refusal no project can clear without deleting its own documentation.
+    t_check init.complete.decisions \
+        "making every DECISION is enough - design.mk's instructions carry no marker, so keeping them still reaches 'Contract complete.'" \
         scaffold_completes_clean "$FLOW_DIR" "complete-decisions" keep
 
     #-------------------------------------------------------------------------
@@ -464,6 +478,26 @@ else
             scaffold_completes_clean "$M" "complete-mut" strip
     else
         t_skip init.complete.mutation "could not plant the fault: the XDC_TIMING line in templates/design.mk.in has changed shape"
+    fi
+
+    # The retired defect, put back: one literal marker inside design.mk's own
+    # instructions. It is aimed at the INSTRUCTION LINE and not at an assignment
+    # because those are two different failures, and only one of them is a defect.
+    # A marker on a `VAR :=` line is a decision genuinely not made, and the
+    # project clears it by deciding; a marker in a comment is unclearable except
+    # by deleting the comment, which on this file means deleting the paragraph
+    # that explains the markers. That is why it needs a proof of its own rather
+    # than leaning on init.complete's - and why the mutant is asserted with
+    # `keep`, the same way the assertion it belongs to is.
+    M="$(t_mutant "$SB" completedecisions)"
+    if t_replace_line "$M" templates/design.mk.in \
+        '#   1. Fill in every FILL-IN marker -- the ones in double angle brackets, the' \
+        '#   1. Fill in every <<FILL IN>>. `make check` names any you miss, with the'; then
+        t_check_fail init.complete.decisions.mutation \
+            "with a literal marker back in design.mk's instructions, a project that has decided everything is still refused" \
+            scaffold_completes_clean "$M" "complete-decisions-mut" keep
+    else
+        t_skip init.complete.decisions.mutation "could not plant the fault: templates/design.mk.in's step-1 instruction has been reworded, so nothing put a marker back into a comment and this proof measured nothing"
     fi
 
     # dest_for puts the target files under the BLOCK's name while TARGET_DIR
@@ -603,16 +637,21 @@ fi
 # "files were written and the tree is not the one templates/ describes". Its own
 # comment says why: "A caller that cannot tell those apart retries the wrong one."
 #
-# install_one's empty-output guard uses `refuse`, and it runs AFTER expand() has
-# created $dst and after earlier templates have already been installed. So the
-# one path in the file that most certainly leaves a half-tree behind reports
-# exit 2 - the code that promises nothing was written.
+# install_one's empty-output guard ran AFTER expand() had created $dst and after
+# earlier templates were already installed, and said `refuse`. So the one path in
+# the file that most certainly leaves a half-tree behind reported the code that
+# promises nothing was written. This ran as a t_known_defect until 2026-09-14;
+# the guard now says `fail`, and the retry the old code was sending the caller
+# into is measured in install_one's own comment - the second run finds the
+# zero-byte file the first one left, prints "exists; --force to overwrite" over
+# it, and exits 0.
 #
-# Reaching that path needs expand() neutered, which is why this is measured on a
-# mutant: the guard is shipped code, but nothing in a healthy checkout can make
-# expand() fail. The mutation is the reachability, not the defect.
-#
-# FIX: `fail` rather than `refuse` at that line. Reported, not fixed here.
+# TWO EDITS IN THE MUTANT, ONE FAULT. Reaching this guard at all needs expand()
+# neutered: the guard is shipped code, but nothing in a healthy checkout can make
+# expand() produce nothing. That edit is the REACHABILITY, present in the
+# assertion's copy and in its proof's copy alike, and it is not the thing under
+# test - which is why the proof below carries it as well, and differs from the
+# assertion's copy in exactly one token: the verb.
 #-----------------------------------------------------------------------------
 empty_write_is_a_postcondition_failure() {
     local flow="$1" name="$2"
@@ -631,11 +670,33 @@ empty_write_is_a_postcondition_failure() {
 
 M="$(t_mutant "$SB" emptywrite-code)"
 if t_replace_line "$M" "$INIT_REL" '        "$1" > "$2"' '        /dev/null > "$2"'; then
-    t_known_defect init.exitcode.emptywrite \
+    t_check init.exitcode.emptywrite \
         "an empty write leaves a partial tree, so it is a postcondition failure (1), not a refusal (2)" \
         empty_write_is_a_postcondition_failure "$M" "emptywrite-code-mut"
 else
     t_skip init.exitcode.emptywrite "could not reach the guard: the closing line of expand() in $INIT_REL has changed shape"
+fi
+
+# THE PROOF, on its own copy: the same reachability edit, plus the verb this
+# guard carried until 2026-09-14. The message is left word for word as it is
+# shipped, so the only difference between this copy and the one above is which
+# exit code the caller is handed - and the assertion must go red on it, or it was
+# never reading the code at all and would pass on any non-zero status.
+#
+# The `&&` matters. If the reachability edit lands and the verb edit does not,
+# this copy is the ASSERTION's copy and the proof would report a healthy toolkit
+# as a rejected fault - so both edits are required before anything is asserted,
+# and otherwise the whole proof skips with a reason that covers both.
+M="$(t_mutant "$SB" emptywrite-verb)"
+if t_replace_line "$M" "$INIT_REL" '        "$1" > "$2"' '        /dev/null > "$2"' &&
+   t_replace_line "$M" "$INIT_REL" \
+        '    [ -s "$dst" ] || fail "wrote an empty $dst from $src - nothing was substituted,' \
+        '    [ -s "$dst" ] || refuse "wrote an empty $dst from $src - nothing was substituted,'; then
+    t_check_fail init.exitcode.emptywrite.mutation \
+        "with the guard refusing instead of failing, a half-written tree reports exit 2 - the code that promises nothing was written" \
+        empty_write_is_a_postcondition_failure "$M" "emptywrite-verb-mut"
+else
+    t_skip init.exitcode.emptywrite.mutation "could not plant the fault: either the closing line of expand() or the first line of install_one's empty-output guard in $INIT_REL has changed shape, so this copy is not the one the proof describes and nothing was measured"
 fi
 
 #=============================================================================

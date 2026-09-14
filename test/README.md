@@ -189,12 +189,26 @@ the project's edits and `--force` is what overrides that; nothing outside
 offers are `find part/ -type d`, proved by planting a hardcoded list and then
 adding a pack.
 
-Two `KNOWN-DEFECT` markers come from it, both found by asserting rather than by
-reading: `templates/design.mk.in`'s own instruction line contains a literal
-`<<FILL IN>>`, so a project that has made every real decision still fails
-`make check` until it deletes its own instructions; and `install_one`'s
-empty-output guard uses `refuse` (exit 2, documented as *nothing was written*)
-at the one point in the file that most certainly leaves a half-tree behind.
+Two `KNOWN-DEFECT` markers came from it, both found by asserting rather than by
+reading, and both were **retired on 2026-09-14**. `templates/design.mk.in`'s own
+instruction line contained a literal `<<FILL IN>>`, so a project that had made
+every real decision still failed `make check` until it deleted its own
+instructions — fixed in the **template**, not the checker, because a checker
+taught to ignore comments would stop seeing a marker in every Tcl and XDC
+comment the templates ship, which is where a forgotten one is least visible.
+And `install_one`'s empty-output guard used `refuse` (exit 2, documented as
+*nothing was written*) at the one point in the file that most certainly leaves a
+half-tree behind; it now uses `fail` (exit 1), and the retry that code was
+sending the caller into is measured beside it — the second run skips the
+zero-byte file the first left and exits 0 over it.
+
+Each marker became a real assertion with a planted-fault proof of its own.
+`init.complete.decisions` fills in every value and **keeps** `design.mk`'s
+comments — the control beside it deletes them, so it stays green with the defect
+fully in place — and its proof puts the literal marker back into the
+instruction. `init.exitcode.emptywrite` reads the exit **code** rather than
+accepting any non-zero status, and its proof is the same unreachable-guard copy
+with one token changed back: `fail` to `refuse`.
 
 ---
 
@@ -248,9 +262,10 @@ Two conventions worth keeping:
 `run.sh` aggregates every suite's counts and prints them:
 
 ```
-===== suite: 10 file(s) passed, 0 failed, 60s =====
-assertions: 376 passed, 0 failed, 0 known-defect, 0 skipped
-mutation:   168 planted faults rejected
+===== suite: 13 file(s) passed, 0 failed, 218s =====
+assertions: 542 passed, 0 failed, 9 known-defect, 1 skipped
+mutation:   257 planted faults rejected
+            proofs SKIPPED (precondition absent): t_doctor(4)
 ```
 
 **`MUTATION_COVERAGE`** declares how many planted faults each suite must reject.
@@ -272,10 +287,11 @@ indistinguishable from a complete one.
 ## Coverage is host-dependent, and the summary says so
 
 Every suite skips rather than fails when a precondition is absent, and carries
-its reason. What that hid until 2026-09-11 was the **aggregate**: on a host with
-no `tclsh`, five suites skip themselves whole — 263 of 376 assertions vanish —
-and the old runner still printed `10 file(s) passed, 0 failed`, because it
-counted *files*.
+its reason. What that hid until 2026-09-11 was the **aggregate**. The figures
+below are *from that day* and are left as measured, because they are what the
+gates were built from: on a host with no `tclsh`, five of the then ten suites
+skipped themselves whole — 263 of 376 assertions vanished — and the old runner
+still printed `10 file(s) passed, 0 failed`, because it counted *files*.
 
 Two gates now make that fatal:
 
@@ -299,13 +315,18 @@ five `SKIP` lines, so the ratio alone would have read as 4% and passed.
 - **The deploy tier has never touched a board.** `scripts/fpga-flow-deploy`,
   `mk/deploy.mk` and the fpgahub hooks are exercised against fixtures and
   dry-run paths only.
-- **`fpga-flow-{doctor,hooks}` are named by no test.** `doctor` is pure
-  host-inspection output and could be driven from the harness today; `hooks`
-  answers from `seams.txt` and the steps directory, which `t_seams.sh` already
-  knows how to check. `init` was closed on 2026-09-11 by `t_init.sh` — and what
-  that cost is the useful part: the round trip this bullet used to propose
-  ("scaffold, then `make check` is clean") was **wrong**. A fresh scaffold is
-  deliberately incomplete and `make check` is supposed to refuse it.
+- **`make help-hooks` and `scripts/fpga-flow-hooks` are named by no test.**
+  Note these are two unrelated things, and an earlier version of this bullet
+  conflated them: `fpga-flow-hooks` is the **git-hook** installer, and its own
+  header says so in capitals; the thing that lists seams out of `seams.txt` is
+  `make help-hooks`. Start with `help-hooks` — `t_seams.sh` already knows that
+  shape. `fpga-flow-hooks` needs `git init` throwaway repos, a precondition
+  class no suite here has yet.
+  `init` was closed on 2026-09-11 by `t_init.sh` and `doctor` on the same day by
+  `t_doctor.sh`. What `init` cost is the useful part: the round trip this bullet
+  used to propose ("scaffold, then `make check` is clean") was **wrong**. A
+  fresh scaffold is deliberately incomplete and `make check` is supposed to
+  refuse it — 5 MISS lines naming the decisions the scaffolder left open.
 - **`ci/` is 4312 lines and only `ci/lib.sh` is covered** — thoroughly, by
   `t_verdicts`. `capability.sh`, `tier.sh`, `deploy-gates.sh` and
   `check-vendor-collateral.sh` are not named by any test.

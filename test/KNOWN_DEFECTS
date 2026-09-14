@@ -37,26 +37,6 @@
 # where the next one is hiding.
 #=============================================================================
 
-## scripts/fpga-flow-init :: the template's own instructions count as unfilled work
-# `templates/design.mk.in:12` reads "#   1. Fill in every <<FILL IN>>. ..." - a
-# literal marker inside the instructions. A project that has made every real
-# decision still gets `MISS UNFILLED PLACEHOLDERS  1 marker(s) in 1 file(s)`
-# pointing at a comment, and the only way to clear it is to delete the
-# instructions telling you what to do. Nothing in the next-steps text says so.
-# Expressed as t_known_defect init.complete.decisions, so it goes RED when fixed.
-# FIX: in the TEMPLATE, not the checker - spell the instruction without a
-# literal marker.
-
-## scripts/fpga-flow-init :: an empty write refuses (exit 2) instead of failing (exit 1)
-# `install_one` line 293: `[ -s "$dst" ] || refuse "wrote an empty $dst..."`.
-# CONTRACT section 10 reserves exit 2 for "refused - nothing was written", and
-# this path runs AFTER expand() created the file and after earlier templates are
-# already installed. Measured: rc=2 with files already on disk. The script's own
-# header says why it matters - "a caller that cannot tell those apart retries the
-# wrong one".
-# Expressed as t_known_defect init.exitcode.emptywrite, so it goes RED when fixed.
-# FIX: `fail` (exit 1), not `refuse`.
-
 ## ci/tier.sh :: an unknown tier name can select NOTHING and exit 0
 # Acceptance is a REGEX match (`grep -q " $WANT "`, ci/tier.sh:124); selection is
 # string EQUALITY (:228/:231). A name that matches the regex but equals no tier
@@ -169,7 +149,7 @@
 # CLOSED for `doctor` on 2026-09-11: test/shell/t_doctor.sh, 29 proofs, driven
 # against a stub PATH and a sandbox MODULEPATH so host-dependence is controlled
 # rather than asserted.
-# CLOSED for `init` on 2026-09-11: test/shell/t_init.sh, 20 planted faults. What
+# CLOSED for `init` on 2026-09-11: test/shell/t_init.sh, 22 planted faults. What
 # it cost is the useful part of this entry - the round trip it was supposed to
 # be ("scaffold, then `make check` is clean") was WRONG. A fresh scaffold is
 # deliberately incomplete and `make check` is supposed to refuse it, so the real

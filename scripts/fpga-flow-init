@@ -290,7 +290,19 @@ install_one() {
     # distinguishes ABSENT from ZERO BYTES - a zero-byte file satisfies every
     # `test -e` in the world and is exactly the shape a tool leaves when it
     # opened its output and then died.
-    [ -s "$dst" ] || refuse "wrote an empty $dst from $src - nothing was substituted"
+    #
+    # `fail` (1), NOT `refuse` (2), and the two verbs are not interchangeable
+    # here. Reaching this line means expand() has ALREADY created $dst, and on
+    # any template but the first it means earlier templates are already on disk,
+    # so what is left behind is a PARTIAL SCAFFOLD - which is what exit 1 is
+    # defined as at the top of this file. Exit 2 tells the caller "Nothing was
+    # written", and a caller that believes it retries the wrong thing: it re-runs
+    # this command, which now finds the zero-byte file it left and prints
+    # `skip ... (exists; --force to overwrite)` over it. MEASURED on a copy with
+    # expand() neutered for one template: the second run exits 0 with the empty
+    # file still there. This said `refuse` until 2026-09-14.
+    [ -s "$dst" ] || fail "wrote an empty $dst from $src - nothing was substituted,
+  and $FPGA is now a PARTIAL scaffold - $made file(s) were written before this one."
     case "$dst" in
         *.sh|*/run_*) chmod +x "$dst" ;;
     esac
