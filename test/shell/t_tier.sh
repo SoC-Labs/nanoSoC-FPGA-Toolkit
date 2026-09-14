@@ -55,13 +55,17 @@
 # repository has already shipped once (see t_flow_utils.sh's header).
 #
 # THIS SUITE IS THE SLOW ONE, and the reason is worth knowing before somebody
-# "optimises" it. Three of its runs select rung 1, which is the STATIC tier,
-# and the static tier really runs - including test/shell/t_seams.sh, which is
-# ten toolkit copies of its own. That is about twelve seconds a run and about
-# fifty for the file. It buys the only thing that matters here: the selection
-# is measured on the real driver rather than on a re-implementation of it.
-# Every other run is pointed at a rung whose make target fails in
-# milliseconds, which is why there are only three.
+# "optimises" it. Six of its runs select rung 1, which is the STATIC tier, and
+# the static tier really runs - including test/shell/t_seams.sh, which is ten
+# toolkit copies of its own. That is about fifteen seconds a run. It buys the
+# only thing that matters here: the selection is measured on the real driver
+# rather than on a re-implementation of it. Every other run is pointed at a
+# rung whose make target fails in milliseconds.
+#
+# THREE OF THOSE SIX ARRIVED WITH THE TCL GATE, in section 6.1, and they are
+# the price of judging a gate by what it put in the verdict file rather than by
+# reading its source. Two of them exist to plant a fault and watch the
+# assertion go red, which is the only evidence that the assertion can.
 #
 # Copyright (C) 2026, SoC Labs (www.soclabs.org)
 #-----------------------------------------------------------------------------
@@ -623,7 +627,14 @@ t_check tier.refuse.no_name \
 # own does not, since an empty name also fails the membership test. Each gets
 # its own copy anyway, so that neither proof can pass or fail for the other's
 # reason.
-GUARD_LINE='if [ -z "$WANT" ] || ! printf '"'"'%s'"'"' " $TIERS " | grep -q " $WANT "; then'
+#
+# THE LINE IS READ FROM THE FILE UNDER TEST rather than written out here. A
+# copy of it in this file is a copy that goes stale: the membership test was
+# rewritten once already - it used to be a regex match, see section 6 - and a
+# literal here would have turned both proofs into skips at that moment, leaving
+# the two assertions above standing with nothing behind them. What this file
+# states is the SHAPE the guard must have, which is all it needs to find it.
+GUARD_LINE="$(grep -m1 -E '^if \[ -z "\$WANT" \] \|\|' "$FLOW_DIR/ci/tier.sh")"
 
 M="$(t_mutant "$SB" refuse-nothing-unknown)"
 if t_replace_line "$M" ci/tier.sh "$GUARD_LINE" 'if false; then'; then
@@ -644,24 +655,40 @@ else
 fi
 
 #=============================================================================
-# 6. WHAT THE SELECTOR GETS WRONG TODAY
+# 6. THE ARGUMENT SURFACE, AND THE FOUR HOLES IT USED TO HAVE
 #
-# Four KNOWN-DEFECT markers. Each is an assertion this suite believes is
-# correct and that ci/tier.sh does not satisfy; none is red, and each goes RED
-# the moment it starts passing, so the marker cannot outlive the bug. This
-# suite does not own ci/tier.sh, so it records rather than fixes.
+# Everything in this section arrived as a t_known_defect - an assertion this
+# suite believed was correct and that ci/tier.sh did not satisfy - and became a
+# real assertion with a planted fault behind it on 2026-09-14, when the driver
+# was fixed. The measurements are kept, because what each assertion catches is
+# only legible from the shape of what it caught.
 #
-# THE ROOT OF THE FIRST TWO IS ONE LINE. The name is ACCEPTED by a regular
+# THE ROOT OF THE FIRST TWO WAS ONE LINE. The name was ACCEPTED by a regular
 # expression - `printf '%s' " $TIERS " | grep -q " $WANT "` - and then SELECTED
-# by string equality (`[ "$t" = "$WANT" ]`). Any name that matches as a regex
-# and equals no tier passes the gate and then matches no rung. With --only that
-# selects NOTHING: nine "not requested" rows, no failing gate, "All recorded
-# gates passed", exit 0. Without --only it selects EVERYTHING, because the
-# walk that stops the prefix never finds its stopping point - so `tier.sh
-# 'stati.'` climbs all the way to deploy. A typo, a shell glob that got
-# expanded, or a CI variable that arrived with a stray character reaches both.
+# by string equality (`[ "$t" = "$WANT" ]`). Any name that matched as a regex
+# and equalled no tier passed the gate and then matched no rung. With --only
+# that selected NOTHING: nine "not requested" rows, no failing gate, "All
+# recorded gates passed", exit 0. Without --only it selected EVERYTHING,
+# because the walk that stops the prefix never found its stopping point - so
+# `tier.sh 'stati.'` climbed all the way to deploy. A typo, a shell glob that
+# got expanded, or a CI variable that arrived with a stray character reaches
+# both. Acceptance is now the same equality the selection performs, and both
+# proofs below plant the regex back.
+#
+# THE OTHER TWO ARE THE ARGUMENT LOOP ITSELF. An option whose operand was
+# missing ended in `shift 2`, which FAILS with one argument left and shifts
+# nothing - so the loop saw the same option again, forever, and the job held a
+# runner until an external timeout killed it with no verdict at all. And a
+# second tier name was overwritten in silence, so `tier.sh static deploy` ran
+# DEPLOY: the caller asked for seconds of text checks and got the tier that
+# needs hardware, with nothing anywhere saying a name had been dropped.
+#
+# ALL FOUR REFUSE WITH EXIT 2 rather than failing a gate. ci/README.md's table
+# reserves 2 for "refused: unusable input", and the difference is what the
+# reader does next: 1 sends them to look for a broken design, 2 tells them the
+# job was never asked for anything real.
 #=============================================================================
-t_head "the selector's own holes, recorded so they cannot be forgotten"
+t_head "a name the selector cannot use is refused, and no name is dropped"
 
 ## regex_name_is_refused <toolkit>
 regex_name_is_refused() {
@@ -712,22 +739,67 @@ second_tier_name_is_refused() {
     return 1
 }
 
-t_known_defect tier.refuse.regex_name \
-    "a name that is not a tier but MATCHES one as a regex is refused (it is not: the gate is a regex match and the selection is string equality)" \
+t_check tier.refuse.regex_name \
+    "a name that is not a tier but MATCHES one as a regular expression is refused" \
     regex_name_is_refused "$FLOW_DIR"
 
-t_known_defect tier.select.empty_is_never_green \
-    "a run that selected NO tier at all does not exit 0 (it does: nine skips, no gate, 'All recorded gates passed')" \
+t_check tier.select.empty_is_never_green \
+    "no invocation both selects zero tiers and exits 0 - a run that measured nothing is never green" \
     empty_selection_is_never_green "$FLOW_DIR"
 
-t_known_defect tier.argv.second_name \
-    "two tier names are refused, or the ignored one is reported (neither: the last one silently wins)" \
+t_check tier.argv.second_name \
+    "a second tier name is refused, naming both, rather than one of them winning in silence" \
     second_tier_name_is_refused "$FLOW_DIR"
 
+# -- proofs, one fault per copy ----------------------------------------------
+# The first two plant THE SAME historical fault - acceptance by regex, over a
+# selection by equality - in two copies, because it is the one line that
+# produced both symptoms and the two assertions catch different halves of it:
+# one that the name is refused at all, one that whatever happens next is not a
+# green run of nothing.
+REGEX_GUARD='if [ -z "$WANT" ] || ! printf '"'"'%s'"'"' " $TIERS " | grep -q " $WANT "; then'
+
+M="$(t_mutant "$SB" accept-by-regex)"
+if [ -n "$GUARD_LINE" ] && t_replace_line "$M" ci/tier.sh "$GUARD_LINE" "$REGEX_GUARD"; then
+    t_check_fail tier.refuse.regex_name.mutation \
+        "with acceptance back to a regex match over a selection by equality, a regex-shaped non-tier is accepted and the assertion goes red" \
+        regex_name_is_refused "$M"
+else
+    t_skip tier.refuse.regex_name.mutation "could not plant the fault: no single-line 'if [ -z \"\$WANT\" ] || ...' acceptance test in the copy to replace"
+fi
+
+M="$(t_mutant "$SB" accept-by-regex-green)"
+if [ -n "$GUARD_LINE" ] && t_replace_line "$M" ci/tier.sh "$GUARD_LINE" "$REGEX_GUARD"; then
+    t_check_fail tier.select.empty_is_never_green.mutation \
+        "with the same fault planted, --only on that name selects no tier at all and exits 0, and the assertion goes red" \
+        empty_selection_is_never_green "$M"
+else
+    t_skip tier.select.empty_is_never_green.mutation "could not plant the fault: no single-line 'if [ -z \"\$WANT\" ] || ...' acceptance test in the copy to replace"
+fi
+
+# THE SECOND-NAME ARM, read out of the file for the reason GUARD_LINE is: the
+# fault to plant is the line as it was BEFORE the fix, which is written out
+# here, but the line to replace is whatever the driver says today.
+NAME_ARM="$(grep -m1 -F -- 'refuse_second_name "$WANT"' "$FLOW_DIR/ci/tier.sh")"
+
+M="$(t_mutant "$SB" second-name-wins)"
+if [ -n "$NAME_ARM" ] && t_replace_line "$M" ci/tier.sh "$NAME_ARM" \
+        '        *)          WANT="$1"; shift ;;'; then
+    t_check_fail tier.argv.second_name.mutation \
+        "with the second name overwriting the first again, two names run one of them in silence and the assertion goes red" \
+        second_tier_name_is_refused "$M"
+else
+    t_skip tier.argv.second_name.mutation "could not plant the fault: the positional arm of the argument loop no longer refuses a second name on one line"
+fi
+
 ## fpga_dir_without_operand_is_refused <toolkit>
-## `--fpga-dir` with nothing after it. `shift 2` with one argument left fails
-## and shifts NOTHING, so the argument loop spins forever: the job burns a
-## runner until somebody's timeout kills it, and reports no verdict at all.
+## `--fpga-dir` with nothing after it. It used to `shift 2`, and a `shift 2`
+## with one argument left fails and shifts NOTHING, so the argument loop spun
+## forever: the job burned a runner until somebody's timeout killed it, and
+## reported no verdict at all. THE TIMEOUT IS PART OF THE ASSERTION - without
+## it the proof below would hang this suite instead of failing it, and 124 is
+## graded as its own answer so a red line says "it never returned" rather than
+## the unrelated "it exited 124".
 fpga_dir_without_operand_is_refused() {
     local dir="$1" rc=0 want
     want="$(ladder_names "$dir" | tail -1)"
@@ -743,30 +815,73 @@ fpga_dir_without_operand_is_refused() {
 }
 
 if command -v timeout >/dev/null 2>&1; then
-    t_known_defect tier.argv.missing_operand \
-        "--fpga-dir with no operand is refused (it is not: the argument loop never terminates)" \
+    t_check tier.argv.missing_operand \
+        "--fpga-dir with no operand is refused (exit 2) instead of spinning the argument loop" \
         fpga_dir_without_operand_is_refused "$FLOW_DIR"
+
+    # The fault planted is the line as it stood before the fix, verbatim. The
+    # proof therefore measures the defect itself rather than some other way of
+    # reaching a non-zero exit: the mutant does not refuse, does not fail, and
+    # does not return - t_check_fail sees the assertion go red on a 5-second
+    # timeout, which is exactly what CI saw for as long as the line was there.
+    FPGA_DIR_ARM="$(grep -m1 -F -- '--fpga-dir) need_operand' "$FLOW_DIR/ci/tier.sh")"
+    M="$(t_mutant "$SB" fpga-dir-shift2)"
+    if [ -n "$FPGA_DIR_ARM" ] && t_replace_line "$M" ci/tier.sh "$FPGA_DIR_ARM" \
+            '        --fpga-dir) FPGA_PROJECT="${2:-}"; shift 2 ;;'; then
+        t_check_fail tier.argv.missing_operand.mutation \
+            "with the operand check removed and the bare 'shift 2' back, the loop never terminates and the assertion goes red" \
+            fpga_dir_without_operand_is_refused "$M"
+    else
+        t_skip tier.argv.missing_operand.mutation "could not plant the fault: the --fpga-dir arm of the argument loop no longer checks its operand on one line"
+    fi
 else
     t_skip tier.argv.missing_operand "no coreutils timeout on this host, and the case under test is a script that never returns - running it without a timeout would hang this suite"
+    t_skip tier.argv.missing_operand.mutation "no coreutils timeout on this host, and the fault this proof plants is the non-terminating loop itself - it would hang this suite rather than fail it"
 fi
 
-#-----------------------------------------------------------------------------
-# AND ONE DEFECT INSIDE A TIER, FOUND BY RUNNING IT.
+#=============================================================================
+# 6.1 AND ONE DEFECT INSIDE A TIER, FOUND BY RUNNING IT.
 #
 # The static tier claims to check that Tcl files balance "via `info complete`".
-# It pipes a one-line script into `tclsh - "$f"` - and a standard tclsh does
-# not consume that `-`, so the file name lands in $argv as the SECOND word
-# while the script reads the first. Every open fails, the script exits 2, and
-# the tier reports every .tcl file in the toolkit as having "unbalanced
-# braces/brackets/quotes". It is a FALSE RED rather than a false green, which
-# is the better direction to fail in - but it is also a gate inventing a
-# specific finding out of a file it never read, which is CONTRACT.md rule two.
+# It piped a one-line script into `tclsh - "$f"` - and a standard tclsh does
+# not consume that `-`: it reads the script from stdin and leaves argv as
+# `{- <file>}`, so `[lindex $argv 0]` was the DASH. Every open failed, the
+# one-liner exited 2 - its OWN "could not read" code - and the caller graded
+# every non-zero as unbalanced. The tier reported every .tcl file in the
+# toolkit as having "unbalanced braces/brackets/quotes", which meant the static
+# tier COULD NOT PASS on any host that had a tclsh. A false RED rather than a
+# false green, which is the better direction to fail in - but also a gate
+# stating a specific finding about a file it never opened, which is CONTRACT.md
+# rule two.
+#
+# FIXED 2026-09-14, and in two parts, because the second is the one that keeps
+# it fixed: the reader is a FILE passed to tclsh by name, and it answers in
+# THREE states - balances, does not balance, could not be read. The third is
+# what the gate had no word for, and a gate with no word for "I could not look"
+# has to borrow one from "I looked and it is broken".
+#
+# Both halves are asserted here, on the verdict file rather than on the source:
+#   tier.static.tcl_gate             what it reports agrees, file for file and
+#                                    count for count, with an independent
+#                                    reader over the same file set
+#   tier.static.tcl_gate.unreadable  a .tcl that cannot be OPENED is reported
+#                                    as unread, and never as a syntax finding
 #
 # Judged against a SECOND, INDEPENDENT implementation of the same check,
 # written here, for the reason ci/README.md gives for assert-stage.sh existing
 # beside make's own assertions: a claim checked only by the thing that made it
 # is not checked.
-#-----------------------------------------------------------------------------
+#=============================================================================
+t_head "the static tier's Tcl gate reports what it read, and only what it read"
+
+# The independent reader. Its exit codes are the three states above.
+#
+# BE PRECISE ABOUT WHAT IT IS INDEPENDENT OF. It asks Tcl the same question the
+# gate does, deliberately - if `info complete` is the wrong question, this pair
+# agrees and is wrong together, and nothing here would notice. What it does not
+# share with the gate is how the file is handed to tclsh and how the answer is
+# graded, and that is where every defect in this section lived: a file name
+# that never reached the script, and a read failure graded as a syntax finding.
 cat > "$SB/complete.tcl" <<'TCL'
 set f [lindex $argv 0]
 if {[catch {set c [open $f]}]} { exit 3 }
@@ -775,33 +890,232 @@ close $c
 exit [expr {[info complete $d] ? 0 : 1}]
 TCL
 
-## tcl_gate_agrees_with_tclsh <verdict dir of a run that included the static tier>
+## tcl_roots <toolkit> - the directories the gate searches for .tcl files.
+##
+## READ OUT OF ci/tier.sh's own `find`, never copied into this file: comparing
+## the gate against a DIFFERENT set of files than it looked at would produce a
+## disagreement that is this suite's fault, and - the direction that matters -
+## a suite whose list had gone short would agree with the gate about files
+## neither of them read.
+tcl_roots() {
+    local dir="$1"
+    # The find spans two lines: the roots, then `-name '*.tcl' -type f`. Keep a
+    # one-line window and print it when the second line arrives.
+    awk '{ win = prev "\n" $0; prev = $0 }
+         /-name .\*\.tcl./ { print win; exit }' "$dir/ci/tier.sh" \
+        | grep -o '[$]FLOW_DIR/[A-Za-z0-9_]*' \
+        | sed 's|^[$]FLOW_DIR/||' \
+        | while IFS= read -r r; do [ -n "$r" ] && printf '%s/%s\n' "$dir" "$r"; done
+}
+
+## tcl_files <toolkit> - every .tcl file the gate would have found, sorted.
+tcl_files() {
+    local dir="$1" r
+    local -a roots=()
+    while IFS= read -r r; do
+        [ -n "$r" ] && [ -d "$r" ] && roots+=("$r")
+    done < <(tcl_roots "$dir")
+    [ "${#roots[@]}" -gt 0 ] || return 1
+    find "${roots[@]}" -name '*.tcl' -type f 2>/dev/null | sort
+}
+
+## static_climb <toolkit> - run RUNG 1 alone and print the verdict directory.
+## Rung 1 BY POSITION, never by name: no list of tiers appears in this file.
+static_climb() {
+    local dir="$1" vd
+    vd="$(vd_new)"
+    climb "$dir" "$vd" "$(ladder_names "$dir" | head -1)" --only > "$vd/.climb.log" 2>&1
+    printf '%s' "$vd"
+}
+
+## tcl_gate_row <verdict dir> - the gate's row, or nothing.
+tcl_gate_row() {
+    awk -F'\t' '$3 == "static.tcl.complete" { print; exit }' "$1/verdicts.tsv" 2>/dev/null
+}
+
+## tcl_gate_agrees_with_tclsh <verdict dir of a run that included rung 1> <toolkit>
 tcl_gate_agrees_with_tclsh() {
-    local vd="$1" row status detail first
-    row="$(awk -F'\t' '$3 == "static.tcl.complete" { print; exit }' "$vd/verdicts.tsv" 2>/dev/null)"
-    [ -n "$row" ] || { echo 'no static.tcl.complete row in that run'; return 1; }
+    local vd="$1" dir="$2" row status detail f irc n=0 bad="" unread="" said
+    row="$(tcl_gate_row "$vd")"
+    [ -n "$row" ] || {
+        printf 'no static.tcl.complete row in that run. The gate either did not run or no\n'
+        printf 'longer records under that id, and either way nothing here is measuring it.\n'
+        return 1; }
     status="$(printf '%s\n' "$row" | cut -f2)"
     detail="$(printf '%s\n' "$row" | cut -f4)"
-    [ "$status" = "PASS" ] && return 0
-    first="$(printf '%s\n' "$detail" | tr ' ' '\n' | grep -m1 '\.tcl$')"
-    [ -n "$first" ] || { printf 'the gate is %s and names no .tcl file: %s\n' "$status" "$detail"; return 1; }
-    if tclsh "$SB/complete.tcl" "$first" >/dev/null 2>&1; then
-        printf 'the gate reported this file as having "unbalanced braces/brackets/quotes":\n  %s\n' "$first"
-        printf 'An independent [info complete] on that same file says it BALANCES, so the\n'
-        printf 'gate is reporting a finding about a file it did not read.\n'
+
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        n=$((n + 1))
+        irc=0
+        tclsh "$SB/complete.tcl" "$f" >/dev/null 2>&1 || irc=$?
+        case "$irc" in 0) ;; 1) bad="$bad $f" ;; *) unread="$unread $f" ;; esac
+    done < <(tcl_files "$dir")
+
+    if [ "$n" -eq 0 ]; then
+        printf 'the independent reader found no .tcl file under the roots ci/tier.sh searches\n'
+        printf '(%s), so there is nothing here to compare the gate against.\n' "$(tcl_roots "$dir" | tr '\n' ' ')"
+        return 1
+    fi
+
+    if [ -z "$bad" ] && [ -z "$unread" ]; then
+        # Every file opened and every one balances, so the gate has exactly one
+        # correct answer - and the COUNT is part of that answer. A gate that
+        # passes having read three files out of twenty-one is the same defect
+        # wearing a green badge, and the count is the only place it shows.
+        if [ "$status" != "PASS" ]; then
+            printf 'an independent [info complete] opened all %d .tcl file(s) the gate searches\n' "$n"
+            printf 'and every one of them BALANCES. The gate recorded %s: %s\n' "$status" "$detail"
+            return 1
+        fi
+        said="$(printf '%s' "$detail" | sed -n 's/^\([0-9][0-9]*\) file(s).*/\1/p')"
+        if [ "$said" != "$n" ]; then
+            printf 'the gate passed, and says it checked %s of the %d file(s) that are there: %s\n' \
+                "${said:-no number at all}" "$n" "$detail"
+            return 1
+        fi
+        return 0
+    fi
+
+    # This checkout really does have a bad .tcl in it. The gate must then have
+    # found the SAME thing and said so in the right words - an unopenable file
+    # reported as unread, an unbalanced one as unbalanced, never one dressed as
+    # the other.
+    for f in $unread $bad; do
+        t_contains "$detail" "$f" || {
+            printf 'an independent reader has something to say about %s and the gate does not\n' "$f"
+            printf 'mention it at all: %s\n' "$detail"
+            return 1; }
+    done
+    if [ -n "$unread" ] && [ "$status" != "UNVERIFIED" ]; then
+        printf 'a .tcl file could not be opened, and the gate recorded %s rather than UNVERIFIED.\n' "$status"
+        printf 'Missing evidence is not a finding: %s\n' "$detail"
+        return 1
+    fi
+    if [ -z "$unread" ] && [ "$status" != "FAIL" ]; then
+        printf 'a .tcl file does not balance, and the gate recorded %s: %s\n' "$status" "$detail"
         return 1
     fi
     return 0
 }
 
+## plant_unreadable_tcl <toolkit copy> - print the path of a .tcl in it that
+## cannot be opened, or fail if this host will not let one exist.
+##
+## THE CONTENT BALANCES. If anything ever opens the file the gate must pass, so
+## the word "unbalanced" can only reach the verdict by the conflation this pair
+## of assertions is about. This is a planted CONDITION, not a planted fault:
+## both the assertion and its proof get one, and only the proof gets a fault.
+plant_unreadable_tcl() {
+    local dir="$1" root f
+    root="$(tcl_roots "$dir" | head -1)"
+    [ -n "$root" ] && [ -d "$root" ] || return 1
+    f="$root/unreadable_by_construction.tcl"
+    printf 'puts "this file balances; the whole point of it is that nothing can read it"\n' > "$f" || return 1
+    chmod 000 "$f" 2>/dev/null || return 1
+    # And it is REALLY unreadable here. uid 0 reads it anyway, and so does a
+    # filesystem that ignores mode bits - and a proof that quietly lost its
+    # precondition is a proof that cannot fail.
+    cat "$f" >/dev/null 2>&1 && return 1
+    printf '%s' "$f"
+}
+
+## unreadable_tcl_is_not_called_unbalanced <verdict dir> <the planted file>
+unreadable_tcl_is_not_called_unbalanced() {
+    local vd="$1" f="$2" row status detail
+    row="$(tcl_gate_row "$vd")"
+    [ -n "$row" ] || { echo 'no static.tcl.complete row in that run'; return 1; }
+    status="$(printf '%s\n' "$row" | cut -f2)"
+    detail="$(printf '%s\n' "$row" | cut -f4)"
+    if [ "$status" = "PASS" ]; then
+        printf 'a .tcl file that cannot be opened at all went unnoticed: %s\n' "$detail"
+        printf 'The gate passed, so it counted a file it never read among the ones that balance.\n'
+        return 1
+    fi
+    t_contains "$detail" "$f" || {
+        printf 'the gate is %s and does not name the file it could not read:\n%s\n' "$status" "$detail"
+        return 1; }
+    if printf '%s' "$detail" | grep -qi 'unbalanc'; then
+        printf 'the gate called a file it could not OPEN unbalanced:\n%s\n' "$detail"
+        printf 'It never read a byte of it, so it has no finding about the braces in it. That\n'
+        printf 'conflation is what reported all 21 .tcl files in this toolkit as broken on\n'
+        printf 'every host with a tclsh, for as long as the gate existed.\n'
+        return 1
+    fi
+    printf '%s' "$detail" | grep -qi 'could not read' || {
+        printf 'the gate is %s and names the file, but never says it could not READ it - so\n' "$status"
+        printf 'the reader is left to guess which kind of problem this is:\n%s\n' "$detail"
+        return 1; }
+    [ "$status" = "UNVERIFIED" ] || {
+        printf 'evidence that is MISSING is UNVERIFIED in this toolkit (ci/lib.sh counts it as\n'
+        printf 'a failure and says why); the gate recorded %s: %s\n' "$status" "$detail"
+        return 1; }
+    return 0
+}
+
 if ! command -v tclsh >/dev/null 2>&1; then
+    # All four need a tclsh: two to read the toolkit, two to plant a fault in
+    # the reader and watch this suite notice. The gate itself reports
+    # UNVERIFIED on such a host and there is no claim of its to check.
     t_skip tier.static.tcl_gate "no tclsh on this host, so the static tier reported that gate UNVERIFIED in this run and there is no claim of its to check"
-elif ! grep -q 'static\.tcl\.complete' "$VD_PREFIX/verdicts.tsv" 2>/dev/null; then
-    t_skip tier.static.tcl_gate "the prefix run above recorded no static.tcl.complete row in THIS run (see tier.select.prefix), so there is no verdict of that gate to compare against"
+    t_skip tier.static.tcl_gate.mutation "no tclsh on this host, so the gate under the planted fault would report UNVERIFIED for the same reason as the unmutated one, and the proof would pass for the wrong reason"
+    t_skip tier.static.tcl_gate.unreadable "no tclsh on this host, so the gate never opens a file at all and cannot distinguish one it could not read"
+    t_skip tier.static.tcl_gate.unreadable.mutation "no tclsh on this host, so the gate never opens a file at all and the fault this proof plants is unreachable"
 else
-    t_known_defect tier.static.tcl_gate \
-        "the static tier's Tcl gate reports only what it read (it does not: 'tclsh - \$f' leaves the file name in \$argv[1], so every file fails to open and every file is called unbalanced)" \
-        tcl_gate_agrees_with_tclsh "$VD_PREFIX"
+    if ! grep -q 'static\.tcl\.complete' "$VD_PREFIX/verdicts.tsv" 2>/dev/null; then
+        t_skip tier.static.tcl_gate "the prefix run above recorded no static.tcl.complete row in THIS run (see tier.select.prefix), so there is no verdict of that gate to compare against"
+    else
+        t_check tier.static.tcl_gate \
+            "the gate's verdict, its file list and its count agree with an independent [info complete] over the same files" \
+            tcl_gate_agrees_with_tclsh "$VD_PREFIX" "$FLOW_DIR"
+    fi
+
+    # THE FAULT IS THE LINE AS IT STOOD BEFORE THE FIX, verbatim, so the proof
+    # measures the defect that was there rather than some other way of upsetting
+    # the gate. Under it every open fails, and the gate - which now HAS a word
+    # for that - reports UNVERIFIED over all 21 files while the independent
+    # reader opens every one of them.
+    TCL_READ_LINE="$(grep -m1 -F -- 'tclsh "$reader"' "$FLOW_DIR/ci/tier.sh")"
+    TCL_PIPED_LINE="        echo 'if {[catch {set d [read [set c [open [lindex \$argv 0]]]]}]} {exit 2}; close \$c; exit [expr {[info complete \$d] ? 0 : 1}]' | tclsh - \"\$f\" >/dev/null 2>&1 || trc=\$?"
+    M="$(t_mutant "$SB" tcl-reader-on-stdin)"
+    if [ -n "$TCL_READ_LINE" ] && t_replace_line "$M" ci/tier.sh "$TCL_READ_LINE" "$TCL_PIPED_LINE"; then
+        VD_TCL="$(static_climb "$M")"
+        t_check_fail tier.static.tcl_gate.mutation \
+            "with the reader piped into 'tclsh - \$f' again, every file fails to open and the assertion goes red" \
+            tcl_gate_agrees_with_tclsh "$VD_TCL" "$M"
+    else
+        t_skip tier.static.tcl_gate.mutation "could not plant the fault: the gate no longer runs 'tclsh \"\$reader\" \"\$f\"' on one line, so there is no invocation to put back on stdin"
+    fi
+
+    # -- and the third state, which is the half that keeps it fixed -----------
+    M="$(t_mutant "$SB" tcl-unreadable)"
+    UNREAD_F="$(plant_unreadable_tcl "$M")" || UNREAD_F=""
+    if [ -z "$UNREAD_F" ]; then
+        t_skip tier.static.tcl_gate.unreadable "this host reads a mode-000 file anyway (uid $(id -u), or a filesystem that ignores mode bits), so a .tcl the gate cannot open cannot be created here"
+    else
+        VD_UNREAD="$(static_climb "$M")"
+        t_check tier.static.tcl_gate.unreadable \
+            "a .tcl file that cannot be opened is reported as unread (UNVERIFIED), by name, and never as unbalanced" \
+            unreadable_tcl_is_not_called_unbalanced "$VD_UNREAD" "$UNREAD_F"
+    fi
+
+    # The fault is the conflation itself: the reader still answers in three
+    # states and the caller folds two of them together again, which is what the
+    # old `|| tbad="$tbad $f"` did to every non-zero exit.
+    TCL_UNREAD_ARM="$(grep -m1 -F -- 'tunread="$tunread' "$FLOW_DIR/ci/tier.sh")"
+    M="$(t_mutant "$SB" tcl-unreadable-conflated)"
+    UNREAD_F2="$(plant_unreadable_tcl "$M")" || UNREAD_F2=""
+    if [ -z "$UNREAD_F2" ]; then
+        t_skip tier.static.tcl_gate.unreadable.mutation "this host reads a mode-000 file anyway (uid $(id -u), or a filesystem that ignores mode bits), so the case this proof plants a fault against cannot be created here"
+    elif [ -z "$TCL_UNREAD_ARM" ] || ! t_replace_line "$M" ci/tier.sh "$TCL_UNREAD_ARM" \
+            '            *) tbad="$tbad $f" ;;   # planted fault: any non-zero is a syntax finding again'; then
+        t_skip tier.static.tcl_gate.unreadable.mutation "could not plant the fault: the gate's reader no longer has a single-line '*) tunread=...' arm to fold back into the unbalanced list"
+    else
+        VD_UNREAD2="$(static_climb "$M")"
+        t_check_fail tier.static.tcl_gate.unreadable.mutation \
+            "with 'could not read' folded back into 'unbalanced', a file the gate never opened is called a syntax finding and the assertion goes red" \
+            unreadable_tcl_is_not_called_unbalanced "$VD_UNREAD2" "$UNREAD_F2"
+    fi
 fi
 
 #=============================================================================
@@ -973,38 +1287,87 @@ else
 fi
 
 M="$(t_mutant "$SB" cap-noconf-continues)"
-if t_replace_line "$M" ci/capability.sh '    exit 2' '    :'; then
+# SCOPED TO THE BLOCK IT BELONGS TO, and it was not until 2026-09-14. The
+# target used to be the literal line `    exit 2`, which t_replace_line refuses
+# once a second one exists anywhere in the file - and one does, since the
+# argument loop grew a refusal of its own. The proof did not go red; it went
+# QUIET, skipping with a reason that was true of the file and false of the
+# guard, which is the shape of a proof that stops proving anything.
+if t_mutate "$M" ci/capability.sh \
+        '/^capability: no declaration file\./,/^fi$/ s/^    exit 2$/    :/'; then
     t_check_fail cap.conf.absent.mutation \
         "with the missing-declaration refusal removed, the assertion goes red" \
         no_declaration_is_refused "$M"
 else
-    t_skip cap.conf.absent.mutation "could not plant the fault: the no-declaration-file block no longer ends in a bare 'exit 2'"
+    t_skip cap.conf.absent.mutation "could not plant the fault: the block that prints 'capability: no declaration file.' no longer ends in a bare 'exit 2'"
 fi
 
 #-----------------------------------------------------------------------------
 # AND THE SAME ARGUMENT-LOOP DEFECT AS ci/tier.sh, IN THE SAME SHAPE.
-# `--require` and `--conf` both do `shift 2`, which fails and shifts NOTHING
-# when one argument is left - so the loop spins forever. The first step of
-# every CI job is this script; a job that hangs there reports no verdict at all
-# and holds a runner until somebody's timeout kills it.
+# `--require` and `--conf` both ended in `shift 2`, which fails and shifts
+# NOTHING when one argument is left - so the loop spun forever. The first step
+# of every CI job is this script; a job that hangs there reports no verdict at
+# all and holds a runner until somebody's timeout kills it. Fixed 2026-09-14
+# alongside ci/tier.sh's --fpga-dir, which had it too.
+#
+# BOTH OPTIONS ARE DRIVEN, and each has its own proof. They are two separate
+# lines in one loop: an assertion that only ever exercised --require would say
+# nothing whatever about --conf, and "the other one was fixed at the same time"
+# is a claim about somebody's memory of an afternoon.
 #-----------------------------------------------------------------------------
-## cap_require_without_operand_is_refused <toolkit>
-cap_require_without_operand_is_refused() {
-    local dir="$1" rc=0
+## _cap_argv_refused <toolkit> <the option under test> -- <argv...>
+## THE TIMEOUT IS PART OF THE ASSERTION: the failure being measured is a script
+## that never returns, so 124 is graded as its own answer rather than being
+## reported as an exit status the script chose.
+_cap_argv_refused() {
+    local dir="$1" opt="$2" rc=0; shift 3
     timeout 5 env -u CI_CAPABILITY_CONF -u FPGA_DIR \
-        bash "$dir/ci/capability.sh" --conf "$CAP_CONF" --require >/dev/null 2>&1 || rc=$?
+        bash "$dir/ci/capability.sh" "$@" >/dev/null 2>&1 || rc=$?
     [ "$rc" = 2 ] && return 0
-    [ "$rc" = 124 ] && { printf 'it had not terminated after 5 seconds.\n'; return 1; }
-    printf 'exit %s, not 2 (refused: unusable input)\n' "$rc"
+    [ "$rc" = 124 ] && { printf '%s with no operand had not terminated after 5 seconds.\n' "$opt"; return 1; }
+    printf '%s with no operand exited %s, not 2 (refused: unusable input)\n' "$opt" "$rc"
     return 1
 }
 
+## cap_options_without_operand_are_refused <toolkit>
+cap_options_without_operand_are_refused() {
+    local dir="$1"
+    _cap_argv_refused "$dir" --require -- --conf "$CAP_CONF" --require || return 1
+    _cap_argv_refused "$dir" --conf    -- --conf || return 1
+    return 0
+}
+
 if command -v timeout >/dev/null 2>&1; then
-    t_known_defect cap.argv.missing_operand \
-        "--require with no operand is refused (it is not: the argument loop never terminates)" \
-        cap_require_without_operand_is_refused "$FLOW_DIR"
+    t_check cap.argv.missing_operand \
+        "--require and --conf with no operand are each refused (exit 2) instead of spinning the argument loop" \
+        cap_options_without_operand_are_refused "$FLOW_DIR"
+
+    # One fault per copy, and the fault is each line as it stood before the fix.
+    CAP_REQUIRE_ARM="$(grep -m1 -F -- '--require) need_operand' "$FLOW_DIR/ci/capability.sh")"
+    M="$(t_mutant "$SB" cap-require-shift2)"
+    if [ -n "$CAP_REQUIRE_ARM" ] && t_replace_line "$M" ci/capability.sh "$CAP_REQUIRE_ARM" \
+            '        --require) MODE=require; REQUIRE="${2:-}"; shift 2 ;;'; then
+        t_check_fail cap.argv.missing_operand.mutation.require \
+            "with --require back to a bare 'shift 2', the loop never terminates and the assertion goes red" \
+            cap_options_without_operand_are_refused "$M"
+    else
+        t_skip cap.argv.missing_operand.mutation.require "could not plant the fault: the --require arm of capability.sh's argument loop no longer checks its operand on one line"
+    fi
+
+    CAP_CONF_ARM="$(grep -m1 -F -- '--conf)    need_operand' "$FLOW_DIR/ci/capability.sh")"
+    M="$(t_mutant "$SB" cap-conf-shift2)"
+    if [ -n "$CAP_CONF_ARM" ] && t_replace_line "$M" ci/capability.sh "$CAP_CONF_ARM" \
+            '        --conf)    CONF="${2:-}"; shift 2 ;;'; then
+        t_check_fail cap.argv.missing_operand.mutation.conf \
+            "and with --conf back to a bare 'shift 2' - the option the first proof never touches - the assertion goes red too" \
+            cap_options_without_operand_are_refused "$M"
+    else
+        t_skip cap.argv.missing_operand.mutation.conf "could not plant the fault: the --conf arm of capability.sh's argument loop no longer checks its operand on one line"
+    fi
 else
     t_skip cap.argv.missing_operand "no coreutils timeout on this host, and the case under test is a script that never returns - running it without a timeout would hang this suite"
+    t_skip cap.argv.missing_operand.mutation.require "no coreutils timeout on this host, and the fault this proof plants is the non-terminating loop itself - it would hang this suite rather than fail it"
+    t_skip cap.argv.missing_operand.mutation.conf "no coreutils timeout on this host, and the fault this proof plants is the non-terminating loop itself - it would hang this suite rather than fail it"
 fi
 
 fi   # ci/capability.sh present

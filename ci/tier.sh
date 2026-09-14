@@ -109,19 +109,92 @@ trap 'exit 130' INT
 
 TIERS="static host contract flist synth impl bitstream verify deploy"
 
+#-----------------------------------------------------------------------------
+# THE ARGUMENT LOOP, AND THE TWO WAYS IT USED TO END BADLY.
+#
+# 1. AN OPTION WITH NO OPERAND NEVER TERMINATED. `--fpga-dir` ended in
+#    `shift 2`, and a `shift 2` with one argument left FAILS - it shifts
+#    NOTHING. The loop then sees the same `--fpga-dir` next time round, and the
+#    time after that, forever: no verdict, no output, no exit status, and a
+#    runner held until somebody's external timeout kills it. Measured, both
+#    here and in ci/capability.sh's --require/--conf. The check has to happen
+#    BEFORE the shift, which is what need_operand is.
+#
+# 2. A SECOND TIER NAME WAS SILENTLY DISCARDED. `WANT="$1"` inside the loop
+#    means the LAST name wins, so `ci/tier.sh static deploy` climbed to DEPLOY
+#    - the one tier that needs hardware - for a caller who asked for the cheap
+#    text-only one, and nothing anywhere said a name had been dropped. Two
+#    names select two different sets of checks; a script that picks one of them
+#    for you is reporting on a run nobody asked for.
+#
+# Both refuse with exit 2 and neither reaches ci_init, so a refused invocation
+# writes no verdict file at all. ci/README.md reserves 2 for "refused: unusable
+# input", and the distinction from 1 is the whole point: 1 sends a reader
+# looking for a broken design, 2 tells them the job was never asked for
+# anything real.
+#-----------------------------------------------------------------------------
+
+## need_operand <arguments remaining> <option> <what it takes>
+## Called with "$#" from inside the loop, BEFORE the `shift 2` that would
+## otherwise fail silently and spin.
+need_operand() {
+    [ "$1" -ge 2 ] && return 0
+    echo "tier: $2 takes $3 after it, and nothing followed it." >&2
+    echo "  Nothing was measured. Exit 2 is 'unusable arguments', not a failing gate." >&2
+    exit 2
+}
+
+## refuse_second_name <the name already held> <the name just seen>
+## NAMES BOTH. The caller cannot otherwise tell which of the two this script
+## would have kept, and the two answers differ by hours of licence time.
+refuse_second_name() {
+    echo "tier: two tier names were given: '$1' and '$2'. This script climbs ONE ladder." >&2
+    echo "  They select different sets of checks, and one of them was about to be" >&2
+    echo "  discarded without a word. Name one; add --only to run just that tier." >&2
+    exit 2
+}
+
 WANT=""
 ONLY=0
 FPGA_PROJECT="${FPGA_DIR:-$PWD}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --only)     ONLY=1; shift ;;
-        --fpga-dir) FPGA_PROJECT="${2:-}"; shift 2 ;;
+        --fpga-dir) need_operand "$#" --fpga-dir "the fpga/ directory to act on"; FPGA_PROJECT="$2"; shift 2 ;;
         -h|--help)  usage; exit 0 ;;
         -*)         echo "tier: unknown argument '$1'" >&2; exit 2 ;;
-        *)          WANT="$1"; shift ;;
+        *)          [ -z "$WANT" ] || refuse_second_name "$WANT" "$1"; WANT="$1"; shift ;;
     esac
 done
-if [ -z "$WANT" ] || ! printf '%s' " $TIERS " | grep -q " $WANT "; then
+
+#-----------------------------------------------------------------------------
+# ACCEPTANCE IS STRING EQUALITY - THE SAME TEST THE SELECTION USES.
+#
+# It was a REGULAR EXPRESSION: `printf '%s' " $TIERS " | grep -q " $WANT "`,
+# while should_run selects with `[ "$t" = "$WANT" ]`. A name that matched as a
+# regex and equalled no tier therefore passed the gate and then matched no
+# rung, and the two ways that came out were both silent. MEASURED:
+#
+#   ci/tier.sh 'stati.' --only   exit 0, nine "not requested" rows, no gate
+#                                run, and "All recorded gates passed."
+#   ci/tier.sh 'stati.'          every tier INCLUDING deploy, because the
+#                                prefix walk never found its stopping point.
+#
+# A typo'd tier name in a workflow file reaches both, and the first one is a CI
+# job going green having run nothing - the exact failure this whole verdict
+# layer exists to prevent. Two tests of membership on one name is one test too
+# many: this one is the test the selection then performs, so a name that is
+# accepted here is a name that selects a rung.
+#-----------------------------------------------------------------------------
+
+## is_declared_tier <name>
+is_declared_tier() {
+    local t
+    for t in $TIERS; do [ "$t" = "$1" ] && return 0; done
+    return 1
+}
+
+if [ -z "$WANT" ] || ! is_declared_tier "$WANT"; then
     echo "tier: name one of: $TIERS" >&2
     exit 2
 fi
@@ -274,6 +347,94 @@ stage_tier() {  # stage_tier <make target> <assert-stage name> [--optional]
 }
 
 #-----------------------------------------------------------------------------
+# THE TCL BALANCE GATE.
+#
+# In a function of its own because it has THREE outcomes, not two, and because
+# the reason for that is worth more room than an inline comment.
+#
+# There is no parse-only mode - tclsh EXECUTES - so this checks only that
+# braces, brackets and quotes balance, via `info complete`. The gate says so:
+# a gate whose name promises more than it measured is how a green run comes to
+# be believed about something it never looked at.
+#
+# THE READER IS A FILE, AND THE FILE UNDER TEST IS tclsh's FIRST ARGUMENT.
+# It used to be `echo '<one-liner>' | tclsh - "$f"`, and a standard tclsh does
+# not consume that `-`. Measured on tcl 8.6: `tclsh - <file>` reads the script
+# from stdin and leaves argv as `{- <file>}`, so `[lindex $argv 0]` was the
+# DASH. Every open failed, the one-liner exited 2 - its own "could not read"
+# code - and the caller graded every non-zero as unbalanced. The static tier
+# therefore reported all 21 .tcl files in this toolkit as having "unbalanced
+# braces/brackets/quotes" on every host that HAS a tclsh, while an independent
+# `info complete` over the same files found not one. It is a false RED rather
+# than a false green, which is the better direction to fail in - but it is also
+# a gate stating a specific finding about a file it never opened, and it meant
+# this tier could not pass anywhere tclsh was installed.
+#
+# SO THE READER ANSWERS IN THREE STATES. "I could not open it" and "I opened it
+# and it does not balance" are different facts, with different owners and
+# different fixes, and collapsing them is precisely what produced the finding
+# above. The gate keeps them apart all the way to the verdict: an unread file
+# is UNVERIFIED (evidence missing, and ci/lib.sh counts that as a failure), an
+# unbalanced one is FAIL (evidence read, and bad).
+#-----------------------------------------------------------------------------
+static_tcl_gate() {
+    local f n=0 trc reader tbad="" tunread=""
+
+    reader="$(mktemp "${TMPDIR:-/tmp}/fpga-flow-tcl-complete.XXXXXXXX" 2>/dev/null)" || reader=""
+    if [ -z "$reader" ]; then
+        ci_unverified static.tcl.complete \
+            "could not write a reader script under ${TMPDIR:-/tmp}, so not one Tcl file was opened. This is a fact about this host, and NOT a finding about any file"
+        return 1
+    fi
+    # A QUOTED heredoc. Every `$` below belongs to Tcl, and an unquoted one
+    # would have the shell expand them to nothing before tclsh ever saw them.
+    cat > "$reader" <<'TCL'
+# ci/tier.sh's static tier: does one file's Tcl balance?
+#   exit 0  it balances
+#   exit 1  it was READ and does not balance
+#   exit 3  it could not be read at all - the caller must not call this a
+#           syntax finding, because nothing has looked at the syntax
+set f [lindex $argv 0]
+if {[catch {set c [open $f]}]} { exit 3 }
+set d [read $c]
+close $c
+exit [expr {[info complete $d] ? 0 : 1}]
+TCL
+
+    while IFS= read -r f; do
+        n=$((n + 1))
+        trc=0
+        tclsh "$reader" "$f" >/dev/null 2>&1 || trc=$?
+        case "$trc" in
+            0) ;;                            # read, and balances
+            1) tbad="$tbad $f" ;;            # read, and does not balance
+            *) tunread="$tunread $f" ;;      # never opened - NOT a finding about its contents
+        esac
+    done < <(find "$FLOW_DIR/flow" "$FLOW_DIR/part" "$FLOW_DIR/templates" \
+                  -name '*.tcl' -type f 2>/dev/null)
+    rm -f "$reader"
+
+    if [ "$n" -eq 0 ]; then
+        ci_skip static.tcl.complete "no .tcl under flow/, part/ or templates/ yet"
+        return 0
+    fi
+    # UNREADABLE FIRST, and it is reported as missing evidence rather than as a
+    # verdict about the file. A gate that cannot open its input has not passed
+    # and has not found anything; it has not run.
+    if [ -n "$tunread" ]; then
+        ci_unverified static.tcl.complete \
+            "could not READ, so nothing is claimed about what is in them:$tunread${tbad:+ (separately, these WERE read and do not balance:$tbad)}"
+        return 1
+    fi
+    if [ -n "$tbad" ]; then
+        ci_fail static.tcl.complete "unbalanced braces/brackets/quotes:$tbad"
+        return 1
+    fi
+    ci_pass static.tcl.complete "$n file(s) balance (this proves BALANCE, not that they run)"
+    return 0
+}
+
+#-----------------------------------------------------------------------------
 t_static() {
     local rc=0 f
 
@@ -293,26 +454,10 @@ t_static() {
         ci_pass static.shell.parse "every ci/, test/ and scripts/ shell file parses"
     fi
 
-    # 2. Tcl. There is no parse-only mode - tclsh EXECUTES - so this checks
-    #    only that braces, brackets and quotes balance, via `info complete`.
-    #    Say so: a gate whose name promises more than it measured is how a
-    #    green run comes to be believed about something it never looked at.
+    # 2. Tcl balance, via `info complete` - see static_tcl_gate above for what
+    #    that does and does not prove, and for the three states it answers in.
     if command -v tclsh >/dev/null 2>&1; then
-        local tbad="" n=0
-        while IFS= read -r f; do
-            n=$((n + 1))
-            echo 'if {[catch {set d [read [set c [open [lindex $argv 0]]]]}]} {exit 2}; close $c; exit [expr {[info complete $d] ? 0 : 1}]' \
-                | tclsh - "$f" >/dev/null 2>&1 || tbad="$tbad $f"
-        done < <(find "$FLOW_DIR/flow" "$FLOW_DIR/part" "$FLOW_DIR/templates" \
-                      -name '*.tcl' -type f 2>/dev/null)
-        if [ "$n" -eq 0 ]; then
-            ci_skip static.tcl.complete "no .tcl under flow/, part/ or templates/ yet"
-        elif [ -n "$tbad" ]; then
-            ci_fail static.tcl.complete "unbalanced braces/brackets/quotes:$tbad"
-            rc=1
-        else
-            ci_pass static.tcl.complete "$n file(s) balance (this proves BALANCE, not that they run)"
-        fi
+        static_tcl_gate || rc=1
     else
         ci_unverified static.tcl.complete "no tclsh on this host, so no Tcl file was checked at all"
         rc=1

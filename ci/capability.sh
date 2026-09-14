@@ -105,14 +105,40 @@ export FPGA_FLOW_DIR="${FPGA_FLOW_DIR:-$FLOW_DIR}"
 usage() { sed -n '2,/^# Copyright/p' "$0" | sed 's/^#\{1,\} \{0,1\}//;s/^#$//'; }
 trap 'exit 130' INT
 
+#-----------------------------------------------------------------------------
+# AN OPTION WITH NO OPERAND MUST REFUSE, NOT SPIN.
+#
+# `--require` and `--conf` both ended in `shift 2`, and a `shift 2` with one
+# argument left FAILS - it shifts NOTHING. The loop then sees the same option
+# again, and again, forever. Measured: `capability.sh --conf <file> --require`
+# never returns. THIS SCRIPT IS THE FIRST STEP OF A CI JOB, whose entire
+# purpose is to fail in seconds when the job lands on an under-provisioned
+# host; hanging there is the one failure mode that costs more than the forty
+# minutes of synthesis it exists to save, because the job reports nothing at
+# all and holds a runner until somebody's external timeout kills it.
+#
+# The test has to happen BEFORE the shift. Exit 2 is this script's "unusable
+# input" (see the header's exit table) and is deliberately not 1: 1 means this
+# host does not provide the label, which would send a reader hunting for a
+# missing tool that has nothing to do with it.
+#-----------------------------------------------------------------------------
+
+## need_operand <arguments remaining> <option> <what it takes>
+need_operand() {
+    [ "$1" -ge 2 ] && return 0
+    echo "capability: $2 takes $3 after it, and nothing followed it." >&2
+    echo "  Nothing was probed. Exit 2 is 'unusable arguments', not an unmet requirement." >&2
+    exit 2
+}
+
 MODE=report
 REQUIRE=""
 CONF=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --labels)  MODE=labels; shift ;;
-        --require) MODE=require; REQUIRE="${2:-}"; shift 2 ;;
-        --conf)    CONF="${2:-}"; shift 2 ;;
+        --require) need_operand "$#" --require "the label to assert"; MODE=require; REQUIRE="$2"; shift 2 ;;
+        --conf)    need_operand "$#" --conf "the declaration file to read"; CONF="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "capability: unknown argument '$1'" >&2; exit 2 ;;
     esac
