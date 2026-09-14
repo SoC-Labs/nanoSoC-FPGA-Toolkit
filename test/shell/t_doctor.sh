@@ -47,7 +47,7 @@
 #
 #   header 27-32  exit 0 every ESSENTIAL item present; 1 an essential item is
 #                 missing; 2 crash; 130 interrupted. Advisory items NEVER
-#                 change the status - Doctor's own docstring (line 77) says
+#                 change the status - Doctor's own docstring (line 88) says
 #                 why: "a doctor that exits 1 on it teaches people to ignore it"
 #   header 10-21  it reports what is ON THE FILESYSTEM AND REACHABLE BY YOU,
 #                 enumerated at run time, and names every version a modulefile
@@ -55,9 +55,11 @@
 #                 modulefile and never hardcodes a version list
 #   header 22-25  it launches NO EDA TOOL; the version comes from the install
 #                 PATH and is labelled as such
-#   usable() 278  THREE states, not two: absent / blocked (present but not
-#                 usable by you) / ok
-#   main() 624    it takes no arguments, and says so rather than ignoring them
+#   usable() 472  THREE states, not two: absent / blocked (present but not
+#                 usable by you) / ok - and Doctor.tool 107 applies the same
+#                 three to a support tool, because a tclsh that is on PATH and
+#                 cannot start is neither present nor absent
+#   main() 856    it takes no arguments, and says so rather than ignoring them
 #
 # What it INSPECTS, which is what makes a stub PATH enough: PATH (shutil.which),
 # the filesystem under each discovered install root, MODULEPATH and the
@@ -78,9 +80,12 @@
 # doctor.mod.unmeasured needs 20 GB free on $TMPDIR, because doctor advises
 # below that and a single advisory is enough to stop the summary saying "This
 # host can run the flow." Each is MEASURED before it is skipped. On a host where
-# all four skip, four planted-fault proofs skip with them and the count in
-# test/MUTATION_COVERAGE goes red - which is the ledger doing its job, and the
-# SKIP lines above it say which host fact caused it.
+# all four skip, FIVE planted-fault proofs skip with them - untraversable
+# acquired one on 2026-09-14 when its defect was fixed - and the ledger does not
+# go red for it: test/MUTATION_COVERAGE counts the proofs a suite CARRIES,
+# rejections plus proofs that skipped for a stated reason, so a missing
+# precondition is reported once, by the SKIP lines and run.sh's hole gate, and
+# not twice.
 #
 # WHAT THIS FILE DOES NOT COVER, so the green line is not read as more than it
 # is: the disk-space threshold (20 GB) is not exercised - making a filesystem
@@ -230,10 +235,20 @@ mkstub "$TOOLS/tclsh"  "8.6.12"             - 0
 mkstub "$TOOLS/git"    "git version 2.0.0-stub" - 0
 mkstub "$TOOLS/lmutil" "lmutil - stub"      - 0
 mkstub "$TOOLS/lmstat" "lmstat - stub"      - 0
-# A tclsh that is installed and CANNOT START. run() merges stderr into stdout
-# and ignores the exit status, so this is the input that decides whether doctor
-# can tell "present" from "present and unusable" in its support-tool tier.
-mkstub "$TOOLS/tclsh-broken" - "tclsh: error while loading shared libraries: libtcl.so" 127
+# A tclsh that is installed and CANNOT START: the input that decides whether
+# doctor can tell "present" from "present and unusable" in its support-tool tier.
+#
+# THE MESSAGE CARRIES A VERSION NUMBER ON PURPOSE, and this is the fixture
+# earning its keep rather than decoration. A real dynamic-linker failure names
+# the SONAME it could not find, and a soname carries the library's version - so
+# the string a broken tclsh prints while dying is one that any "does this look
+# like a version?" test accepts. With `libtcl.so` in it, doctor could pass this
+# case by parsing alone and the exit status could go on being ignored; with
+# `libtcl8.6.so` in it, only grading the status gets the answer right. The
+# fixture has to be able to fool the weaker of the two checks or it does not
+# measure the stronger one.
+TCL_BROKEN_ERR="tclsh: error while loading shared libraries: libtcl8.6.so: cannot open shared object file"
+mkstub "$TOOLS/tclsh-broken" - "$TCL_BROKEN_ERR" 127
 # A tclsh that answers nothing at all and exits 0.
 mkstub "$TOOLS/tclsh-silent" - - 0
 
@@ -444,6 +459,19 @@ dr_rc() {
     dr_dump "$DR_OUT"
     printf 'doctor exited %s on the report above; expected %s (%s)\n' "$DR_RC" "$1" "$2"
     return 1
+}
+
+## dr_advisory <out> - the advisory COUNT out of the summary line; empty if the
+## run did not reach "Essentials present."
+##
+## Counted rather than described, because "it is reported" and "it counts" are
+## different properties and the second one is the one with teeth: an item that
+## prints a line and increments nothing still lets the run end with "This host
+## can run the flow." Comparing two runs that differ in ONE fixture is the only
+## way to attribute a count to that fixture - asserting a number would be
+## asserting the sum of everything else in the run as well.
+dr_advisory() {
+    sed -n 's/^Essentials present\. \([0-9][0-9]*\) advisory item(s).*/\1/p' "$1"
 }
 
 ## declared_list <toolkit> <NAME> - a tuple constant read OUT OF THE SCRIPT.
@@ -735,8 +763,8 @@ else
 fi
 
 M="$(t_mutant "$SB" tclessential)"
-if t_replace_line "$M" "$DOCTOR_REL" '    tcl = d.tool("tclsh", False,' \
-                                     '    tcl = d.tool("tclsh", True,'; then
+if t_replace_line "$M" "$DOCTOR_REL" '    d.tool("tclsh", False,' \
+                                     '    d.tool("tclsh", True,'; then
     t_check_fail doctor.tool.advisory.mutation \
         "with tclsh promoted to essential, a host that can build perfectly well is failed and the assertion goes red" \
         helpers_are_advisory "$M" bare-mut
@@ -759,8 +787,21 @@ fi
 # One predicate, three inputs. doctor's own standard for this is written in its
 # disk branch: "Reported as unmeasured rather than as fine. A check that could
 # not read its input has not passed; it has not run." The tclsh and git version
-# lines are the place that standard is not met, and the two markers below are
-# what asserting it - rather than reading it - found.
+# lines were the place that standard was NOT met, and the two assertions below
+# were carried here as t_known_defect until 2026-09-14 - which is the whole
+# reason they exist in this shape. Writing the predicate found both: a run()
+# that merged stderr into stdout and dropped the exit status, so a tclsh that
+# could not start had the LINKER'S ERROR printed as its version under `ok`, and
+# a tclsh that answered nothing lost the line altogether.
+#
+# THE THREE INPUTS FAIL IN THREE DIRECTIONS, which is why one predicate is not
+# enough and each has its own assertion below it:
+#   a working tclsh      the version is read and printed        (doctor.tool.version)
+#   one that cannot run  present, and unusable - never `ok`     (...version.garbage)
+#   one that says nothing the version is unknown, and SAID to be (...version.silent)
+# The second and third are opposite errors: reporting a silent tool as broken is
+# as wrong as reporting a broken one as fine, so each asserts the other's case
+# did not happen.
 #-----------------------------------------------------------------------------
 t_head "a version doctor could not read must be reported, not passed off or dropped"
 
@@ -800,40 +841,156 @@ tool_version_is_honest() {
     return 1
 }
 
+## unusable_tool_is_not_ok <toolkit> <tag>
+##
+## A tclsh on PATH that exits 127. Everything the report has to get right about
+## it, in one run - and the first line is the generic rule above, so this does
+## not restate it and cannot drift from it.
+##
+## What was MEASURED here before the fix:
+##   ok     tclsh            <path>
+##   ok       tclsh version  tclsh: error while loading shared libraries: libtcl...
+## Two `ok` lines about a tool that cannot start, and the linker's message
+## printed as a measured version.
+unusable_tool_is_not_ok() {
+    local flow="$1" tag="$2"
+    tool_version_is_honest "$flow" "$tag-rule" "$BIN_TCLBAD" || return 1
+
+    run_doctor "$flow" "$tag" "$SB/cwd" "$BIN_TCLBAD" BUILD_DIR="$SB/build"
+
+    # THE TOOL'S OWN LINE, not just the version's. "Present" is true and "ok" is
+    # not: a reader scanning the status column must not come away with a host
+    # that has a working tclsh, because that column is the whole reason a report
+    # is faster than looking.
+    dr_lacks "$DR_OUT" ok   "tclsh" || return 1
+    dr_says  "$DR_OUT" WARN "tclsh" "$BIN_TCLBAD/tclsh" || return 1
+
+    # And it says what it MEASURED. "Present and unusable" with no exit status
+    # behind it is an opinion, and the status is the one fact that separates
+    # this from a tool doctor simply failed to parse.
+    t_contains "$(dr_block "$DR_OUT" WARN "tclsh")" "exited 127" || {
+        printf 'doctor reports tclsh as unusable and never says what it measured. The exit\n'
+        printf 'status is the evidence, and a reader with no evidence has to go and run it:\n'
+        dr_block "$DR_OUT" WARN "tclsh"; return 1; }
+
+    # Nothing the dying tool printed appears under an `ok` ANYWHERE. Aimed at
+    # the whole report rather than at the version line, because the defect was
+    # never really about that line: it was about text from a failed probe being
+    # restated as a measurement.
+    if grep -E '^  ok ' "$DR_OUT" | grep -qF -- "${TCL_BROKEN_ERR:0:40}"; then
+        printf 'what the tool printed while FAILING is repeated on an `ok` line:\n'
+        grep -E '^  ok ' "$DR_OUT" | sed 's/^/    | /'
+        printf 'That is a measured fact stated about a tool that never started.\n'
+        return 1
+    fi
+
+    # THE EXIT CONTRACT. tclsh is advisory (Vivado carries its own Tcl), so
+    # discovering that it is broken must NOT fail the host: doctor's own
+    # docstring - "a doctor that exits 1 on it teaches people to ignore it" - is
+    # the reason a newly-detected fault does not get to change the status.
+    dr_rc 0 "a broken tclsh is advisory; the flow never launches one" || return 1
+    t_matches "$(cat "$DR_OUT")" "^Essentials present\." || {
+        printf 'exit 0 without saying so, on a run that found a tool it could not start:\n'
+        dr_dump "$DR_OUT"; return 1; }
+    return 0
+}
+
+## silent_version_is_unknown_and_counts <toolkit> <tag>
+##
+## The opposite error to the one above, and the reason they are two assertions:
+## a tclsh that exits 0 and prints nothing IS usable. The tool line must stay
+## `ok` and only the VERSION is unknown - reporting the tool as broken here
+## would be the same class of defect pointed the other way.
+##
+## The second half is the half with teeth. A line that reports something and
+## increments nothing still lets the run finish with "This host can run the
+## flow.", so the count is measured against a control run that differs only in
+## which tclsh is on PATH. doctor does exactly this for a disk it could not
+## measure, one section later.
+silent_version_is_unknown_and_counts() {
+    local flow="$1" tag="$2" base got
+
+    tool_version_is_honest "$flow" "$tag-rule" "$BIN_TCLMUTE" || return 1
+
+    run_doctor "$flow" "$tag-control" "$SB/cwd" "$BIN_FULL" BUILD_DIR="$SB/build"
+    base="$(dr_advisory "$DR_OUT")"
+    [ -n "$base" ] || {
+        printf 'the control run never reached "Essentials present.", so there is no advisory\n'
+        printf 'count to compare against and the second half of this assertion would be vacuous:\n'
+        dr_dump "$DR_OUT"; return 1; }
+
+    run_doctor "$flow" "$tag" "$SB/cwd" "$BIN_TCLMUTE" BUILD_DIR="$SB/build"
+    dr_says "$DR_OUT" ok "tclsh" "$BIN_TCLMUTE/tclsh" || return 1
+    dr_lacks "$DR_OUT" WARN "tclsh" || return 1
+    dr_says "$DR_OUT" -- "  tclsh version" "unknown" || return 1
+
+    got="$(dr_advisory "$DR_OUT")"
+    [ -n "$got" ] || {
+        printf 'the run did not reach "Essentials present." at all:\n'; dr_dump "$DR_OUT"; return 1; }
+    [ "$got" -eq $((base + 1)) ] || {
+        printf 'the same host with a tclsh that answers nothing reports %s advisory item(s);\n' "$got"
+        printf 'with one that answers, %s. A version doctor could not read has to COUNT, or\n' "$base"
+        printf 'the summary a reader acts on says the host was measured clean when one of the\n'
+        printf 'measurements did not happen. doctor does count an unmeasured disk.\n'
+        dr_dump "$DR_OUT"; return 1; }
+    dr_rc 0 "an unknown tclsh version is not a reason the flow cannot run here" || return 1
+    return 0
+}
+
 t_check doctor.tool.version \
     "a working tclsh has its version read and reported beside it" \
     tool_version_is_honest "$FLOW_DIR" version-ok "$BIN_FULL"
 
+t_check doctor.tool.version.garbage \
+    "a tclsh that cannot start is WARN, never ok, and its failure text is never printed as a version" \
+    unusable_tool_is_not_ok "$FLOW_DIR" version-broken
+
+t_check doctor.tool.version.silent \
+    "a tclsh that answers nothing keeps its ok - only the version is unknown, and the unknown counts" \
+    silent_version_is_unknown_and_counts "$FLOW_DIR" version-silent
+
 M="$(t_mutant "$SB" versionline)"
-if t_mutate "$M" "$DOCTOR_REL" '/ver = run(\[tcl\]/,+1s/^        if ver:$/        if False:/'; then
+if t_replace_line "$M" "$DOCTOR_REL" '            line("ok", "  %s version" % name, ver)' \
+                                     '            pass'; then
     t_check_fail doctor.tool.version.mutation \
         "with the version line suppressed, a working tclsh reports no version at all and the assertion goes red" \
         tool_version_is_honest "$M" version-mut "$BIN_FULL"
 else
-    t_skip doctor.tool.version.mutation "could not plant the fault: the 'if ver:' guard after 'ver = run([tcl]' in $DOCTOR_REL has changed shape, and a mutation aimed at the git one two lines later would prove a different thing"
+    t_skip doctor.tool.version.mutation "could not plant the fault: the ok version line inside Doctor.tool in $DOCTOR_REL has changed shape"
 fi
 
-# A tclsh that is installed and cannot start. MEASURED against this checkout:
-#   ok     tclsh          <path>
-#   ok       tclsh version  tclsh: error while loading shared libraries: libtcl.so
-# The tool is unusable, the report says ok twice, and the linker's error is
-# printed in the version's place. Fixing it is four lines in run() and the `if
-# ver:` guard - return the child's status, and say "unknown" when it is not 0
-# or the output does not parse. Reported, not fixed here.
-t_known_defect doctor.tool.version.garbage \
-    "a tclsh that cannot start is reported ok, with its linker error printed as the version" \
-    tool_version_is_honest "$FLOW_DIR" version-broken "$BIN_TCLBAD"
+# THE PROOF FOR THE BROKEN TOOL IS AIMED AT THE EXIT STATUS, and only at it. Two
+# independent tests stand between a failed probe and an `ok` line - the child's
+# status, and whether its output carries a version number at all - so a proof
+# that removed either one and still went red would not say WHICH is load-bearing.
+# It is the status: with it ignored, the stub's linker error parses as a version
+# (it names libtcl8.6.so) and doctor prints it in the version's place, which is
+# the defect verbatim.
+M="$(t_mutant "$SB" versionrc)"
+if t_replace_line "$M" "$DOCTOR_REL" '    if rc != 0:' '    if False:'; then
+    t_check_fail doctor.tool.version.garbage.mutation \
+        "with the exit status discarded again, a tclsh that cannot start reports ok and its linker error is printed as the version - the assertion goes red" \
+        unusable_tool_is_not_ok "$M" version-broken-mut
+else
+    t_skip doctor.tool.version.garbage.mutation "could not plant the fault: probe_version's 'if rc != 0:' guard in $DOCTOR_REL has changed shape, and a mutation aimed at the version-token test beside it would prove the weaker of the two checks"
+fi
 
-# The same hole from the other side: a tool that answers nothing loses the line
-# entirely, and `ok tclsh <path>` is all that is left.
-t_known_defect doctor.tool.version.silent \
-    "a tclsh that answers nothing loses its version line, and nothing says the version is unknown" \
-    tool_version_is_honest "$FLOW_DIR" version-silent "$BIN_TCLMUTE"
+# And the silent case's proof is aimed at the LINE. The defect was never a wrong
+# answer; it was an absent one, and an absent line reads as fine.
+M="$(t_mutant "$SB" versionsilent)"
+if t_replace_line "$M" "$DOCTOR_REL" '        line("--", "  %s version" % name, "unknown - %s" % reason)' \
+                                     '        pass'; then
+    t_check_fail doctor.tool.version.silent.mutation \
+        "with the unknown-version line dropped again, a tclsh that answers nothing is indistinguishable from one nobody asked and the assertion goes red" \
+        silent_version_is_unknown_and_counts "$M" version-silent-mut
+else
+    t_skip doctor.tool.version.silent.mutation "could not plant the fault: the unknown-version line inside Doctor.tool in $DOCTOR_REL has changed shape"
+fi
 
 #=============================================================================
 # 3. THE THREE STATES OF AN INSTALL
 #
-# usable() line 278: "Three states, because two is a lie on a shared site."
+# usable() line 472: "Three states, because two is a lie on a shared site."
 # absent / blocked / ok. The traps below are the shapes that look installed to
 # anything cruder than doctor - and `test -d` is cruder than doctor.
 #=============================================================================
@@ -943,23 +1100,23 @@ else
 fi
 
 M="$(t_mutant "$SB" dangling)"
-if t_replace_line "$M" "$DOCTOR_REL" '            if os.path.isfile(os.path.join(cand, BIN_REL)):' \
-                                     '            if os.path.lexists(os.path.join(cand, BIN_REL)):'; then
+if t_replace_line "$M" "$DOCTOR_REL" '        return stat.S_ISREG(os.stat(exe).st_mode), False' \
+                                     '        return os.path.lexists(exe), False'; then
     t_check_fail doctor.state.dangling.mutation \
         "with the discovery test following no symlink, a link that resolves to nothing counts as an install and the assertion goes red" \
         dangling_is_not_present "$M" dangling-mut
 else
-    t_skip doctor.state.dangling.mutation "could not plant the fault: install_roots' os.path.isfile(...BIN_REL) test in $DOCTOR_REL has changed shape"
+    t_skip doctor.state.dangling.mutation "could not plant the fault: bin_state's os.stat/S_ISREG test in $DOCTOR_REL has changed shape, and it is the one place that decides whether a symlink is followed"
 fi
 
 M="$(t_mutant "$SB" emptydir)"
-if t_replace_line "$M" "$DOCTOR_REL" '            if os.path.isfile(os.path.join(cand, BIN_REL)):' \
+if t_replace_line "$M" "$DOCTOR_REL" '            if present or (denied and cand == seed):' \
                                      '            if os.path.isdir(cand):'; then
     t_check_fail doctor.state.emptydir.mutation \
         "with discovery asking only whether the directory exists, an empty mount point counts as an install and the assertion goes red" \
         empty_mount_is_not_present "$M" emptydir-mut
 else
-    t_skip doctor.state.emptydir.mutation "could not plant the fault: install_roots' os.path.isfile(...BIN_REL) test in $DOCTOR_REL has changed shape"
+    t_skip doctor.state.emptydir.mutation "could not plant the fault: install_roots' 'if present or (denied and cand == seed)' discovery test in $DOCTOR_REL has changed shape"
 fi
 
 M="$(t_mutant "$SB" unknownver)"
@@ -985,14 +1142,23 @@ fi
 #-----------------------------------------------------------------------------
 # A DIRECTORY YOU CANNOT TRAVERSE. This is the case doctor's header was written
 # from - "the two newest live under a DIFFERENT install root on a
-# group-restricted mount - so whether they exist is a per-user answer" - and it
-# is the one case usable()'s third state cannot reach: os.path.isfile(exe)
-# returns False on EACCES exactly as it does on ENOENT, so the traversal check
-# below it never runs. A perfectly good install that you have no permission to
-# reach is therefore reported with the reason "no bin/vivado", and the note
-# that follows tells the reader it is "a site packaging fault, not a fault in
-# your project: tell whoever owns the module tree". They will be told their
-# module tree is fine.
+# group-restricted mount - so whether they exist is a per-user answer" - and
+# until 2026-09-14 it was the one case usable()'s third state could not reach:
+# os.path.isfile(exe) returns False on EACCES exactly as it does on ENOENT, so
+# the traversal check below it never ran. A perfectly good install you have no
+# permission to reach was reported with the reason "no bin/vivado", the note
+# that follows told the reader it was "a site packaging fault ... tell whoever
+# owns the module tree", and the install was dropped from the installed-versions
+# list entirely. The owner of the module tree would have been told his tree is
+# fine, by somebody holding a report that says the layer they are leaving is
+# fine. Carried here as t_known_defect until the errno was graded.
+#
+# THE ASSERTION IS THAT THE TWO FINDINGS DIFFER, not that a particular sentence
+# appears. Two roots go in: one that genuinely does not exist and one that
+# exists, holds an executable vivado, and sits under a directory this test makes
+# unreadable. They need opposite actions - a packaging fix from somebody else,
+# and a group membership for you - so the report has to separate them, name the
+# directory that refused, and give each the advice that belongs to it.
 #-----------------------------------------------------------------------------
 t_head "a permission you do not have is not the same finding as a file nobody installed"
 
@@ -1012,12 +1178,52 @@ permission_is_not_a_missing_file() {
     locked="$(dr_block "$DR_OUT" WARN "ADVERTISED, NOT USABLE: $VER_LOCKED" | sed -n 's/.* on PATH, and \(.*\)\.$/\1/p')"
     [ -n "$ghost" ] && [ -n "$locked" ] || {
         printf 'one of the two advertised versions was not reported at all:\n'; dr_dump "$DR_OUT"; return 1; }
-    [ "$ghost" != "$locked" ] && return 0
-    printf 'a root that does not exist and a root you cannot traverse get the SAME reason:\n'
-    printf '    %s : %s\n    %s : %s\n' "$VER_GHOST" "$ghost" "$VER_LOCKED" "$locked"
-    printf 'They need opposite actions. The note under the second one tells the reader to\n'
-    printf 'go and tell the owner of the module tree about a packaging fault that is not there.\n'
-    return 1
+    [ "$ghost" != "$locked" ] || {
+        printf 'a root that does not exist and a root you cannot traverse get the SAME reason:\n'
+        printf '    %s : %s\n    %s : %s\n' "$VER_GHOST" "$ghost" "$VER_LOCKED" "$locked"
+        printf 'They need opposite actions. The note under the second one tells the reader to\n'
+        printf 'go and tell the owner of the module tree about a packaging fault that is not there.\n'
+        return 1; }
+
+    # DIFFERENT IS NOT YET ACTIONABLE. The reader has to be able to act without
+    # going and looking, which is the thing doctor exists to save, so the reason
+    # has to NAME THE DIRECTORY that refused - not the install root under it,
+    # which is a path they cannot even stat.
+    case "$locked" in
+        *"$LOCKED"*) ;;
+        *) printf 'the reason given for a version you cannot reach never names the directory that\n'
+           printf 'refused (%s):\n    %s\n' "$LOCKED" "$locked"
+           printf '"not usable" with no path in it is a finding nobody can take to anybody.\n'
+           return 1 ;;
+    esac
+
+    # AND THE ADVICE HAS TO FOLLOW THE FINDING. The packaging-fault paragraph is
+    # right for a version that is not installed and wrong for one that is: it
+    # sends the reader to the owner of a module tree that is correct. Asserted
+    # in BOTH directions, because an advice paragraph deleted outright would
+    # otherwise pass - the ghost must still get it.
+    t_contains "$(dr_block "$DR_OUT" WARN "ADVERTISED, NOT USABLE: $VER_GHOST")" "packaging fault" || {
+        printf 'the version that genuinely is not installed no longer gets the packaging-fault\n'
+        printf 'advice, so the test below it would hold on a doctor that gives no advice at all:\n'
+        dr_block "$DR_OUT" WARN "ADVERTISED, NOT USABLE: $VER_GHOST"; return 1; }
+    t_contains "$(dr_block "$DR_OUT" WARN "ADVERTISED, NOT USABLE: $VER_LOCKED")" "packaging fault" && {
+        printf 'a version that IS installed, under a directory you cannot search, is reported as\n'
+        printf 'a packaging fault in a module tree that is telling the truth:\n'
+        dr_block "$DR_OUT" WARN "ADVERTISED, NOT USABLE: $VER_LOCKED"
+        printf 'They will look, find the version exactly where their modulefile says it is, and\n'
+        printf 'the reader will have spent the afternoon in the wrong layer.\n'
+        return 1; }
+
+    # THE OTHER HALF OF THE SAME DEFECT: the install was dropped from the
+    # installed-versions list altogether, because discovery asked os.path.isfile
+    # and got False for a reason it never distinguished. A version you cannot
+    # reach is still a version this host HAS, and the list of what is installed
+    # is what a reader compares against `module avail`.
+    dr_says "$DR_OUT" WARN "installed $VER_LOCKED" "$LOCKED/$VER_LOCKED" || return 1
+    dr_lacks "$DR_OUT" MISS "installed versions" || {
+        printf 'doctor found an install it could not reach and still reported that none was found\n'
+        printf 'on this filesystem.\n'; return 1; }
+    return 0
 }
 
 # Probing the fixture rather than describing it: as uid 0, and on some mount
@@ -1028,13 +1234,28 @@ chmod 000 "$LOCKED" 2>/dev/null
 if [ -r "$LOCKED" ] || [ -x "$LOCKED" ] || ls "$LOCKED" >/dev/null 2>&1; then
     chmod 755 "$LOCKED"
     t_skip doctor.state.untraversable "mode 000 on $LOCKED does not block this user (uid $(id -u)) - the fixture cannot make a directory untraversable here, so nothing would distinguish it from a root that does not exist"
+    t_skip doctor.state.untraversable.mutation "not attempted: its assertion was skipped because mode 000 on $LOCKED does not block this user (uid $(id -u))"
 else
     chmod 755 "$LOCKED"
-    # Expressed as t_known_defect so it goes RED the day doctor learns to tell
-    # the two apart, and the marker cannot outlive the bug.
-    t_known_defect doctor.state.untraversable \
-        "an install under a directory you cannot traverse is reported as 'no bin/vivado' - the reader is sent to the wrong layer" \
+    t_check doctor.state.untraversable \
+        "an install you cannot traverse to is reported as a PERMISSION on a path that exists - named, listed as installed, and never as 'no bin/vivado'" \
         permission_is_not_a_missing_file "$FLOW_DIR" untraversable
+
+    # ONE GUARD, ONE PROOF. Every part of the finding above - the different
+    # reason, the named directory, the advice, the install appearing in the list
+    # at all - hangs on a single question asked in a single place: was the answer
+    # "no such file" or "you may not look?" With the errno test gone, EACCES
+    # reads as ENOENT again exactly as os.path.isfile used to make it, and all
+    # four collapse back into "no bin/vivado".
+    M="$(t_mutant "$SB" untraversable)"
+    if t_replace_line "$M" "$DOCTOR_REL" '        if e.errno in (errno.EACCES, errno.EPERM):' \
+                                         '        if False:'; then
+        t_check_fail doctor.state.untraversable.mutation \
+            "with EACCES graded as ENOENT again, a version you cannot reach is reported exactly like one nobody installed and the assertion goes red" \
+            permission_is_not_a_missing_file "$M" untraversable-mut
+    else
+        t_skip doctor.state.untraversable.mutation "could not plant the fault: bin_state's errno test in $DOCTOR_REL has changed shape, and it is the only place the difference between 'not there' and 'not allowed' is decided"
+    fi
 fi
 
 #=============================================================================
@@ -1147,7 +1368,7 @@ t_check doctor.mod.unadvertised \
     unadvertised_is_named "$FLOW_DIR" unadvertised
 
 M="$(t_mutant "$SB" ghost)"
-if t_replace_line "$M" "$DOCTOR_REL" '                ghosts.append((ver, mf, root, detail))' \
+if t_replace_line "$M" "$DOCTOR_REL" '                ghosts.append((ver, mf, root, state, detail))' \
                                      '                line("ok", "advertised %s" % ver, "installed at %s" % root)'; then
     t_check_fail doctor.mod.ghost.mutation \
         "with an unusable advertised root reported as installed, the modulefile's lie is repeated by the tool written to catch it and the assertion goes red" \

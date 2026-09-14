@@ -36,8 +36,10 @@
 # A proof is counted by its assertion id: an id containing `.mutation`. The
 # number is proofs the suite CARRIES - rejections PLUS proofs that skipped for a
 # stated reason - not rejections alone. That distinction was added 2026-09-11
-# when t_doctor arrived with four host-conditional proofs (they need a mode that
-# bites, so they skip as uid 0; a closed port; 20 GB free). Counting rejections
+# when t_doctor arrived with host-conditional proofs - they need a file mode
+# that actually bites, so they skip as uid 0; a closed port; 20 GB free. There
+# are FIVE of them as of 2026-09-14: fixing the untraversable-install defect
+# turned its marker into a fourth mode-dependent assertion plus its proof. Counting rejections
 # only would have reported "A PROOF WAS DROPPED" on any host lacking a
 # precondition, which is a different fact and is already graded by run.sh's hole
 # and skip-ratio gates. Failing the same cause twice teaches the reader to skim.
@@ -52,7 +54,7 @@
 t_assert_stage   12
 t_bd              3
 t_contract       26
-t_doctor         29
+t_doctor         32
 t_flist          22
 t_flow_utils     32
 t_init           22

@@ -74,34 +74,6 @@
 # `tier.sh static deploy` runs deploy. Nothing says a name was dropped.
 # FIX: refuse a second positional, naming both.
 
-## scripts/fpga-flow-doctor :: a tool that cannot start is reported `ok`
-# `run()` (:107) merges stderr into stdout and discards the exit status, so a
-# tclsh that exits 127 with a linker error is reported PRESENT and **the
-# linker's error is printed as its version**. Carried as
-# t_known_defect doctor.tool.version.garbage.
-# FIX: grade the exit status; a non-zero probe is "present but unusable", which
-# usable() already has a state for.
-
-## scripts/fpga-flow-doctor :: a silent version answer loses the line entirely
-# A tool that answers nothing has its version line dropped rather than reported
-# unknown - and doctor applies the OPPOSITE rule to disk one section later.
-# Carried as t_known_defect doctor.tool.version.silent.
-# FIX: report `unknown`, the way the disk section already does.
-
-## scripts/fpga-flow-doctor :: an untraversable install reads as "not installed"
-# An install under a directory you cannot traverse - the group-restricted mount
-# doctor's own header was written from - is reported as "no bin/vivado",
-# identical to a root nobody installed, and the note sends the reader to the
-# module-tree owner. usable()'s third state is unreachable there: os.path.isfile
-# fails the same on EACCES as on ENOENT, so the traversal loop never runs, and
-# such installs are dropped from the report entirely.
-# Carried as t_known_defect doctor.state.untraversable.
-# FIX: distinguish EACCES from ENOENT at the isfile call.
-
-#=============================================================================
-# UNPROVEN
-#=============================================================================
-
 ## the deploy tier has never touched a board
 # scripts/fpga-flow-deploy (1390 lines), mk/deploy.mk and the fpgahub hooks have
 # been exercised against fixtures and against the CLI's own dry-run paths.

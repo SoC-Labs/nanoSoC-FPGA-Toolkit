@@ -37,12 +37,22 @@ import os
 import re
 import sys
 import glob
+import stat
+import errno
 import socket
 import shutil
 import subprocess
 import traceback
 
 WIDTH = 24
+
+# What a version answer has to carry before doctor will print it AS a version.
+# Deliberately loose - `8.6.12`, `git version 2.0.0`, `Python 3.11.2` and
+# `2026.1_AR12345` all have to pass - and deliberately not empty: the string a
+# tool prints while FAILING almost never contains one, and the one measured case
+# where it did (`...libtcl8.6.so: cannot open shared object file`) is caught by
+# the exit status instead. Two weak tests that fail in different directions.
+VERSION_TOKEN = re.compile(r"\d+\.\d+")
 
 # Vivado's own layout: an install root is the directory that contains bin/, and
 # the version is the name of that directory or of its parent. Both shapes are in
@@ -94,30 +104,174 @@ class Doctor(object):
         self.advisory += 1
         line("WARN", name, detail)
 
-    def tool(self, name, essential, why):
+    def tool(self, name, essential, why, version_args=None, version_stdin=None):
+        """Report one support tool - and, where asking is cheap, whether it RUNS.
+
+        THREE STATES, the same three usable() reports for an install, because
+        two is a lie for a tool as well:
+
+            ok        on PATH, and it answered
+            WARN/MISS on PATH, and it does not run - present, and unusable
+            --/MISS   not on PATH
+
+        The middle one is the one this used to get wrong, and it is the one that
+        costs the reader a night: `shutil.which` finds the file, every
+        `command -v` in every wrapper agrees, and the tool cannot start. Reported
+        as `ok`, with whatever it printed on its way out shown as its version,
+        that is a report sending somebody to debug the layer above a layer it has
+        just told them is fine.
+
+        Pass version_args to have the tool asked; leave it None and the tool is
+        never launched - which is the default, and stays the default. make is
+        deliberately in the second group: nothing in the flow branches on its
+        version, so asking would buy a line nobody acts on at the price of one
+        more process doctor started. Nothing here is ever to be pointed at an EDA
+        tool; that promise is in the header and t_doctor.sh asserts it with a
+        tripwire rather than believing it.
+
+        THE VERDICT FOLLOWS `essential`, NOT THE PROBE. A tool the flow cannot
+        run without is MISS whether it is absent or merely broken - both mean the
+        flow cannot run here. An advisory tool is advisory in both states: a
+        doctor that exits 1 over a tclsh teaches people to ignore it, which is
+        the docstring above this one. No essential tool is probed today, so this
+        arm changes no exit status; it is written because the day one is probed
+        the grade must not have to be remembered."""
         path = shutil.which(name)
-        if path:
+        if not path:
+            if essential:
+                self.essential(name, "not on PATH")
+            else:
+                self.advisory += 1
+                line("--", name, "not on PATH")
+            note(why)
+            return None
+
+        if version_args is None:
             line("ok", name, path)
             return path
-        if essential:
-            self.essential(name, "not on PATH")
-        else:
-            self.advisory += 1
-            line("--", name, "not on PATH")
-        note(why)
-        return None
+
+        ver, reason, ran = probe_version([path] + list(version_args), version_stdin)
+        if ver:
+            line("ok", name, path)
+            line("ok", "  %s version" % name, ver)
+            return path
+
+        if not ran:
+            # PRESENT, AND UNUSABLE. Graded like an absent tool, because for
+            # every purpose the flow has they are the same host.
+            if essential:
+                self.essential(name, "%s   present, and it does not run" % path)
+            else:
+                self.advise(name, "%s   present, and it does not run" % path)
+            note("%s is on PATH - every `command -v` anywhere on this host will\n"
+                 "find it - and %s.\n"
+                 "That is the third state a tool can be in, the one usable() reports\n"
+                 "for an install: present, and unusable. It is not `ok`, and nothing\n"
+                 "falls back for you the way it would if the tool were simply absent.\n"
+                 "%s" % (name, reason, why))
+            line("--", "  %s version" % name, "unknown - the probe did not run")
+            return path
+
+        # It ran, it exited 0, and it did not answer. The rule doctor applies to
+        # disk one section below: "Reported as unmeasured rather than as fine. A
+        # check that could not read its input has not passed; it has not run."
+        # The line is never DROPPED - an absent line is indistinguishable from a
+        # version nobody asked for, which reads as fine.
+        line("ok", name, path)
+        self.advisory += 1
+        line("--", "  %s version" % name, "unknown - %s" % reason)
+        note("%s started and exited 0 without answering a version question, so\n"
+             "the tool is here and WHICH ONE is unknown. Reported rather than\n"
+             "left out: a version line that is simply missing looks exactly like\n"
+             "a version nobody wanted, and a run manifest that records a tool\n"
+             "without its version cannot tie a result to it." % name)
+        return path
 
 
 def run(cmd, timeout=6, stdin_text=None):
-    """Run a small, cheap, non-EDA command. Never raises."""
+    """Run a small, cheap, non-EDA command. -> (status, stdout, stderr).
+
+    Never raises. `status` is None when the command could not be run at all -
+    not startable, or still going after `timeout` - and stderr then carries the
+    reason in the child's place.
+
+    THE STATUS IS RETURNED AND STDERR IS KEPT APART, and both halves of that are
+    a fix rather than a preference. This used to merge stderr into stdout and
+    return the text alone, so a tclsh that exited 127 with a linker error had the
+    LINKER'S ERROR printed as its version, under `ok`: a measured fact stated
+    about a tool that never started. A probe whose status is discarded is a probe
+    whose answer cannot be graded, and an ungradeable answer is exactly the input
+    the rest of this script refuses to round up."""
     try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              stdin=subprocess.PIPE if stdin_text else None,
                              universal_newlines=True)
-        out, _ = p.communicate(input=stdin_text, timeout=timeout)
-        return (out or "").strip()
-    except Exception:
-        return None
+    except Exception as e:
+        return None, "", "it could not be started (%s)" % e
+    try:
+        out, err = p.communicate(input=stdin_text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Reaped rather than abandoned. A tool that hangs is one of the shapes
+        # "cannot start" takes, and doctor must not leave a process behind on
+        # every host where it happens - least of all a process holding the pipes
+        # it is about to stop reading.
+        p.kill()
+        try:
+            p.communicate()
+        except Exception:
+            pass
+        return None, "", "it did not answer within %g seconds" % timeout
+    except Exception as e:
+        return None, "", "it could not be run (%s)" % e
+    return p.returncode, (out or "").strip(), (err or "").strip()
+
+
+def evidence(text, width=60):
+    """One bounded line of what a probe actually said, for a report line.
+
+    Bounded because it lands in a report rather than in a terminal dump: a
+    linker error runs to three lines and 400 characters, and a report that wraps
+    stops being readable by column, which is the only reason reading one is
+    quicker than looking. The first line and the exit status are the shape of
+    the failure; whoever reads it has the tool in front of them and can run it
+    for the rest."""
+    lines = (text or "").strip().splitlines()
+    if not lines:
+        return ""
+    said = lines[0].strip()
+    return said if len(said) <= width else said[:width - 3] + "..."
+
+
+def probe_version(cmd, stdin_text=None):
+    """Ask a small tool its version and GRADE the answer -> (version, why, ran).
+
+    Exactly one of `version` and `why` is ever non-empty. `ran` is False when the
+    tool could not be started or started and failed - present, and unusable - and
+    True when it ran, exited 0 and simply did not say.
+
+    Two independent tests, and a real answer has to pass both: the exit status,
+    and whether what came back carries a version number at all. Either alone is
+    weak in a different direction - a tool can fail while printing something
+    plausible, and a tool can succeed while printing nothing - and neither costs
+    anything, so both are applied."""
+    rc, out, err = run(cmd, stdin_text=stdin_text)
+    if rc is None:
+        return "", err or "it could not be run", False
+    if rc != 0:
+        said = evidence(err or out)
+        return "", ("it exited %d saying: %s" % (rc, said) if said
+                    else "it exited %d without a word" % rc), False
+    # stdout first and stderr only as a fallback: a few tools answer a version
+    # question on stderr, and one that writes a warning there while answering
+    # properly on stdout must still be reported by its answer.
+    answer = out or err
+    if not answer:
+        return "", "it exited 0 and printed nothing", True
+    for candidate in answer.splitlines():
+        candidate = candidate.strip()
+        if VERSION_TOKEN.search(candidate):
+            return candidate, "", True
+    return "", 'it answered "%s", which carries no version number' % evidence(answer), True
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +391,24 @@ def install_roots(extra):
         if not seed:
             continue
         for cand in (seed,) + tuple(siblings(seed)):
-            if os.path.isfile(os.path.join(cand, BIN_REL)):
+            present, denied = bin_state(os.path.join(cand, BIN_REL))
+            # `denied` is kept, and that is the whole of a measured defect. An
+            # install under a directory you cannot traverse used to be dropped
+            # HERE, before usable() ever saw it, and the report then said "none
+            # found on this filesystem" about a Vivado that is installed and that
+            # the person at the next desk runs every day. What cannot be looked
+            # at is reported as unreachable; it is never reported as absent.
+            #
+            # IT COUNTS ONLY FOR A ROOT SOMETHING NAMED - the binary on PATH,
+            # XILINX_VIVADO, a modulefile - and that limit is the difference
+            # between reporting what could not be read and inventing an install
+            # out of it. For a seed, "you may not look" is an answer about a
+            # root somebody claimed holds a Vivado, and the claim is the finding.
+            # For a directory the sibling glob turned up, nothing claimed
+            # anything: an unreadable directory beside an install is an
+            # unreadable directory, and listing it as an installed version would
+            # be a verdict made from missing data.
+            if present or (denied and cand == seed):
                 roots[os.path.realpath(cand)] = cand
     return sorted(roots.values())
 
@@ -274,19 +445,68 @@ def version_of(root):
     return "unknown"
 
 
+def bin_state(exe):
+    """-> (present, denied). Is there a regular file there, and if not, why not?
+
+    THE DISTINCTION IS THE POINT. os.path.isfile answers False both for "there is
+    no such file" and for "you may not traverse the directory it is in", and
+    those two need opposite actions from whoever reads the report: one is a
+    version nobody installed, the other is a group membership or a mount. Doctor
+    exists because of a site where the two newest Vivado installs sit on a
+    group-restricted mount, so which answer you get is a fact about YOU and the
+    question was about the host.
+
+    EACCES also PROVES the directory above it exists: the kernel had to find a
+    directory in order to refuse to search it. That is why the blocked state can
+    say "exists" about a path it was never allowed to read."""
+    try:
+        return stat.S_ISREG(os.stat(exe).st_mode), False
+    except OSError as e:
+        if e.errno in (errno.EACCES, errno.EPERM):
+            return False, True
+        return False, False
+
+
+def first_untraversable(path):
+    """The outermost directory on the way to `path` that you may not search.
+
+    Walked from the ROOT DOWN, not up from the file, and that is what makes the
+    answer actionable: the outermost refusal is the directory whose group or
+    mount is the actual finding, and every directory under it is unreadable for
+    that one reason. Walking up would name the innermost one instead - a path
+    whose name the reader cannot even confirm, taken to an owner who does not own
+    it."""
+    probe = os.sep
+    for part in os.path.abspath(path).split(os.sep)[1:-1]:
+        probe = os.path.join(probe, part)
+        if not os.access(probe, os.X_OK):
+            return probe
+    return None
+
+
 def usable(root):
     """-> (state, detail). Three states, because two is a lie on a shared site."""
     exe = os.path.join(root, BIN_REL)
-    if not os.path.isfile(exe):
+    present, denied = bin_state(exe)
+    if denied:
+        # An executable you cannot traverse to is not an executable you can run -
+        # and unlike the two states below, this one is a statement about the
+        # reader rather than about the host. NAME THE DIRECTORY THAT REFUSED:
+        # "somewhere above here" is not something anybody can act on, and the
+        # note this detail lands in is read by somebody deciding who to go to.
+        #
+        # This is also the only place the traversal can be observed. A loop that
+        # walked up from a file os.stat had already succeeded on was unreachable
+        # code: stat needs search permission on every ancestor, so reaching it
+        # proved every ancestor was traversable.
+        blocker = first_untraversable(exe) or os.path.dirname(exe)
+        return "blocked", ("%s exists and is not traversable by you (a group or "
+                           "mount permission), so whether %s is under it is a "
+                           "per-user answer" % (blocker, BIN_REL))
+    if not present:
         return "absent", "no %s" % BIN_REL
     if not os.access(exe, os.X_OK):
         return "blocked", "present but not executable by %s" % (os.environ.get("USER") or "you")
-    # An executable you cannot traverse to is not an executable you can run.
-    probe = os.path.dirname(exe)
-    while probe and probe != os.sep:
-        if not os.access(probe, os.X_OK):
-            return "blocked", "%s is not traversable by you (group/mount permissions)" % probe
-        probe = os.path.dirname(probe)
     return "ok", exe
 
 
@@ -352,10 +572,14 @@ def report_vivado(d):
                 line("ok", "installed %s" % ver, root)
             elif state == "blocked":
                 d.advise("installed %s" % ver, root)
-                note("Present on this filesystem but NOT USABLE BY YOU: %s\n"
+                note("NOT USABLE BY YOU: %s\n"
                      "This is the third state a version can be in and the one that\n"
                      "gets recorded as 'not installed' by whoever hits it first.\n"
-                     "It is a group or mount permission, not a missing install." % detail)
+                     "It is a permission on a path that EXISTS, and a permission is\n"
+                     "per-user - so this may well be the version somebody at the next\n"
+                     "desk uses every day. Said as `may`, because what is behind a\n"
+                     "directory this account cannot search is not something this\n"
+                     "account can report." % detail)
             else:
                 d.advise("installed %s" % ver, "%s (%s)" % (root, detail))
 
@@ -380,7 +604,7 @@ def report_vivado(d):
             if state == "ok":
                 line("ok", "advertised %s" % ver, "installed at %s" % root)
             else:
-                ghosts.append((ver, mf, root, detail))
+                ghosts.append((ver, mf, root, state, detail))
 
         for ver, reason in aliases:
             line("--", "advertised %s" % ver, reason + "  (an alias, not a version)")
@@ -391,18 +615,40 @@ def report_vivado(d):
                  "cannot read is precisely the version that surprises you later."
                  % (mf, reason))
 
-        for ver, mf, root, detail in ghosts:
+        for ver, mf, root, state, detail in ghosts:
             d.advise("ADVERTISED, NOT USABLE: %s" % ver, root)
-            note("The modulefile\n"
-                 "    %s\n"
-                 "puts %s/bin on PATH, and %s.\n"
-                 "`module load vivado/%s` will therefore SUCCEED and leave you with\n"
-                 "a PATH entry that resolves to nothing, or to whichever Vivado was\n"
-                 "already there. The build then runs on a version nobody chose and\n"
-                 "no log says so.\n"
-                 "This is a site packaging fault, not a fault in your project: tell\n"
-                 "whoever owns the module tree, and until then load a version listed\n"
-                 "as installed above." % (mf, root, detail, ver))
+            if state == "blocked":
+                # A PERMISSION, NOT A PACKAGING FAULT - and the advice below is
+                # the opposite of the advice for a version that does not exist.
+                # Both used to get the packaging-fault paragraph, which sends the
+                # reader to tell the owner of a module tree that his modulefile
+                # advertises a version he does not have. It does have it. He will
+                # look, find it, and the reader will have spent the afternoon
+                # being told the layer they were leaving is fine.
+                note("The modulefile\n"
+                     "    %s\n"
+                     "puts %s/bin on PATH, and %s.\n"
+                     "`module load vivado/%s` will therefore SUCCEED and put a\n"
+                     "directory you cannot search onto PATH. That is NOT the finding\n"
+                     "a version which is not installed gets: nothing here says this\n"
+                     "one is absent, only that this account may not look - and the\n"
+                     "same `module load` may work perfectly for a colleague.\n"
+                     "The action is a permission on the directory named above - ask\n"
+                     "for the group, or for the mount to be visible to you. Nothing\n"
+                     "here is wrong with the module tree or with your project, and\n"
+                     "until the permission changes, load a version listed as\n"
+                     "installed above." % (mf, root, detail, ver))
+            else:
+                note("The modulefile\n"
+                     "    %s\n"
+                     "puts %s/bin on PATH, and %s.\n"
+                     "`module load vivado/%s` will therefore SUCCEED and leave you with\n"
+                     "a PATH entry that resolves to nothing, or to whichever Vivado was\n"
+                     "already there. The build then runs on a version nobody chose and\n"
+                     "no log says so.\n"
+                     "This is a site packaging fault, not a fault in your project: tell\n"
+                     "whoever owns the module tree, and until then load a version listed\n"
+                     "as installed above." % (mf, root, detail, ver))
 
         # The mirror-image finding, and the reason this is a two-way comparison:
         # a version nobody advertises is a version nobody will think to load.
@@ -438,8 +684,16 @@ def report_support(d):
     line("ok", "python3 (running)", "%s   %d.%d.%d" %
          (sys.executable, sys.version_info[0], sys.version_info[1], sys.version_info[2]))
     if py and os.path.realpath(py) != os.path.realpath(sys.executable):
-        ver = run([py, "-V"]) or "version unknown"
-        line("--", "python3 (on PATH)", "%s   %s" % (py, ver))
+        # GRADED like every other probe: a python3 that answers `-V` with a
+        # linker error must not have the linker error printed as its version.
+        # Left ADVISORY on purpose, and it is a judgement rather than an
+        # oversight: `python3 -V` failing is good evidence the interpreter is
+        # broken but not proof - a site wrapper that mishandles a flag fails the
+        # same way - and this line is already the second python3, reported so a
+        # reader knows which one make will use. Exit 1 needs a fact, not a
+        # strong hint.
+        ver, why, _ = probe_version([py, "-V"])
+        line("--", "python3 (on PATH)", "%s   %s" % (py, ver or "version unknown - %s" % why))
         note("A DIFFERENT python3 from the one running this script. make recipes\n"
              "use the one on PATH, so that is the one whose version matters for\n"
              "the rest of the flow.")
@@ -451,23 +705,21 @@ def report_support(d):
         d.essential("python3 version", "%d.%d is too old" % sys.version_info[:2])
         note("The toolkit's scripts are stdlib-only Python 3.6+.")
 
-    tcl = d.tool("tclsh", False,
-                 "Not launched by the flow itself - Vivado carries its own Tcl -\n"
-                 "but it is how the toolkit's Tcl is syntax-checked without a\n"
-                 "licence, and how a hook is debugged outside a 90-minute run.")
-    if tcl:
-        ver = run([tcl], stdin_text="puts [info patchlevel]\nexit\n")
-        if ver:
-            line("ok", "  tclsh version", ver.splitlines()[-1])
+    # The two tools doctor DOES launch, and the only two - both are cheap, both
+    # are advisory, and neither is an EDA tool. The version each one answers with
+    # is graded by d.tool: reported when it is a version, and reported as unknown
+    # with the reason when it is not.
+    d.tool("tclsh", False,
+           "Not launched by the flow itself - Vivado carries its own Tcl -\n"
+           "but it is how the toolkit's Tcl is syntax-checked without a\n"
+           "licence, and how a hook is debugged outside a 90-minute run.",
+           version_args=[], version_stdin="puts [info patchlevel]\nexit\n")
 
-    git = d.tool("git", False,
-                 "Used only for the provenance lines in each run manifest. Without\n"
-                 "it they read UNVERIFIED and a bitstream cannot be tied to a\n"
-                 "commit - which is the difference between a result and an anecdote.")
-    if git:
-        ver = run([git, "--version"])
-        if ver:
-            line("ok", "  git version", ver)
+    d.tool("git", False,
+           "Used only for the provenance lines in each run manifest. Without\n"
+           "it they read UNVERIFIED and a bitstream cannot be tied to a\n"
+           "commit - which is the difference between a result and an anecdote.",
+           version_args=["--version"])
     print("")
 
 
