@@ -9,9 +9,20 @@
 # the bottom of this file, which exist precisely so you never have to.
 #
 # HOW TO USE THIS FILE
-#   1. Fill in every <<FILL IN>>. `make check` names any you miss, with the
-#      variable, the path it looked for, and what the file is for. A fresh
-#      scaffold FAILS `make check` on purpose.
+#   1. Fill in every FILL-IN marker -- the ones in double angle brackets, the
+#      way the assignments below spell them. `make check` names any you miss,
+#      with the variable, the path it looked for, and what the file is for. A
+#      fresh scaffold FAILS `make check` on purpose.
+#
+#      THIS SENTENCE DOES NOT SPELL THE MARKER OUT, and that is deliberate. It
+#      used to, and the instruction was then counted as one of the decisions it
+#      was telling you to make: a project that had made every real decision
+#      still got `UNFILLED PLACEHOLDERS  1 marker(s) in 1 file(s)` pointing at
+#      this comment, and the only way to clear it was to delete the line that
+#      tells you what to do. The marker scan reads FILE CONTENT and has no idea
+#      what a comment is -- which is exactly why it catches a marker sitting in
+#      a Tcl string or an XDC argument, where no path check would ever look. The
+#      scan is right; this sentence was wrong, and it is the sentence that moved.
 #   2. Leave the `?=` assignments alone unless your project already has a
 #      different layout. They are conventions, not requirements -- every path
 #      the flow uses is overridable from here, so an existing tree does not

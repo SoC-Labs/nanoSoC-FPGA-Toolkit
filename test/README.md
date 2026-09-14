@@ -189,12 +189,26 @@ the project's edits and `--force` is what overrides that; nothing outside
 offers are `find part/ -type d`, proved by planting a hardcoded list and then
 adding a pack.
 
-Two `KNOWN-DEFECT` markers come from it, both found by asserting rather than by
-reading: `templates/design.mk.in`'s own instruction line contains a literal
-`<<FILL IN>>`, so a project that has made every real decision still fails
-`make check` until it deletes its own instructions; and `install_one`'s
-empty-output guard uses `refuse` (exit 2, documented as *nothing was written*)
-at the one point in the file that most certainly leaves a half-tree behind.
+Two `KNOWN-DEFECT` markers came from it, both found by asserting rather than by
+reading, and both were **retired on 2026-09-14**. `templates/design.mk.in`'s own
+instruction line contained a literal `<<FILL IN>>`, so a project that had made
+every real decision still failed `make check` until it deleted its own
+instructions — fixed in the **template**, not the checker, because a checker
+taught to ignore comments would stop seeing a marker in every Tcl and XDC
+comment the templates ship, which is where a forgotten one is least visible.
+And `install_one`'s empty-output guard used `refuse` (exit 2, documented as
+*nothing was written*) at the one point in the file that most certainly leaves a
+half-tree behind; it now uses `fail` (exit 1), and the retry that code was
+sending the caller into is measured beside it — the second run skips the
+zero-byte file the first left and exits 0 over it.
+
+Each marker became a real assertion with a planted-fault proof of its own.
+`init.complete.decisions` fills in every value and **keeps** `design.mk`'s
+comments — the control beside it deletes them, so it stays green with the defect
+fully in place — and its proof puts the literal marker back into the
+instruction. `init.exitcode.emptywrite` reads the exit **code** rather than
+accepting any non-zero status, and its proof is the same unreachable-guard copy
+with one token changed back: `fail` to `refuse`.
 
 ---
 
