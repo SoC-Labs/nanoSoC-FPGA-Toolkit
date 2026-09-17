@@ -65,14 +65,64 @@ usage() { sed -n '3,53p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 trap 'echo; echo "deploy-gates: interrupted"; exit 130' INT
 
+#-----------------------------------------------------------------------------
+# AN OPTION WITH NO OPERAND MUST REFUSE, NOT SPIN
+#
+# `--manifest)  MANIFEST="${2:-}";  shift 2` was careful about the VALUE and
+# not about the SHIFT. `shift 2` WITH ONE ARGUMENT LEFT FAILS AND SHIFTS
+# NOTHING, so the loop sees `--manifest` again, and again, forever: no verdict,
+# no gate file, no exit status, and a CI runner held until somebody's external
+# timeout kills it. That is worse than a wrong answer, because a job that never
+# finishes produces no evidence about why. The test has to happen BEFORE the
+# shift, which is what need_operand is.
+#
+# THE 5TH AND 6TH INSTANCES OF ONE DEFECT. ci/tier.sh (--fpga-dir),
+# ci/capability.sh (--require and --conf) and ci/assert-stage.sh (--fpga-dir)
+# were each given this guard on 2026-09-14. This file kept the line, because
+# nothing drove its argument loop until t_deploy_gates.sh did, and it was
+# carried there as a known defect until this commit.
+#
+# Exit 2 is "refused: unusable input" - ci/README.md's exit table, CONTRACT.md
+# section 10 - and deliberately not 1. 1 says a gate was graded and failed,
+# which sends a reader into the deploy record looking for a board that never
+# came up. Nothing was graded here. need_operand also runs before ci_init, so
+# a refused invocation writes no verdicts.tsv at all.
+#
+# A FOURTH COPY OF A FIVE-LINE GUARD, AND THE DUPLICATION IS THE DECISION.
+# ci/assert-stage.sh records why the first three were not hoisted into
+# ci/lib.sh - tier.sh and assert-stage.sh source it, capability.sh does not -
+# and names the condition for collapsing them: capability.sh taking a
+# dependency on lib.sh. THAT CONDITION HAS NOT CHANGED. This file does source
+# lib.sh, so a hoist today would serve three of the four callers and leave
+# capability.sh a copy anyway - two implementations of one guard instead of
+# four identical ones, and a reader would have to establish which script uses
+# which. The message is per-script prose rather than a parameter, too: each
+# names its own script and says what was not done (measured, probed, graded),
+# so a shared body needs two more arguments than it has lines. And each copy
+# is mutation-proved by its own suite against its own argv arm; one shared
+# definition gives four argument loops a common blast radius whose failure
+# mode is the hang above. If capability.sh ever sources lib.sh, collapse all
+# four - the saving is real then, and not before.
+#-----------------------------------------------------------------------------
+
+## need_operand <arguments remaining> <option> <what it takes>
+## Called with "$#" from inside the loop, BEFORE the `shift 2` that would
+## otherwise fail silently and spin.
+need_operand() {
+    [ "$1" -ge 2 ] && return 0
+    echo "deploy-gates: $2 takes $3 after it, and nothing followed it." >&2
+    echo "  Nothing was graded. Exit 2 is 'unusable arguments', not a failing gate." >&2
+    exit 2
+}
+
 MANIFEST=""
 GATE_FILE=""
 WANT_SUMMARY=0
 SELFTEST=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        --manifest)  MANIFEST="${2:-}";  shift 2 ;;
-        --gate-file) GATE_FILE="${2:-}"; shift 2 ;;
+        --manifest)  need_operand "$#" --manifest "the deploy manifest to grade"; MANIFEST="$2";  shift 2 ;;
+        --gate-file) need_operand "$#" --gate-file "the file to write the gate report to"; GATE_FILE="$2"; shift 2 ;;
         --summary)   WANT_SUMMARY=1; shift ;;
         --selftest)  SELFTEST=1; shift ;;
         -h|--help)   usage; exit 0 ;;

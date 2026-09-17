@@ -96,14 +96,18 @@ STAGES="flist package-ip bd synth impl bitstream"
 ## there; this script had the identical line and was found by the team that
 ## fixed those two.
 ##
-## THERE ARE THREE COPIES OF THIS GUARD - here, ci/tier.sh and ci/capability.sh -
-## and that is worth one sentence rather than a silent duplication. tier.sh and
-## this script source ci/lib.sh and could share one; ci/capability.sh does NOT
-## source it, deliberately or otherwise, so hoisting the guard into lib.sh would
-## either leave a copy behind anyway or change capability.sh's dependency shape.
-## Five lines in three places, each naming its own script in the message, was
-## judged the smaller risk. If capability.sh ever takes a dependency on lib.sh,
-## collapse all three.
+## THERE ARE FOUR COPIES OF THIS GUARD - here, ci/tier.sh, ci/capability.sh and
+## ci/deploy-gates.sh - and that is worth one sentence rather than a silent
+## duplication. This script, tier.sh and deploy-gates.sh source ci/lib.sh and
+## could share one; ci/capability.sh does NOT source it, deliberately or
+## otherwise, so hoisting the guard into lib.sh would either leave a copy behind
+## anyway or change capability.sh's dependency shape. Five lines in four places,
+## each naming its own script in the message, was judged the smaller risk, and
+## the fourth copy (2026-09-17, curing the same spin in deploy-gates.sh's
+## --manifest and --gate-file) was weighed against hoisting rather than added by
+## reflex: a hoist would have served three of the four and left two
+## implementations of one guard. If capability.sh ever takes a dependency on
+## lib.sh, collapse all four.
 need_operand() {
     [ "$1" -ge 2 ] && return 0
     echo "assert-stage: $2 takes $3 after it, and nothing followed it." >&2

@@ -45,9 +45,12 @@
 #      a clean run, the failing gate listed on a red one, UNVERIFIED counted as
 #      hard, and every SKIP enumerated under "NOT covered".
 #   9. ARGUMENTS: an unknown one is refused with nothing recorded; --manifest
-#      beats the environment; and the missing-operand spin that ci/tier.sh,
+#      beats the environment; and an option with no operand REFUSES - exit 2,
+#      naming the option - instead of spinning the argument loop. That last is
+#      the 5th and 6th instance of the `shift 2` hang ci/tier.sh,
 #      ci/assert-stage.sh and ci/capability.sh were each cured of on
-#      2026-09-14 is STILL IN THIS FILE - carried as a known defect.
+#      2026-09-14; it was carried here as a known defect until 2026-09-17 and
+#      is now asserted, with the pre-fix line planted back as the proof.
 #  10. MAKE AGREES. The manifest and gate-file names the gate and the driver
 #      spell are the ones mk/deploy.mk resolves - asked of make, not read out
 #      of the makefile - and a checkout missing the gate is refused by name.
@@ -80,11 +83,15 @@
 #      wrote is read by no gate, and it is carried as a defect rather than
 #      dressed up as an assertion.
 #
-# TEN KNOWN DEFECTS are carried, every one found by an assertion going the
-# wrong way rather than by reading: the two argv spins; the selftest's
-# blindness to the verdict it claims is recorded; `deploy.test.log`, read by
-# the gate and written by nothing; a duplicated key graded from its FIRST
-# value in silence when the driver's documented semantics are last-write-wins;
+# EIGHT KNOWN DEFECTS are carried, every one found by an assertion going the
+# wrong way rather than by reading. There were ten until 2026-09-17: the two
+# argv spins were fixed in ci/deploy-gates.sh and their markers are now the
+# assertions of section 9, which is what a t_known_defect is for - it goes RED
+# the day it starts passing, so the marker cannot outlive the bug. The eight:
+# the selftest's blindness to the verdict it claims is recorded;
+# `deploy.test.log`, read by the gate and written by nothing; a duplicated key
+# graded from its FIRST value in silence when the driver's documented
+# semantics are last-write-wins;
 # `deploy.program.skipped` absent read as "not skipped" (a verdict from missing
 # data, CONTRACT.md rule two); a lease reported held at program time on a
 # run that reports no lease acquired, graded PASS; `deploy.preflight.
@@ -1076,12 +1083,20 @@ fi
 #
 # AND THE MISSING-OPERAND SPIN. `--manifest) MANIFEST="${2:-}"; shift 2` with
 # nothing after --manifest: `shift 2` fails with one argument left and shifts
-# nothing, the loop sees --manifest again, forever. ci/tier.sh,
-# ci/assert-stage.sh and ci/capability.sh were each cured of this on
-# 2026-09-14 with a need_operand guard; this file was not. The timeout IS the
-# assertion: a spin shows as 124, which is neither the 2 it owes nor a pass.
+# nothing, the loop sees --manifest again, forever - no verdict, no gate file,
+# no exit status, and a runner held until an external timeout kills it, which
+# is worse than a wrong answer because a job that never finishes produces no
+# evidence about why. ci/tier.sh, ci/assert-stage.sh and ci/capability.sh were
+# each cured of this on 2026-09-14 with a need_operand guard; this file was the
+# 5th and 6th instance and was cured on 2026-09-17, which is why the two
+# t_known_defect markers below are now t_check.
+#
+# THE TIMEOUT IS THE ASSERTION: a spin shows as 124, which is neither the 2 it
+# owes nor a pass, and the predicate says which of the two it saw. The refusal
+# must also NAME THE OPTION - "unusable arguments" that does not say which
+# argument leaves the caller to bisect their own command line.
 #=============================================================================
-t_head "arguments: unknown is refused unrecorded, --manifest beats the environment, and the operand spin"
+t_head "arguments: unknown is refused unrecorded, --manifest beats the environment, and an option with no operand refuses instead of spinning"
 
 ## unknown_arg_refused <toolkit>
 ## FPGA_REPORT_DIR points at a real, clean run directory on purpose: a gate
@@ -1114,13 +1129,16 @@ manifest_beats_env() {
     printf 'the clean fixture was graded and the exit is %s\n' "$rc"; return 1
 }
 
-## operand_refused <toolkit> <option> - 0 iff the bare option exits 2 within 5s
+## operand_refused <toolkit> <option>
+## 0 iff the bare option exits 2 within 5s AND the refusal names the option.
 operand_refused() {
-    local dir="$1" opt="$2" rc=0
-    timeout 5 "${GATE_ENV[@]}" CI_VERDICT_DIR="$(vd_new)" bash "$dir/ci/deploy-gates.sh" "$opt" >/dev/null 2>&1 || rc=$?
-    [ "$rc" = 2 ] && return 0
+    local dir="$1" opt="$2" out rc=0
+    out="$(timeout 5 "${GATE_ENV[@]}" CI_VERDICT_DIR="$(vd_new)" bash "$dir/ci/deploy-gates.sh" "$opt" 2>&1)" || rc=$?
     [ "$rc" = 124 ] && { printf '%s with no operand had not terminated after 5 seconds - the argv loop is spinning\n' "$opt"; return 1; }
-    printf 'exit %s, not 2\n' "$rc"; return 1
+    [ "$rc" = 2 ] || { printf 'exit %s, not 2 (124 would be the spin)\n%s\n' "$rc" "$out"; return 1; }
+    t_contains "$out" "$opt" && return 0
+    printf 'refused with exit 2 but did not name %s, so the caller is told an argument is unusable and not which:\n%s\n' "$opt" "$out"
+    return 1
 }
 
 t_check deploy.argv.unknown "an unknown argument is refused with exit 2, named, and NO verdict file - even with a clean run directory in the environment" \
@@ -1129,15 +1147,47 @@ t_check deploy.argv.manifest_wins "--manifest is graded in preference to FPGA_RE
     manifest_beats_env "$FLOW_DIR"
 
 if command -v timeout >/dev/null 2>&1; then
-    t_known_defect deploy.argv.missing_operand.manifest \
-        "--manifest with no operand is refused (exit 2) instead of spinning the argument loop" \
+    t_check deploy.argv.missing_operand.manifest \
+        "--manifest with nothing after it is refused (exit 2 within 5s, naming the option) instead of spinning the argument loop" \
         operand_refused "$FLOW_DIR" --manifest
-    t_known_defect deploy.argv.missing_operand.gate_file \
-        "--gate-file with no operand is refused (exit 2) instead of spinning the argument loop" \
+    t_check deploy.argv.missing_operand.gate_file \
+        "--gate-file with nothing after it is refused (exit 2 within 5s, naming the option) instead of spinning the argument loop" \
         operand_refused "$FLOW_DIR" --gate-file
+
+    # THE FAULT IS THE PRE-FIX LINE, VERBATIM - `${2:-}` and all - because the
+    # aimed-at failure is the SPIN and nothing else. Dropping the guard while
+    # keeping `MANIFEST="$2"` would trip `set -u` on the missing operand and
+    # exit 1: non-zero, so t_check_fail would print `ok` having proved only
+    # that bash has -u. The mutant has to reach the loop and go round it.
+    #
+    # `plant` rather than t_replace_line, per this file's helper: it checks the
+    # copy still parses, and a mutant that dies of a syntax error hands the
+    # predicate a non-zero exit for free - the same false green from the other
+    # direction. One arm per copy, so each proof isolates one guard.
+    M="$(t_mutant "$SB" argv-manifest-unguarded)"
+    if plant "$M" ci/deploy-gates.sh \
+            's|^        --manifest) .*|        --manifest)  MANIFEST="${2:-}";  shift 2 ;;|'; then
+        t_check_fail deploy.argv.missing_operand.manifest.mutation \
+            "with the guard removed from the --manifest arm the loop spins, the 5s timeout fires at 124, and the assertion goes red - the defect verbatim, as it stood before 2026-09-17" \
+            operand_refused "$M" --manifest
+    else
+        t_skip deploy.argv.missing_operand.manifest.mutation "could not plant the fault, or the planted copy stopped parsing: the --manifest arm of the argv loop has changed shape - see the harness line above"
+    fi
+
+    M="$(t_mutant "$SB" argv-gatefile-unguarded)"
+    if plant "$M" ci/deploy-gates.sh \
+            's|^        --gate-file) .*|        --gate-file) GATE_FILE="${2:-}"; shift 2 ;;|'; then
+        t_check_fail deploy.argv.missing_operand.gate_file.mutation \
+            "the same fault in the --gate-file arm spins the same way - both arms shifted 2, so one guard proves nothing about the other" \
+            operand_refused "$M" --gate-file
+    else
+        t_skip deploy.argv.missing_operand.gate_file.mutation "could not plant the fault, or the planted copy stopped parsing: the --gate-file arm of the argv loop has changed shape - see the harness line above"
+    fi
 else
-    t_skip deploy.argv.missing_operand.manifest "no coreutils timeout on this host, and the case under test is a loop that does not terminate"
-    t_skip deploy.argv.missing_operand.gate_file "no coreutils timeout on this host, and the case under test is a loop that does not terminate"
+    t_skip deploy.argv.missing_operand.manifest "no coreutils timeout on this host, and the case under test is a loop that does not terminate - an assertion that can hang the runner is worse than the one it guards"
+    t_skip deploy.argv.missing_operand.gate_file "no coreutils timeout on this host, and the case under test is a loop that does not terminate - an assertion that can hang the runner is worse than the one it guards"
+    t_skip deploy.argv.missing_operand.manifest.mutation "no coreutils timeout on this host - the planted spin is exactly what would hang this suite"
+    t_skip deploy.argv.missing_operand.gate_file.mutation "no coreutils timeout on this host - the planted spin is exactly what would hang this suite"
 fi
 
 M="$(t_mutant "$SB" argv-unknown-ignored)"
