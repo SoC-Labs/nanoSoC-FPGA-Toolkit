@@ -57,16 +57,22 @@
 # WOULD SETTLE IT: a second board on a different part, built end to end by
 # somebody who did not write the pack API.
 
-## no stage script is unit-tested
-# flow/vivado/{1_flist,2_package_ip,3_bd,4_synth,5_impl,6_bitstream}.tcl is 5181
-# lines and needs Vivado to run, so the suite reaches it only through fixtures
-# of its OUTPUT. t_measure, t_assert_stage and t_verdicts test the graders; the
-# stages themselves are covered by the fact that a bitstream came out matching a
-# known-good one, which is an integration result for one design on one part.
-# The five flow/steps/*.tcl files are in the same position.
-# WOULD SETTLE IT: the parts of each stage that do not call a tool, factored out
-# and driven under tclsh the way flow_utils.tcl now is.
-
+## five of six stage scripts are not unit-tested
+# CLOSED for stage 1 on 2026-09-17: test/shell/t_stage_flist.sh, 28 planted
+# faults, driving 1_flist.tcl under bare tclsh with recording stubs for the
+# Vivado commands. The remaining five are 2_package_ip, 3_bd, 4_synth, 5_impl,
+# 6_bitstream.
+#
+# TWO THINGS THAT SUITE MEASURED, WHICH CHANGE THIS ENTRY'S ADVICE.
+# First, the remedy below overstated the work: 1_flist.tcl was ALREADY drivable,
+# and only ~60 of its 643 lines needed factoring. Do not budget a refactor per
+# stage until you have looked; the other five may differ.
+# Second, and this is the boundary to keep stating: recording stubs prove the
+# stage ISSUED a call, in that order, with those arguments. They prove NOTHING
+# about whether Vivado would accept it. A read_verilog the tool rejects, an
+# include_dirs property it ignores, a fileset that does not exist - all pass
+# under stubs. That half still rests on one integration result.
+# WOULD SETTLE IT for the rest: the same technique, one stage at a time.
 ## `make help-hooks` and scripts/fpga-flow-hooks are named by no test
 # CORRECTING MY OWN ENTRY, 2026-09-11. This used to read "doctor reports what a
 # host has; hooks lists seams... which t_seams.sh already knows how to check".

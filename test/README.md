@@ -307,11 +307,13 @@ five `SKIP` lines, so the ratio alone would have read as 4% and passed.
 
 ## What these suites do **not** cover yet
 
-- **No stage script is unit-tested.** `flow/vivado/*.tcl` is 5181 lines and
-  needs Vivado, so the suites reach it only through fixtures of its *output*.
-  `t_measure`, `t_assert_stage` and `t_verdicts` test the graders. The stages
-  themselves rest on one integration result: a bitstream that matched a
-  known-good one, for one design on one part.
+- **Five of six stage scripts are not unit-tested.** Stage 1 was closed on
+  2026-09-17 by `t_stage_flist.sh` (28 proofs), which drives `1_flist.tcl` under
+  bare `tclsh` with recording stubs for the Vivado commands. The rest —
+  `2_package_ip`, `3_bd`, `4_synth`, `5_impl`, `6_bitstream` — still rest on one
+  integration result: a bitstream that matched a known-good one, for one design
+  on one part. **Stubs prove a call was ISSUED, never that Vivado would accept
+  it**; that half of the claim is still untested by construction.
 - **The deploy tier has never touched a board.** `scripts/fpga-flow-deploy`,
   `mk/deploy.mk` and the fpgahub hooks are exercised against fixtures and
   dry-run paths only.
