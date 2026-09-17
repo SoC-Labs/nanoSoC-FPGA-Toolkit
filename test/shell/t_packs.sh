@@ -237,12 +237,79 @@ BOARD_DIR=$SB/boards/testbench-board
 #=============================================================================
 t_head "the shipped packs load and validate, and so does the other role"
 
-t_check packs.load.xc7z020 "part pack xc7z020clg400-1 loads and validates" \
-    pack_loads "$FLOW_DIR" part xc7z020clg400-1
-t_check packs.load.xck26   "part pack xck26-sfvc784-2LV-c loads and validates" \
-    pack_loads "$FLOW_DIR" part xck26-sfvc784-2LV-c
-t_check packs.load.xcku115 "part pack xcku115-flvb1760-1-c loads and validates" \
-    pack_loads "$FLOW_DIR" part xcku115-flvb1760-1-c
+## installed_part_packs <toolkit root> - every directory under part/ holding a
+## part.tcl, globbed exactly as pack_installed globs them.
+##
+## DERIVED, AND IT DID NOT USED TO BE. This block named its three packs, one
+## t_check each, for as long as there were three - so when a FOURTH pack was
+## added (xcvu19p, 2026-09-17) it shipped with NO load assertion at all and the
+## suite stayed green at 86 passed. That is CONTRACT.md's third rule broken
+## inside the suite that exists to enforce it, and it is the reference
+## toolkit's five-entry-whitelist defect exactly: a list that is merely
+## INCOMPLETE still prints something plausible and says nothing about what it
+## missed. Section 9 below already plants a fourth pack to prove the ENGINE's
+## enumeration reads the directory; this one is the suite reading it too.
+installed_part_packs() {
+    local d
+    for d in "$1"/part/*/; do
+        [ -f "${d}part.tcl" ] || continue
+        basename "$d"
+    done
+}
+
+N_PACKS="$(installed_part_packs "$FLOW_DIR" | grep -c .)"
+t_say "$N_PACKS part pack(s) installed under part/, found by glob"
+
+# AN EMPTY LOOP ASSERTS NOTHING AND LOOKS GREEN. If part/ ever holds no pack -
+# a bad checkout, a renamed directory - the loop below runs zero times and this
+# suite would report a clean bill of health for packs it never opened.
+t_check packs.load.any \
+    "part/ holds at least one pack, so the loop below actually asserts something" \
+    test "$N_PACKS" -gt 0
+
+while IFS= read -r _p; do
+    [ -n "$_p" ] || continue
+    t_check "packs.load.$_p" "part pack $_p loads and validates" \
+        pack_loads "$FLOW_DIR" part "$_p"
+done < <(installed_part_packs "$FLOW_DIR")
+
+## every_installed_pack_loads <toolkit root>
+## The same sweep as one predicate, so the property "this reads the DIRECTORY"
+## can be proved. The loop above cannot be: each of its assertions names a pack
+## that already exists, so all of them would stay green against a suite that
+## had gone back to carrying three names.
+every_installed_pack_loads() {
+    local root="$1" p n=0 bad=0 out
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        n=$((n + 1))
+        if ! out="$(pack_loads "$root" part "$p" 2>&1)"; then
+            printf '%s\n' "$out"
+            bad=1
+        fi
+    done < <(installed_part_packs "$root")
+    [ "$n" -gt 0 ] || { printf 'no pack under %s/part - NOTHING was validated, which is not the same as nothing being wrong\n' "$root"; return 1; }
+    return "$bad"
+}
+
+t_check packs.load.derived \
+    "every pack the part/ DIRECTORY holds loads and validates - the list is the glob, not a list in this file" \
+    every_installed_pack_loads "$FLOW_DIR"
+
+# THE PROOF THAT IT IS THE DIRECTORY. A fifth pack is planted in a copy, and it
+# is a pack that CANNOT validate - one required key and nothing else. A suite
+# carrying its own list of pack names never opens it and stays green, which is
+# precisely how the fourth pack came to ship unasserted.
+M="$(t_mutant "$SB" fifth-pack-broken)"
+if mkdir -p "$M/part/zz-planted-broken" \
+   && printf 'part_set part_name zz-planted-broken\n' > "$M/part/zz-planted-broken/part.tcl"; then
+    t_check_fail packs.load.derived.mutation \
+        "with an INVALID fifth pack planted in the directory, the sweep goes red - it enumerated it rather than reciting three names" \
+        every_installed_pack_loads "$M"
+else
+    t_skip packs.load.derived.mutation "could not plant a fifth pack directory inside the mutant"
+fi
+
 t_check packs.load.board   "a BOARD pack loads through the same engine (CONTRACT.md section 8: two roles, one validator)" \
     pack_loads "$FLOW_DIR" board "$BOARD_DIR"
 
