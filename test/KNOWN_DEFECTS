@@ -117,17 +117,36 @@
 # graph and asserts the prerequisite chain and the resolved variable surface;
 # THEN the split. Not the other way round.
 
-## ci/deploy-gates.sh and ci/check-vendor-collateral.sh are named by no test
-# CLOSED for tier.sh and capability.sh on 2026-09-14 (t_tier.sh, 24 proofs) and
-# for assert-stage.sh's argument loop on the same day. Between them those suites
-# found FIVE defects, two of which were a gate reporting a verdict it had not
-# measured - a CI job with a typo'd tier name exiting 0 having run nothing, and
-# a Tcl checker naming files it never opened.
-# The two that remain are judged not trivial, and the reason is the fixture, not
-# the logic: deploy-gates.sh (746 lines) wants a deploy manifest covering six
-# time-ordered moments; check-vendor-collateral.sh (1364) wants a throwaway git
-# repository with staged content and revisions - a precondition class no suite
-# here has yet.
-# WOULD SETTLE IT: each carries a cheap foothold, `--selftest` and `--arm-only`.
-# Those are claims the files make about THEMSELVES, so driving them from outside
-# is where that suite starts, not where it finishes.
+## ci/deploy-gates.sh is named by no test
+# CLOSED for check-vendor-collateral.sh on 2026-09-17: test/shell/t_vendor_collateral.sh,
+# 24 planted faults. It found FOUR defects in the checker that guards this PUBLIC
+# repository against vendor IP, all carried as t_known_defect:
+#
+#   A SKIPPED SCAN EXITS 0, two independent ways. gawk is FATAL on an unreadable
+#   operand and the scan discards both its stderr and its exit status, so one
+#   mode-000 file hides every file sorting after it in its 400-file batch -
+#   measured, with the census still reporting both as "read for content". And the
+#   size pass matches `wc -c` output to its argument list BY POSITION; wc emits no
+#   line for a file it cannot open, so every size shifts by one and the checker's
+#   own "could not be measured" report is disarmed by an entry that is simply the
+#   wrong file's.
+#
+#   THE PRE-COMMIT HOOK SILENTLY DROPS EVERY CONTENT FINDING. hooks/pre-commit
+#   runs `--staged --fast --new-lines-only`; vc_addedlines calls `git diff`
+#   WITHOUT --cached, so the added-line map describes HEAD-vs-worktree while the
+#   scan reads the INDEX. When they differ every content finding in the staged
+#   blob is filed as pre-existing backlog and dropped. Measured: `--staged --fast`
+#   finds ip/core.v:2 and exits 1; add --new-lines-only and the same repo exits 0
+#   in silence. The divergence is not exotic - it is `git add core && printf '' >
+#   core`, the example the scanner's own header gives for why --staged exists.
+#   Path-shaped findings (line 0) survive, which is likely why it went unnoticed.
+#   FIX: --cached in the --staged branch.
+#
+#   A tracked .envrc carrying a licence-server export is never opened, because
+#   the "extensionless" test is the glob `*.*`, which dotfiles match.
+#
+# deploy-gates.sh (746 lines) remains. Its fixture is the cost: a deploy manifest
+# covering six time-ordered moments. Note before starting it: --selftest and
+# --arm-only are claims each file makes about ITSELF. --arm-only turned out not
+# to mean "Arm vendor only" at all - it means ARM EVERY RULE, firing each on its
+# own specimen and scanning nothing. Read what a flag does before asserting it.
