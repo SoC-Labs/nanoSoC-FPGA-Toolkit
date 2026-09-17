@@ -77,11 +77,6 @@
 # passes. Measured: bitstream_props comes out `(none)`.
 # Carried as t_known_defect bit.override.config_bank.
 
-## ci/deploy-gates.sh :: --manifest and --gate-file with no operand SPIN
-# The 5th and 6th instances of the `shift 2` hang. tier.sh, capability.sh and
-# assert-stage.sh were each given need_operand; this is the one ci/ script that
-# never got it. Same fix: check $# before shifting, exit 2 naming the option.
-
 ## ci/deploy-gates.sh :: a discarded awk status makes the ARCHIVE lie
 # awk exits non-zero when it cannot read its operand, and the gate file's
 # hard-failure test reads that as "nothing found". Measured: verdict dir at mode
