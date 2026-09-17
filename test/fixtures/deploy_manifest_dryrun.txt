@@ -1,0 +1,61 @@
+# A CLEAN deploy MANIFEST - a DRY RUN (DEPLOY_EXECUTE=0) whose preflight passed.
+# Fixture for test/shell/t_deploy_gates.sh.
+#
+# A dry run takes no lease and programs nothing, and the gates must say so as
+# SKIPS WITH THEIR REASON and exit 0 - never UNVERIFIED, never FAIL: "a gate
+# that is red on a healthy run is a gate people learn to ignore on the run
+# where it means something" (ci/deploy-gates.sh, gate_lease). The dry-run
+# values below are the ones the driver's source writes on that path:
+# `deploy.lease.acquired no` with `why dry-run`, `held_at_program no` with the
+# dry-run reason, `program.attempted no`, `test.dispatched no`, and NO
+# release.result at all (there was no token to release). Each of those would
+# be a red verdict on an executed run, which is exactly why the mode has to be
+# read FIRST - and what one of the proofs in the suite neuters to show it is.
+#
+# Same rules as deploy_manifest.txt: the driver's keys, in the driver's order,
+# placeholder names, not a capture.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+
+stage deploy
+date 2026-09-17T00:00:00Z
+host demo-host
+user demo-user
+tool fpgahub
+block demo_block
+run_tag t_deploy_gates
+deploy.mode dry-run
+deploy.subcommand run
+deploy.board_group demo_group
+deploy.target demo_group_pl
+deploy.test.action demo_action
+deploy.hub.transport unix
+deploy.hub.endpoint_sha256 0000000000000000
+deploy.hub.admin_token absent
+deploy.preflight.group_holder none
+deploy.preflight.group_resolved yes
+deploy.preflight.target_resolved yes
+deploy.preflight.program_method demo_method
+deploy.preflight.program_methods [{"name": "demo_method"}]
+deploy.preflight.action_declared yes
+deploy.bitstream.path /srv/images/demo_block.bit
+deploy.bitstream.bytes 4194304
+deploy.bitstream.sha256 0000000000000000000000000000000000000000000000000000000000000000
+deploy.bin_style demo_style
+deploy.stage.mode local
+deploy.stage.server_path /srv/images/demo_block.bit
+deploy.lease.holder fpga-flow-demo_block-t_deploy_gates-demo-host-12345-1758067200
+deploy.lease.ttl_s 600
+deploy.lease.tier interactive
+deploy.lease.acquired no
+deploy.lease.why dry-run
+deploy.lease.held_at_program no
+deploy.lease.held_why dry-run: no lease was taken
+deploy.program.attempted no
+deploy.program.why dry-run
+deploy.test.timeout_s 900
+deploy.test.dispatched no
+deploy.test.event_log /build/demo/logs/deploy_sse.jsonl
+deploy.collect.dir /build/demo/outputs/deploy
+deploy.collect.files 0
+runtime_s 3
