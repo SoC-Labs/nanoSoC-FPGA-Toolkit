@@ -12,6 +12,7 @@ part/
   xc7z020clg400-1/part.tcl  Zynq-7000    XC7Z020   CLG400  -1
   xck26-sfvc784-2LV-c/      Zynq US+     XCK26     SFVC784 -2LV c
   xcku115-flvb1760-1-c/     Kintex US    XCKU115   FLVB1760 -1 c
+  xcvu19p-fsva3824-2-e/     Virtex US+   XCVU19P   FSVA3824 -2 e
 ```
 
 There is no list of installed packs written down anywhere, here included. The
@@ -230,11 +231,15 @@ linked design:
 | `MMCME2_ADV` | **physical** | → `MMCME4_ADV` | → `MMCME3_ADV` |
 | `PLLE2_ADV` | **physical** | → **`MMCME4_ADV`** | → **`MMCME3_ADV`** |
 | `IDELAYE2` | **physical** | → `IDELAYE3` | → `IDELAYE3` |
-| `BUFHCE` | **physical** | → `BUFGCTRL` | → `BUFGCTRL` |
+| `BUFHCE` | **physical** | → `BUFGCTRL` † | → `BUFGCTRL` † |
 | `RAMB36E1` | **physical** | → `RAMB36E2` | → `RAMB36E2` |
 | `DSP48E1` | **physical** | → `DSP48E2` | → `DSP48E2` |
 | `ISERDESE2` | **physical** | *rejected* | *rejected* |
 | `IOBUFE3` | *rejected* | **physical** | **physical** |
+
+The fourth pack, `xcvu19p-fsva3824-2-e` (virtexuplus), was read on **2026-09-17**
+and agrees with the `xck26` column on every row above **except the two marked
+†** — see the next section, which is no longer about one anomaly.
 
 Every retarget succeeds and prints one `[Coretcl 2-1024]` warning into a log
 with thousands of lines. Two of them are not renames at all:
@@ -271,9 +276,10 @@ forgetting to protect it is one omission rather than a silent one.
 `part_primitive_status <prim>` answers the same question at run time:
 `physical`, `{retargeted <what-it-becomes>}`, `rejected`, or `unknown`.
 
-### The one anomaly, recorded rather than smoothed over
+### The anomaly, recorded rather than smoothed over — and then NOT REPRODUCED
 
-On `xck26` and `xcku115` the two measurements disagree about `BUFGCE`:
+On 2026-09-08, on `xck26` and `xcku115`, the two measurements disagreed about
+`BUFGCE`:
 
 ```
 create_cell -reference BUFGCE            ->  warning, retargeted to BUFGCTRL
@@ -286,6 +292,31 @@ not the site census, and the site census is what "physical" means here. So
 `clock_buffer_ce` is `BUFGCE`, `BUFGCE` is **not** in `primitives_retargeted` —
 listing it would make the validator reject the correct value — and both packs
 carry a `part_note` saying exactly this. Neither measurement has been dropped.
+
+**On 2026-09-17 the anomaly did not reproduce, and the `BUFHCE` row went with
+it.** The `xcvu19p` census ran the same probe, and then re-ran it against
+`xck26` in the same hour as a calibration — which reproduced every *other*
+number in that pack exactly, properties, sites and BELs:
+
+| `create_cell -reference` | 2026-09-08, `xck26`/`xcku115` | 2026-09-17, `xcvu19p` **and** `xck26` |
+|---|---|---|
+| `BUFGCE` | → `BUFGCTRL` (the anomaly) | **physical**, no warning |
+| `BUFG` `BUFH` `BUFHCE` `BUFIO` | → `BUFGCTRL` | → **`BUFGCE`** |
+| `BUFGMUX` | → `BUFGCTRL` | → `BUFGCTRL` (agrees) |
+
+Both sessions used Vivado v2024.1, SW Build 5076996. What differed between them
+is **not recorded in either `facts_source`** and the 2026-09-08 raw output was
+not kept, so this is written down rather than resolved. It matters because the
+two readings disagree about the sharpest claim in this file: under the 09-08
+reading a `BUFHCE` loses its clock enable silently, and under the 09-17 reading
+it keeps one. The safe instruction is unchanged either way — **name `BUFGCE`**,
+which is a site on every UltraScale(+) part here under both readings — and that
+is what every pack's `clock_buffer_ce` says.
+
+The shipped packs have **not** been rewritten to the newer reading. Each states
+what its own session measured, with its own date, which is the only way the
+disagreement stays visible; the `xcvu19p` pack's section 5 carries the same
+comparison from the other side.
 
 ---
 
