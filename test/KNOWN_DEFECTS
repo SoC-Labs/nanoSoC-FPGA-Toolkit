@@ -37,6 +37,67 @@
 # where the next one is hiding.
 #=============================================================================
 
+## mk/flow.mk :: the post-target census is read by nothing
+# Section 6 says the FPGA_POST_TARGET_VARS census makes a misspelt post-target
+# variable "visible to `make check`". NOTHING READS IT outside `make env`'s last
+# line - verified: the only occurrences are flow.mk:840 (comment), :915 (the
+# export), :1552 (the print). A complete project with
+# `BITSTREM_POST_TARGETS := deploy` gets `Contract complete.` and the deploy hook
+# silently never runs. Carried as t_known_defect flow_mk.vars.post_census.checked
+# - the census is asserted and proved; the CONSUMER is the marker, so it goes red
+# the day the checker names it.
+# Two smaller things measured beside it: section 7's claim that `$(.VARIABLES)`
+# shows exactly six is false (twelve), and `dirs`' comment justifies its guard
+# with "mkdir -p exits 0 when the path is a FILE" - GNU mkdir -p exits 1. The
+# guard is right; its stated reason is not.
+
+## flow/vivado/6_bitstream.tcl :: a post_bitstream hook can replace the .bit unrecorded
+# `flow_hook post_bitstream` is at :462; the measurements that read `file size`
+# start at :473; `prov_pin` is called only for routed_dcp (:172) and
+# fpga_image_hex (:187). Verified: the .bit is NEVER pinned at write time, zero
+# prov_pin calls name it. A hook that replaces the file is recorded as though
+# write_bitstream wrote it. The template's warning that a post_bitstream hook
+# "cannot change what ships" is true of the DESIGN and false of the FILE.
+# WOULD SETTLE IT: cheap with t_bitstream's existing fixture - the stub knows the
+# bytes it wrote, so an overwriting hook is detectable.
+
+## flow/vivado/6_bitstream.tcl :: the firmware hash is recorded and compared by nothing
+# Written at :493. ci/assert-stage.sh:562-567 only warns when it is ABSENT. The
+# gate bullet at :596-599 says the synth manifest "is what proves which one was
+# read" - and no code opens it. A bitstream carrying different firmware from the
+# one synthesis saw is detectable by nothing in the flow.
+
+## flow/steps/bitstream_opts.tcl :: the override contract is not the acceptance test
+# The file tells an override, first and in capitals, that it MUST keep the
+# CFGBVS/CONFIG_VOLTAGE section - "the whole reason this file is a step of its
+# own". The acceptance test is BITSTREAM_OPTS_DONE plus the existence of three
+# variable NAMES, none of which is that section. An override keeping the letter
+# and dropping it is accepted in silence, and write_bitstream reports the absence
+# as DRC CFGBVS-1, a WARNING - so the run exits 0 and every artefact assertion
+# passes. Measured: bitstream_props comes out `(none)`.
+# Carried as t_known_defect bit.override.config_bank.
+
+## ci/deploy-gates.sh :: --manifest and --gate-file with no operand SPIN
+# The 5th and 6th instances of the `shift 2` hang. tier.sh, capability.sh and
+# assert-stage.sh were each given need_operand; this is the one ci/ script that
+# never got it. Same fix: check $# before shifting, exit 2 naming the option.
+
+## ci/deploy-gates.sh :: a discarded awk status makes the ARCHIVE lie
+# awk exits non-zero when it cannot read its operand, and the gate file's
+# hard-failure test reads that as "nothing found". Measured: verdict dir at mode
+# 000 with deploy.verify failing -> the console reports the failing gate and
+# reports/deploy_gate.txt says `HARD FAILURES: none`. Process exit is unaffected
+# because ci_exit counts in memory, so CI keyed on status still goes red and ONLY
+# THE ARCHIVED COPY LIES - the copy docs/DEPLOY.md sends readers to.
+# Seven more carried as t_known_defect in t_deploy_gates.sh: --selftest grades its
+# absent-record case on exit code alone, so a copy recording SKIP where the header
+# promises UNVERIFIED passes its own selftest; deploy.test.log is read by the gate
+# and written by nothing; a duplicate key is graded from the FIRST value though
+# the driver documents last-write-wins; an absent deploy.program.skipped reads as
+# "not skipped"; held_at_program=yes on a run whose acquire FAILED grades PASS on
+# lease and SKIP on release in one file; deploy.preflight.group_holder is graded
+# by nobody; and the driver records the holder it PROPOSED, never the hub's answer.
+
 ## the deploy tier has never touched a board
 # scripts/fpga-flow-deploy (1390 lines), mk/deploy.mk and the fpgahub hooks have
 # been exercised against fixtures and against the CLI's own dry-run paths.

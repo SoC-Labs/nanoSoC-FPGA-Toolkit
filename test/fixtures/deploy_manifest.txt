@@ -1,0 +1,84 @@
+# A CLEAN deploy MANIFEST - an EXECUTED run that reached all six moments.
+# Fixture for test/shell/t_deploy_gates.sh.
+#
+# ci/deploy-gates.sh grades a deploy BY READING THIS FILE, days later, with no
+# hub and no board - because the evidence is a SEQUENCE OF MOMENTS (the lease
+# held at the instant the program request went out, DONE read back after it,
+# the action state that came back, the lease given back) and re-asking the hub
+# afterwards recovers none of them. So this file is the interface under test.
+#
+# THE KEYS ARE THE DRIVER'S, IN THE DRIVER'S ORDER. Every key here is one that
+# scripts/fpga-flow-deploy `mf_set`s, and the suite asserts that against the
+# driver's source (deploy.fixture.realism) - a fixture cannot disagree with its
+# author, but it can be made to disagree with the code it claims to imitate.
+# The order is the order the driver records them in on a `run --execute`, which
+# is the time order of the six moments. Nothing in the gate depends on line
+# order (it reads by key), so the order is documentation for the reader.
+#
+# WHAT IT IS NOT: a capture. Nothing in this toolkit has ever programmed a
+# device (test/KNOWN_DEFECTS, "the deploy tier has never touched a board"), so
+# no manifest from a real run exists to compare this against. The values below
+# are what the driver's source says it would write on a run where every request
+# succeeded. Names are placeholders: CONTRACT.md section 1 forbids this
+# repository from naming a board, and a fixture is part of this repository.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+
+stage deploy
+date 2026-09-17T00:00:00Z
+host demo-host
+user demo-user
+tool fpgahub
+block demo_block
+run_tag t_deploy_gates
+deploy.mode execute
+deploy.subcommand run
+deploy.board_group demo_group
+deploy.target demo_group_pl
+deploy.test.action demo_action
+deploy.hub.transport unix
+deploy.hub.endpoint_sha256 0000000000000000
+deploy.hub.admin_token absent
+deploy.preflight.group_holder none
+deploy.preflight.group_resolved yes
+deploy.preflight.target_resolved yes
+deploy.preflight.program_method demo_method
+deploy.preflight.program_methods [{"name": "demo_method"}]
+deploy.preflight.action_declared yes
+deploy.bitstream.path /srv/images/demo_block.bit
+deploy.bitstream.bytes 4194304
+deploy.bitstream.sha256 0000000000000000000000000000000000000000000000000000000000000000
+deploy.bin_style demo_style
+deploy.stage.mode local
+deploy.stage.server_path /srv/images/demo_block.bit
+deploy.lease.holder fpga-flow-demo_block-t_deploy_gates-demo-host-12345-1758067200
+deploy.lease.ttl_s 600
+deploy.lease.tier interactive
+deploy.lease.acquired yes
+deploy.lease.token_prefix 0123abcd
+deploy.lease.expires_at 2026-09-17T00:10:00Z
+deploy.lease.heartbeat_interval_s 200
+deploy.lease.held_at_program yes
+deploy.program.attempted yes
+deploy.program.http_status 200
+deploy.program.ok yes
+deploy.program.plugin demo_method
+deploy.program.fingerprint 0123abcd0123
+deploy.program.part demo_part
+deploy.program.message programmed
+deploy.program.skipped no
+deploy.verify.program_verified yes
+deploy.verify.done_property present
+deploy.test.timeout_s 900
+deploy.test.dispatched yes
+deploy.test.event_log /build/demo/logs/deploy_sse.jsonl
+deploy.test.stream_open_before_post yes
+deploy.test.http_status 202
+deploy.test.run_id run-0001
+deploy.test.state ok
+deploy.test.detail {"state": "ok", "run_id": "run-0001"}
+deploy.test.status_url_followed no (the hub emits a /boards/ path that 404s)
+deploy.collect.dir /build/demo/outputs/deploy
+deploy.collect.files 2
+deploy.release.result ok
+runtime_s 42

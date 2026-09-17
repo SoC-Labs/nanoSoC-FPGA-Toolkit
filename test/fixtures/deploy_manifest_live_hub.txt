@@ -1,0 +1,97 @@
+# A deploy MANIFEST AS THE LIVE HUB WOULD MAKE IT - fpgahub 0.3.0, real KR260.
+# Fixture for test/shell/t_deploy_gates.sh.
+#
+# WHY A THIRD FIXTURE EXISTS, AND WHAT IT IS AND IS NOT.
+#
+# deploy_manifest.txt beside this one carries the values the DRIVER'S SOURCE
+# says it would record - and the driver was written against a local fpgahub
+# 0.1.0.dev0 checkout. On 2026-09-17 the tier was run against the live hub,
+# which is 0.3.0, on a real KR260. Two of its findings change what a manifest
+# from a real run CONTAINS, so a suite grading only the 0.1.0-shaped fixture
+# would be grading a record no live run produces.
+#
+#   1. THE HUB IGNORES THE HOLDER IT IS SENT. 0.3.0's LeaseAcquireRequest has
+#      no `holder`, `user` or `unix_user` field at all; the hub records
+#      `holder: mtls-peer@<ip>, user: mtls-peer` from the connection, whatever
+#      the body said. So the toolkit's DISTINCTIVE-HOLDER discipline - the
+#      whole of docs/DEPLOY.md section 2, and the reason the driver builds
+#      `fpga-flow-<block>-<runtag>-<host>-<pid>-<epoch>` - is INERT here. This
+#      file carries the holder the HUB stores, which is what a manifest would
+#      say if the driver recorded the hub's answer instead of its own request.
+#
+#   2. THE PREFLIGHT GROUP-HOLDER PARSE READS A SHAPE 0.3.0 DOES NOT SEND.
+#      The driver reads `lease.holder` / `leases.0.holder`; 0.3.0 returns
+#      `{"state":"held","members":[{"current":{"holder":...}}]}`. Measured: the
+#      preflight printed "group is free" while the hub said HELD. So
+#      `deploy.preflight.group_holder` below is `none` - and it is `none` ON A
+#      RUN WHERE THE BOARD WAS SOMEBODY ELSE'S. That wrong value is left in
+#      this fixture deliberately: NO GATE READS THIS KEY, so no verdict in the
+#      file is different because of it, and the suite records that as a known
+#      defect rather than pretending a fixture can catch it.
+#
+# EVERYTHING ELSE IS deploy_manifest.txt UNCHANGED, so that grading this file
+# beside that one isolates exactly the difference the live hub makes. It is
+# NOT a capture: no manifest from that run reached this repository, and the
+# three facts above are all that is known. Inventing the rest would be a
+# fixture agreeing with its author about a hub neither has read.
+#
+# Copyright (C) 2026, SoC Labs (www.soclabs.org)
+
+stage deploy
+date 2026-09-17T00:00:00Z
+host demo-host
+user demo-user
+tool fpgahub
+block demo_block
+run_tag t_deploy_gates
+deploy.mode execute
+deploy.subcommand run
+deploy.board_group demo_group
+deploy.target demo_group_pl
+deploy.test.action demo_action
+deploy.hub.transport tcp
+deploy.hub.endpoint_sha256 0000000000000000
+deploy.hub.admin_token absent
+deploy.preflight.group_holder none
+deploy.preflight.group_resolved yes
+deploy.preflight.target_resolved yes
+deploy.preflight.program_method demo_method
+deploy.preflight.program_methods [{"name": "demo_method"}]
+deploy.preflight.action_declared yes
+deploy.bitstream.path /srv/images/demo_block.bit
+deploy.bitstream.bytes 4194304
+deploy.bitstream.sha256 0000000000000000000000000000000000000000000000000000000000000000
+deploy.bin_style demo_style
+deploy.stage.mode local
+deploy.stage.server_path /srv/images/demo_block.bit
+deploy.lease.holder mtls-peer@192.0.2.1
+deploy.lease.ttl_s 600
+deploy.lease.tier interactive
+deploy.lease.acquired yes
+deploy.lease.token_prefix 0123abcd
+deploy.lease.expires_at 2026-09-17T00:10:00Z
+deploy.lease.heartbeat_interval_s 200
+deploy.lease.held_at_program yes
+deploy.program.attempted yes
+deploy.program.http_status 200
+deploy.program.ok yes
+deploy.program.plugin demo_method
+deploy.program.fingerprint 0123abcd0123
+deploy.program.part demo_part
+deploy.program.message programmed
+deploy.program.skipped no
+deploy.verify.program_verified yes
+deploy.verify.done_property present
+deploy.test.timeout_s 900
+deploy.test.dispatched yes
+deploy.test.event_log /build/demo/logs/deploy_sse.jsonl
+deploy.test.stream_open_before_post yes
+deploy.test.http_status 202
+deploy.test.run_id run-0001
+deploy.test.state ok
+deploy.test.detail {"state": "ok", "run_id": "run-0001"}
+deploy.test.status_url_followed no (the hub emits a /boards/ path that 404s)
+deploy.collect.dir /build/demo/outputs/deploy
+deploy.collect.files 2
+deploy.release.result ok
+runtime_s 42
