@@ -167,6 +167,36 @@ then get the answer wrong, calling a real extension point unrecognised. That is
 the failure this repository's third rule was written from, reproduced with the
 same numbers.
 
+### `t_help_hooks.sh` — the page people read *instead of* opening `seams.txt`
+
+`t_seams.sh` proves no file **carries** a copy of the seam list. This is the
+functional half for the one consumer a person actually reads: `make help-hooks`
+answers "where can this project extend the flow", and whatever `mk/help.mk`
+does internally, **what it prints must equal what the file says** — same names,
+same order, and a count line that agrees with both. A seam it omits is a seam
+nobody uses; a seam it invents is a hook file somebody writes that never runs.
+
+Nine assertions, five of them planted faults, and the first two are the two
+directions the equality can fail in: the target reading a **stale snapshot** of
+the list while a seam is added to the real file, and the target **printing a
+name the file does not declare**. The rest cover the two columns a project reads
+about *itself* — a hook at the last declared seam reported as taken, with its
+path and in the footer count, and a file whose name is not a seam named under
+`WILL NEVER RUN` — plus the refusal when `seams.txt` is absent, driven
+standalone (`make -f mk/help.mk`) because inside a project `mk/flow.mk` refuses
+first and that guard is already `t_seams.sh`'s.
+
+The suite **names no seam of its own**; every name comes from `seams.txt` at run
+time, because a test for "this list has one copy" that carried a second copy
+would be the defect wearing a lab coat. One thing is recorded as a **skip with
+its reason rather than a pass**: `help-hooks` *points at* `flow/steps/` but
+enumerates nothing from it, so there is no printed step list to compare with the
+directory — the day it grows one, that skip is the line to replace.
+
+`scripts/fpga-flow-hooks` is a different thing entirely — the **git-hook**
+installer — and is not touched here. Its own header says so in capitals, and an
+earlier `KNOWN_DEFECTS` entry conflated the two in a file that warns about it.
+
 ### `t_init.sh` — the scaffolder, and the round trip through `make check`
 
 A scaffolder is trusted absolutely by the person running it, because they have
@@ -315,13 +345,17 @@ five `SKIP` lines, so the ratio alone would have read as 4% and passed.
 - **The deploy tier has never touched a board.** `scripts/fpga-flow-deploy`,
   `mk/deploy.mk` and the fpgahub hooks are exercised against fixtures and
   dry-run paths only.
-- **`make help-hooks` and `scripts/fpga-flow-hooks` are named by no test.**
+- **`scripts/fpga-flow-hooks` is named by no test.** This bullet used to name
+  `make help-hooks` too. That half is **CLOSED** as of 2026-09-17 by
+  `t_help_hooks.sh`, 9 assertions and 5 planted faults, above.
   Note these are two unrelated things, and an earlier version of this bullet
   conflated them: `fpga-flow-hooks` is the **git-hook** installer, and its own
   header says so in capitals; the thing that lists seams out of `seams.txt` is
-  `make help-hooks`. Start with `help-hooks` — `t_seams.sh` already knows that
-  shape. `fpga-flow-hooks` needs `git init` throwaway repos, a precondition
-  class no suite here has yet.
+  `make help-hooks`. `fpga-flow-hooks` needs `git init` throwaway repos, four
+  subcommands, the refusal-on-existing-hooks path and the submodule
+  `.git`-is-a-file case — a precondition class no suite here has yet.
+  `test/KNOWN_DEFECTS` still carries the entry in its original wording; whoever
+  closes `fpga-flow-hooks` should retire the whole line there.
   `init` was closed on 2026-09-11 by `t_init.sh` and `doctor` on the same day by
   `t_doctor.sh`. What `init` cost is the useful part: the round trip this bullet
   used to propose ("scaffold, then `make check` is clean") was **wrong**. A
