@@ -1372,14 +1372,23 @@ bitstream: dirs check-quiet
 	    echo "      unconstrained IO and says so as a DRC, not as an exit code:"; \
 	    echo "        grep -nE '^ERROR|DRC|write_bitstream' $(LOG_DIR)/bitstream.log"; \
 	    exit 1; }
-	@test -s "$(OUT_DIR)/$(BLOCK).bin" || { \
+	@bs=$$(awk '$$1=="bin_style"{print $$2; exit}' "$(REPORT_DIR)/bitstream_manifest.txt" 2>/dev/null); \
+	if [ "$$bs" = "none" ]; then \
+	    echo "OK: no .bin, and none is what the board pack asked for (bin_style none)"; \
+	elif test -s "$(OUT_DIR)/$(BLOCK).bin"; then \
+	    : ; \
+	else \
 	    echo "FAIL: no .bin at $(OUT_DIR)/$(BLOCK).bin"; \
 	    echo "      The .bin is what a running system loads, and the conversion"; \
 	    echo "      is board-family dependent: BIN_STYLE is currently"; \
 	    echo "      '$(if $(strip $(BIN_STYLE)),$(BIN_STYLE),(unset))', and it is a"; \
 	    echo "      REQUIRED key of the board pack at $(BOARD_DIR)/board.tcl."; \
 	    echo "      An unset one is not a default - it is a conversion nobody chose."; \
-	    exit 1; }
+	    echo "      If this board truly has no conversion, say so: bin_style none"; \
+	    echo "      is a statement and is accepted here. An unset key is a silence"; \
+	    echo "      and is not."; \
+	    exit 1; \
+	fi
 	@test -s "$(OUT_DIR)/$(BLOCK).xsa" || { \
 	    echo "FAIL: no hardware handoff at $(OUT_DIR)/$(BLOCK).xsa"; \
 	    echo "      It is what a software build reads to learn the address map,"; \
@@ -1396,7 +1405,11 @@ bitstream: dirs check-quiet
 	    echo "      recorded which firmware image is inside the bitstream above."; \
 	    exit 1; }
 	@echo "OK: bitstream $(OUT_DIR)/$(BLOCK).bit ($$(du -h "$(OUT_DIR)/$(BLOCK).bit" | cut -f1))"
-	@echo "    .bin      $(OUT_DIR)/$(BLOCK).bin  (style $(if $(strip $(BIN_STYLE)),$(BIN_STYLE),(unset)))"
+	@if [ -s "$(OUT_DIR)/$(BLOCK).bin" ]; then \
+	    echo "    .bin      $(OUT_DIR)/$(BLOCK).bin  (style $(if $(strip $(BIN_STYLE)),$(BIN_STYLE),(unset)))"; \
+	else \
+	    echo "    .bin      (none - this family loads the .bit directly)"; \
+	fi
 	@echo "    handoff   $(OUT_DIR)/$(BLOCK).xsa"
 	@# DEPLOY LANDS HERE. Non-fatal to the build, fatal to the claim.
 	@$(call post_stage_targets,bitstream,$(BITSTREAM_POST_TARGETS))

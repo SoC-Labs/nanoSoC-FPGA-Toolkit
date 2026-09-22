@@ -366,12 +366,20 @@ set ::pack_schema_spec(board) {
 
     ## --- programming and deployment -----------------------------------------
     bin_style             yes str   deploy
-        {How a .bin is made for this family: zynq7 (byte swap) or zynqmp (header
-         strip). THEY ARE NOT INTERCHANGEABLE AND THE WRONG ONE CORRUPTS THE
-         LOAD - the conversion succeeds, the file is the right size, the loader
-         accepts it, the device does not come up and nothing says why. Required
-         because guessing it from the part string is the kind of inference that
-         is right until it is not.}
+        {How a loadable image is made for this family: zynq7 (byte swap), zynqmp
+         (header strip), or none (there is no conversion - the loader takes the
+         .bit as written). THE FIRST TWO ARE NOT INTERCHANGEABLE AND THE WRONG
+         ONE CORRUPTS THE LOAD - the conversion succeeds, the file is the right
+         size, the loader accepts it, the device does not come up and nothing
+         says why. Required because guessing it from the part string is the kind
+         of inference that is right until it is not.
+         none IS A POSITIVE STATEMENT, NOT A WAIVER. It says this board's loader
+         consumes the .bit directly, so no .bin exists to be right or wrong, and
+         the stage will neither write one nor demand one. A bare Kintex on an Arm
+         MPS3 is the worked case: the MCC reads a .bit off a config microSD and
+         no .bin appears anywhere in that path. Leaving the key UNSET is still an
+         error, and deliberately so - unset means nobody chose, and none means
+         somebody looked and there is nothing to choose.}
     deploy_style          no  str   deploy
         {How this board is normally loaded: jtag, qspi, sd, tftp.}
     jtag_serial           no  str   deploy
@@ -475,12 +483,15 @@ set ::pack_cascade_spec(board) {
 #### 1d. CLOSED VALUE SETS #####################################################
 #
 # Only where the set really is closed and a wrong member is silent. bin_style is
-# the case that earns the mechanism: both values "work", and one of them
-# corrupts the load.
+# the case that earns the mechanism: zynq7 and zynqmp both "work", and one of
+# them corrupts the load. The third member, none, is not a way out of that - it
+# is the statement that this family has no conversion at all, and it is checked
+# in exactly the same way, because "none" typed where "zynqmp" was meant is the
+# same class of silent wrong answer.
 
 array set ::pack_enum_spec {
     board,platform     {bare pynq}
-    board,bin_style    {zynq7 zynqmp}
+    board,bin_style    {zynq7 zynqmp none}
     board,deploy_style {jtag qspi sd tftp}
 }
 

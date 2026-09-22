@@ -330,11 +330,22 @@ proc bin_byteswap32 {src dst} {
 set BIN_SOURCE "unmeasured"
 set RAW_BIN [file join $WORK_DIR ${block_name}.payload.bin]
 
-if {$BITSTREAM_BIN_STYLE eq ""} {
+if {$BITSTREAM_BIN_STYLE eq "none"} {
+    # A MEASURED ANSWER, NOT AN ABSENCE. bin_style none says this family's loader
+    # consumes the .bit directly, so bitstream_opts did not pass -bin_file and no
+    # payload exists. bin_source is set to a real value so that the gate below
+    # can tell "no conversion, by declaration" from "a conversion happened and
+    # nothing recorded which" - those are opposite situations and an unmeasured
+    # field cannot distinguish them.
+    say "bin style none: the .bit is the loadable form. No .bin written."
+    set BIN_SOURCE "none:bit-direct - this family has no .bin conversion"
+} elseif {$BITSTREAM_BIN_STYLE eq ""} {
     warn "no bin_style, so NO .bin was written - only the .bit."
     warn "  bin_style is a REQUIRED board-pack key. mk/flow.mk asserts the .bin"
     warn "  exists, so this run will fail there, and that is the correct outcome:"
     warn "  a .bin nobody chose the conversion for is worse than no .bin."
+    warn "  If this board genuinely has no conversion, the answer is bin_style"
+    warn "  none - a statement - and not an unset key, which is a silence."
     set BIN_SOURCE "none - bin_style is unset"
 } elseif {![file exists $BIN] || ![file size $BIN]} {
     warn "bin_style is '$BITSTREAM_BIN_STYLE' and write_bitstream wrote no payload"
@@ -540,7 +551,24 @@ foreach {f what} $__required {
     }
 }
 unset __required
-if {$BITSTREAM_BIN_STYLE eq ""} {
+if {$BITSTREAM_BIN_STYLE eq "none"} {
+    # The board declared there is no conversion, so there is no .bin to assert.
+    # WHAT IS STILL ASSERTED: that bin_source was MEASURED and is the none form.
+    # Without this the exemption would also cover a run that crashed before
+    # reaching the conversion block, which is the failure the .bin test exists
+    # for. And a .bin that exists anyway means -bin_file was passed after all -
+    # the two halves of this file disagree, and that is worth stopping for.
+    if {![prov_stage_measured bin_source] || ![string match "none:*" $BIN_SOURCE]} {
+        lappend HARD "bin_style is none but bin_source is '$BIN_SOURCE' - the stage\
+                      did not reach its conversion block, so the missing .bin is\
+                      unexplained rather than declared"
+    }
+    if {[file exists $BIN] && [file size $BIN]} {
+        lappend HARD "bin_style is none and yet a .bin exists at $BIN - something\
+                      passed -bin_file. A file nothing declares is a file nobody\
+                      checks"
+    }
+} elseif {$BITSTREAM_BIN_STYLE eq ""} {
     lappend HARD "no bin_style, so no .bin was written. It is a REQUIRED board-pack\
                   key and an unset one is not a default - it is a conversion nobody\
                   chose"

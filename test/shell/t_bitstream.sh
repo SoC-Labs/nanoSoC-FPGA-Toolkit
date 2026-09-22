@@ -887,9 +887,55 @@ pack_owns_style() {
     return 0
 }
 
+## bin_none <toolkit> - bin_style none: NO .bin, and that absence is DECLARED
+##
+## The other two styles prove a conversion happened. This one proves one did not,
+## which is the harder claim: "no .bin" is also what a stage that died early
+## produces, and what a stage that forgot -bin_file produces. So the assertion is
+## not "the file is absent" - it is that the file is absent AND the manifest says
+## why AND the gate is satisfied.
+bin_none() {
+    local tk="$1" v
+    bit_run "$tk" none none || return 1
+    [ "$BR_RC" -eq 0 ] || { printf 'bin_style none and the stage exited %s:\n' "$BR_RC"; show_run; return 1; }
+    [ ! -s "$BR_OUTDIR/$BR_BLOCK.bin" ] || {
+        printf 'bin_style none and a .bin was written at %s.\n' "$BR_OUTDIR/$BR_BLOCK.bin"
+        printf 'Something passed -bin_file: the board says this family has no conversion,\n'
+        printf 'so a payload here is a file nothing declares and nobody checks.\n'; return 1; }
+    v="$(bit_mf "$BR_MAN" bin_style)"; [ "$v" = none ] || { printf "manifest bin_style is '%s', not none\n" "$v"; return 1; }
+    v="$(bit_mf "$BR_MAN" bin_source)"
+    case "$v" in
+        none:*) ;;
+        *) printf "manifest bin_source is '%s' - it does not DECLARE the absence.\n" "$v"
+           printf 'An unmeasured bin_source with no .bin is indistinguishable from a stage\n'
+           printf 'that died before its conversion block.\n'; return 1 ;;
+    esac
+    grep -qE '^HARD FAILURES: 0|^HARD FAILURES: none' "$BR_GATE" 2>/dev/null || {
+        printf 'bin_style none and the gate still counts a hard failure:\n'
+        sed -n '/^HARD FAILURES/,/^BUDGETS/p' "$BR_GATE" 2>/dev/null; return 1; }
+    return 0
+}
+
 t_check bit.bin.zynqmp "zynqmp: the .bin is the payload as written, kept as written, and the manifest says 'header strip'" bin_zynqmp "$FLOW_DIR"
 t_check bit.bin.zynq7  "zynq7: every 32-bit word is byte-swapped, the raw payload is kept in WORK_DIR, and the manifest says 'byte swap'" bin_zynq7 "$FLOW_DIR"
 t_check bit.bin.pack_owns_style "the board pack's bin_style wins over an exported BIN_STYLE, and the divergence is announced" pack_owns_style "$FLOW_DIR"
+t_check bit.bin.none   "none: NO .bin is written, the manifest DECLARES the absence, and the gate is satisfied" bin_none "$FLOW_DIR"
+
+# THE SUPPRESSION IS THE WHOLE MECHANISM. With -bin_file appended for every
+# non-empty style - the shape of the line before `none` existed - the stub writes
+# a payload, a .bin appears for a board that says it has none, and bin_none's
+# absence assertion goes red. This is the proof that `none` does something rather
+# than merely being tolerated.
+M="$(t_mutant "$SB" bin-file-always)"
+if [ -n "$M" ] && t_replace_line "$M" "$OP_REL" \
+        'if {$BITSTREAM_BIN_STYLE ni {"" "none"}} { lappend BITSTREAM_ARGS -bin_file }' \
+        'if {$BITSTREAM_BIN_STYLE ne ""} { lappend BITSTREAM_ARGS -bin_file }'; then
+    t_check_fail bit.bin.none.mutation \
+        "with -bin_file appended for every non-empty style, a .bin appears for a none board and the assertion goes red" \
+        bit_proof bin_none "$M"
+else
+    t_skip bit.bin.none.mutation "could not plant the fault: the -bin_file line has changed shape"
+fi
 
 # The style is ignored and the swap always happens: a zynqmp board gets a
 # zynq7 image of the right size.

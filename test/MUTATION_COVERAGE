@@ -54,7 +54,7 @@
 
 t_assert_stage   13
 t_bd              3
-t_bitstream      20
+t_bitstream      21
 t_contract       26
 t_deploy_gates   47
 t_doctor         32
@@ -65,7 +65,7 @@ t_help_hooks      5
 t_init           22
 t_measure        19
 t_package_ip     44
-t_packs          35
+t_packs          36
 t_provenance     23
 t_seams          10
 t_stage_flist    28

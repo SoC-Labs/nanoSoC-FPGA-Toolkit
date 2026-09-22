@@ -255,11 +255,21 @@ if {$BITSTREAM_BIN_STYLE eq ""} {
     warn "  family loaded by another is corrupt in a way nothing detects - the"
     warn "  file is the right size, has a plausible first block, and the device"
     warn "  does not come up."
-} elseif {[lsearch -exact {zynq7 zynqmp} $BITSTREAM_BIN_STYLE] < 0} {
+} elseif {$BITSTREAM_BIN_STYLE eq "none"} {
+    # THE BOARD SAID THERE IS NO CONVERSION, AND THAT IS NOT THE SAME AS SILENCE.
+    # -bin_file is NOT appended below, so write_bitstream produces no payload and
+    # the three graders that assert a .bin stand down - all of them on the
+    # MANIFEST field this stage writes, not on this variable, so a run that never
+    # reached here cannot inherit the exemption.
+    # The worked case is a bare Kintex on an Arm MPS3: the MCC reads a .bit off a
+    # config microSD, and no .bin appears anywhere in that path.
+    say "bin style: none - this family loads the .bit directly, no .bin will be written"
+} elseif {[lsearch -exact {zynq7 zynqmp none} $BITSTREAM_BIN_STYLE] < 0} {
     flow_refuse "bin_style is '$BITSTREAM_BIN_STYLE', which this flow does not implement." \
-        "  Known styles: zynq7 (byte swap) and zynqmp (header strip)." \
-        "  These are NOT interchangeable: the wrong conversion produces a file" \
-        "  of the right size and name that the device will not boot, and" \
+        "  Known styles: zynq7 (byte swap), zynqmp (header strip), and none" \
+        "  (no conversion - the loader takes the .bit as written)." \
+        "  The first two are NOT interchangeable: the wrong conversion produces" \
+        "  a file of the right size and name that the device will not boot, and" \
         "  nothing between here and the board detects it. Add the style to the" \
         "  bitstream stage deliberately rather than defaulting to one of these."
 } else {
@@ -281,7 +291,11 @@ if {$BITSTREAM_BIN_STYLE eq ""} {
 opt BITSTREAM_FORCE  1   ;# 1 = -force, overwrite an existing .bit from this same flow
 
 if {$BITSTREAM_FORCE} { lappend BITSTREAM_ARGS -force }
-if {$BITSTREAM_BIN_STYLE ne ""} { lappend BITSTREAM_ARGS -bin_file }
+# -bin_file only when a conversion exists. "" is nobody-chose (and mk/flow.mk
+# will fail the run for it); "none" is somebody-looked-and-there-is-nothing, so
+# asking write_bitstream for a payload nothing consumes would write a file whose
+# only purpose would be to satisfy a check.
+if {$BITSTREAM_BIN_STYLE ni {"" "none"}} { lappend BITSTREAM_ARGS -bin_file }
 
 say "write_bitstream args: [expr {[llength $BITSTREAM_ARGS] ? $BITSTREAM_ARGS : {(none)}}]"
 say "properties set: [expr {[llength $BITSTREAM_PROPS] / 2}]"

@@ -544,13 +544,33 @@ bitstream)
     # and the wrong one produces a file that loads and does not run - a board
     # that comes up dead with no error anywhere. So the .bin is asserted AND the
     # style that produced it is read out of the manifest.
-    ci_assert_file bitstream.bin "$OUT/$BLOCK.bin" \
-        "the .bin is what a running system loads"
+    # THE STYLE IS READ BEFORE THE .bin IS ASSERTED, because one legal style says
+    # there is no .bin to assert. It is read from the MANIFEST and not from
+    # $BIN_STYLE: a project's design.mk carries its own copy of that value for
+    # cross-checking, and the copy is not what the stage used.
+    style="$(ci_mf "$REP/bitstream_manifest.txt" bin_style 2>/dev/null)"
+    if [ "$style" = "none" ]; then
+        # An absence the board declared. Still graded - on bin_source, which the
+        # stage only writes once it reaches its conversion block, so a run that
+        # died earlier cannot inherit the exemption.
+        src="$(ci_mf "$REP/bitstream_manifest.txt" bin_source 2>/dev/null)"
+        case "$src" in
+            none:*) ci_pass bitstream.bin "no .bin: bin_style none, and bin_source says so ($src)" ;;
+            *)      ci_fail bitstream.bin \
+                        "bin_style is none but bin_source is '$src' - the stage did not reach its conversion block, so the missing .bin is unexplained rather than declared" ;;
+        esac
+        if [ -s "$OUT/$BLOCK.bin" ]; then
+            ci_fail bitstream.bin.unexpected \
+                "bin_style is none and yet a .bin exists at $OUT/$BLOCK.bin - something passed -bin_file, and a file nothing declares is a file nobody checks"
+        fi
+    else
+        ci_assert_file bitstream.bin "$OUT/$BLOCK.bin" \
+            "the .bin is what a running system loads"
+    fi
     ci_assert_file bitstream.xsa "$OUT/$BLOCK.xsa" \
         "a software build reads this to learn the address map; without it the firmware and the fabric agree only by coincidence"
     assert_manifest bitstream "$REP/bitstream_manifest.txt" bin_style bit_bytes
 
-    style="$(ci_mf "$REP/bitstream_manifest.txt" bin_style 2>/dev/null)"
     if ci_is_measured "$style"; then
         ci_pass bitstream.bin_style "$style"
     else

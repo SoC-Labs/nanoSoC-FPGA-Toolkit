@@ -697,7 +697,7 @@ Required: `board_name part platform sys_clk_freq_hz bin_style`
 | Trigger | Then required |
 |---|---|
 | `board_part` set | `board_repo_paths` |
-| `bin_style` = `zynq7` or `zynqmp` | (nothing — but they are NOT interchangeable; the wrong one corrupts the load) |
+| `bin_style` = `zynq7`, `zynqmp` or `none` | (nothing — but `zynq7`/`zynqmp` are NOT interchangeable; the wrong one corrupts the load. `none` means this family has no conversion: the loader takes the `.bit` as written, no `.bin` is produced, and none is asserted. It is a positive statement — an *unset* key remains an error) |
 | `fpgahub_board` set | `fpgahub_target` — **the lease scope and the program scope are different namespaces** |
 
 Other keys: `deploy_style jtag_serial oscillator_hz io_voltage_by_bank

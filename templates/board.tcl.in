@@ -89,18 +89,25 @@ board_set platform bare
 # states in passing.
 board_set sys_clk_freq_hz "<<FILL IN: integer Hz, e.g. 50000000>>"
 
-# HOW A .bin IS MADE FOR THIS BOARD'S FAMILY. zynq7 | zynqmp
+# HOW A LOADABLE IMAGE IS MADE FOR THIS BOARD'S FAMILY. zynq7 | zynqmp | none
 #
 #   zynq7   the .bit payload needs a BYTE SWAP
 #   zynqmp  the .bit header must be STRIPPED
+#   none    there is NO conversion - this board's loader takes the .bit as
+#           written, and no .bin exists anywhere in the path
 #
-# THEY ARE NOT INTERCHANGEABLE AND THE WRONG ONE CORRUPTS THE LOAD. The
+# THE FIRST TWO ARE NOT INTERCHANGEABLE AND THE WRONG ONE CORRUPTS THE LOAD. The
 # conversion succeeds either way. The file is the right size either way. The
 # loader accepts it either way. The device does not come up, and nothing
 # anywhere in the chain says why. It is a required key because there is no
 # defensible default: guessing from the part string is exactly the kind of
 # inference that is right until the day it is not.
-board_set bin_style "<<FILL IN: zynq7 or zynqmp>>"
+#
+# none IS A STATEMENT, NOT A WAY OUT. Choose it only when you have looked and
+# there is genuinely nothing to convert - a bare FPGA whose loader reads the
+# .bit directly. Leaving this key UNSET is still an error, and the difference is
+# the whole point: unset means nobody chose, none means somebody checked.
+board_set bin_style "<<FILL IN: zynq7, zynqmp or none>>"
 
 
 #### 2. CONDITIONAL ############################################################

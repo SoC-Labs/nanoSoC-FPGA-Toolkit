@@ -484,10 +484,19 @@ pack_fault packs.type.bad_int \
     part "$PARTU" 's/^part_set luts              117120/part_set luts              117k/' \
     "BAD TYPE 'luts'"
 
+# THE NEEDLE CARRIES THE WHOLE SET, AND grep -F CANNOT ANCHOR IT.
+# Measured 2026-09-22: when `none` was added to the enum, this assertion did NOT
+# go red, because pack_rejects matches with `grep -qF` and the old needle
+# "It must be one of: zynq7 zynqmp" is a PREFIX of the new message. A proof whose
+# description says "the whole set is printed" was checking a prefix of it.
+# Carrying the full current set makes a REMOVAL visible. An ADDITION appended to
+# the end is still invisible to a substring match, and that is a property of the
+# harness, not of this line - the proof below is what covers a member actually
+# working, and it is the one to add to when the set next grows.
 pack_fault packs.enum.bin_style \
     "bin_style outside its CLOSED set is refused and the whole set is printed - the wrong one corrupts the load and nothing says why" \
     board "$BOARD" 's/^board_set bin_style       zynqmp/board_set bin_style       zynq/' \
-    "It must be one of: zynq7 zynqmp"
+    "It must be one of: zynq7 zynqmp none"
 
 # ONE FAULT, THREE PROOFS: the type switch is the single place all three type
 # checks live, so neutering it must move all three.
@@ -508,13 +517,43 @@ else
     t_skip packs.type.bad_int.mutation "could not plant the fault: pack_validate()'s type switch has changed shape"
 fi
 
+# bin_style none: A MEMBER THAT WORKS, NOT A STRING THAT IS NOT REFUSED.
+#
+# The assertion above proves a NON-member is refused. It cannot prove a member is
+# ACCEPTED - and the two are different claims, because an enum that accepted
+# everything would also pass it. `none` is the case where that matters most: it
+# is the one value whose whole purpose is to relax a downstream assertion, so if
+# it were quietly not in the set, a board declaring it would be refused at load
+# and nobody would learn why from this suite.
+NONEPACK="$(pack_copy packs_bin_style_none "$BOARD" board)" || NONEPACK=""
+if [ -n "$NONEPACK" ] && t_mutate "$SB" "packs/packs_bin_style_none/board.tcl" \
+        's/^board_set bin_style       zynqmp/board_set bin_style       none/'; then
+    t_check packs.enum.bin_style.none \
+        "bin_style none is a MEMBER of the closed set and a board declaring it loads" \
+        pack_loads "$FLOW_DIR" board "$NONEPACK"
+
+    M0="$(t_mutant "$SB" bin-style-none-not-a-member)"
+    if t_replace_line "$M0" part/pack_schema.tcl \
+            '    board,bin_style    {zynq7 zynqmp none}' \
+            '    board,bin_style    {zynq7 zynqmp}'; then
+        t_check_fail packs.enum.bin_style.none.mutation \
+            "with none taken back out of the closed set, the same board is REFUSED and the assertion above goes red" \
+            pack_loads "$M0" board "$NONEPACK"
+    else
+        t_skip packs.enum.bin_style.none.mutation "could not plant the fault: the bin_style enum line has changed shape"
+    fi
+else
+    t_skip packs.enum.bin_style.none "could not build a board pack declaring bin_style none"
+    t_skip packs.enum.bin_style.none.mutation "could not build a board pack declaring bin_style none"
+fi
+
 M="$(t_mutant "$SB" enum-not-checked)"
 if t_replace_line "$M" part/pack_api.tcl \
         '        if {[info exists ::pack_enum_spec($role,$k)]} {' \
         '        if {0} {'; then
     t_check_fail packs.enum.bin_style.mutation \
         "with the closed-set test neutered, a bin_style of 'zynq' is accepted and the assertion goes red" \
-        pack_rejects "$M" board "$SB/packs/packs_enum_bin_style" "It must be one of: zynq7 zynqmp"
+        pack_rejects "$M" board "$SB/packs/packs_enum_bin_style" "It must be one of: zynq7 zynqmp none"
 else
     t_skip packs.enum.bin_style.mutation "could not plant the fault: pack_validate()'s enum test has changed shape"
 fi

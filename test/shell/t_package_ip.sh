@@ -158,6 +158,7 @@ printf 'another\n'         > "$SB/repo_b/core_b.txt"
 
 sed -e "s/@BOARD@/demo_board/" -e "s/@PART@/$PART_NAME/" \
     -e 's/"<<FILL IN: integer Hz, e.g. 50000000>>"/50000000/' \
+    -e 's/"<<FILL IN: zynq7, zynqmp or none>>"/zynq7/' \
     -e 's/"<<FILL IN: zynq7 or zynqmp>>"/zynq7/' \
     "$FLOW_DIR/templates/board.tcl.in" > "$PROJ/board/demo_board/board.tcl"
 # THE MARKER CHECK IGNORES COMMENTS, and that distinction is the template's own.

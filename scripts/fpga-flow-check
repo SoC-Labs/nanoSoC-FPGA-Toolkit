@@ -170,7 +170,7 @@ MARKER = re.compile(r"<<\s*FILL\s+IN")
 FLOW_MODES = ("direct",)                                     # §3.3 Target
 PLATFORMS = ("bare", "pynq")                                 # §3.3 Target
 FW_HEX_FORMATS = ("byte", "word")                            # §3.3 Firmware
-BIN_STYLES = ("zynq7", "zynqmp")                             # §3.3, §9.5
+BIN_STYLES = ("zynq7", "zynqmp", "none")                     # §3.3, §9.5
 
 # CONTRACT §3.5. Assigned `:=` by the flow after the project is read. A project
 # that assigns one of these has its value silently discarded - the reference
