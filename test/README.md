@@ -337,35 +337,42 @@ five `SKIP` lines, so the ratio alone would have read as 4% and passed.
 
 ## What these suites do **not** cover yet
 
-- **Five of six stage scripts are not unit-tested.** Stage 1 was closed on
-  2026-09-17 by `t_stage_flist.sh` (28 proofs), which drives `1_flist.tcl` under
-  bare `tclsh` with recording stubs for the Vivado commands. The rest —
-  `2_package_ip`, `3_bd`, `4_synth`, `5_impl`, `6_bitstream` — still rest on one
-  integration result: a bitstream that matched a known-good one, for one design
-  on one part. **Stubs prove a call was ISSUED, never that Vivado would accept
-  it**; that half of the claim is still untested by construction.
+*Corrected 2026-09-22. Four of the five bullets this section used to carry have
+closed since it was written, and the section stayed as it was — which is the
+failure it warns about in its own last line.*
+
+- **Three of six stage scripts are driven by no test.** Stage 1 closed
+2026-09-17 (`t_stage_flist.sh`, 28 proofs), stage 2 and stage 6 on 2026-09-18
+(`t_package_ip.sh`, 44; `t_bitstream.sh`, 20) — each driving its stage under
+bare `tclsh` with recording stubs for the Vivado commands. `4_synth` and
+`5_impl` remain undriven. **`3_bd` is not the fourth**: `t_bd.sh` is green, but
+its four assertions *read* `3_bd.tcl` as text. Reading and driving are
+indistinguishable in the summary and in `MUTATION_COVERAGE`, and they are not
+the same claim. **Stubs prove a call was ISSUED, never that Vivado would accept
+it**; that half is untested by construction and rests on one integration result.
 - **The deploy tier has never touched a board.** `scripts/fpga-flow-deploy`,
-  `mk/deploy.mk` and the fpgahub hooks are exercised against fixtures and
-  dry-run paths only.
+`mk/deploy.mk` and the fpgahub hooks are exercised against fixtures and
+dry-run paths only.
+- **`mk/flow.mk`: no recipe that launches a tool is tested.** `t_flow_mk.sh`
+(69 proofs) closed the stage graph, the resolved variable surface, the export
+set and the rule database. What runs once a tool is in the loop does not.
+- **`ci/` is 4186 lines, and `ci/capability.sh` is the one nobody drives.**
+`lib.sh`, `tier.sh`, `deploy-gates.sh`, `assert-stage.sh` and
+`check-vendor-collateral.sh` are all named by suites now. `capability.sh` is
+read as text by `t_tier.sh` §7 and executed by nothing. Separately,
+`deploy-gates.sh --arm-only` — a claim the file makes about itself — is named
+by no assertion.
 - **`scripts/fpga-flow-hooks` is named by no test.** This bullet used to name
-  `make help-hooks` too. That half is **CLOSED** as of 2026-09-17 by
-  `t_help_hooks.sh`, 9 assertions and 5 planted faults, above.
-  Note these are two unrelated things, and an earlier version of this bullet
-  conflated them: `fpga-flow-hooks` is the **git-hook** installer, and its own
-  header says so in capitals; the thing that lists seams out of `seams.txt` is
-  `make help-hooks`. `fpga-flow-hooks` needs `git init` throwaway repos, four
-  subcommands, the refusal-on-existing-hooks path and the submodule
-  `.git`-is-a-file case — a precondition class no suite here has yet.
-  `test/KNOWN_DEFECTS` still carries the entry in its original wording; whoever
-  closes `fpga-flow-hooks` should retire the whole line there.
-  `init` was closed on 2026-09-11 by `t_init.sh` and `doctor` on the same day by
-  `t_doctor.sh`. What `init` cost is the useful part: the round trip this bullet
-  used to propose ("scaffold, then `make check` is clean") was **wrong**. A
-  fresh scaffold is deliberately incomplete and `make check` is supposed to
-  refuse it — 5 MISS lines naming the decisions the scaffolder left open.
-- **`ci/` is 4312 lines and only `ci/lib.sh` is covered** — thoroughly, by
-  `t_verdicts`. `capability.sh`, `tier.sh`, `deploy-gates.sh` and
-  `check-vendor-collateral.sh` are not named by any test.
+`make help-hooks` too; that half closed 2026-09-17 (`t_help_hooks.sh`, 5
+proofs). They are unrelated, and an earlier version of this bullet conflated
+them: `fpga-flow-hooks` is the **git-hook** installer, and its own header says
+so in capitals. It needs `git init` throwaway repos, four subcommands, the
+refusal-on-existing-hooks path and the submodule `.git`-is-a-file case — a
+precondition class no suite here has yet. `init` and `doctor` both closed
+2026-09-11. What `init` cost is the useful part: the round trip this bullet
+used to propose ("scaffold, then `make check` is clean") was **wrong**. A fresh
+scaffold is deliberately incomplete and `make check` is supposed to refuse it —
+5 MISS lines naming the decisions the scaffolder left open.
 
 Every item above is also in `KNOWN_DEFECTS`, which is the file that goes stale
 if one of them is fixed and not deleted.

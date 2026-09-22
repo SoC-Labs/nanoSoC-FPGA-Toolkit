@@ -113,22 +113,34 @@
 # WOULD SETTLE IT: a second board on a different part, built end to end by
 # somebody who did not write the pack API.
 
-## five of six stage scripts are not unit-tested
-# CLOSED for stage 1 on 2026-09-17: test/shell/t_stage_flist.sh, 28 planted
-# faults, driving 1_flist.tcl under bare tclsh with recording stubs for the
-# Vivado commands. The remaining five are 2_package_ip, 3_bd, 4_synth, 5_impl,
-# 6_bitstream.
+## three of six stage scripts are driven by no test
+# CLOSED for stage 1 on 2026-09-17 (t_stage_flist.sh, 28 planted faults), for
+# stage 2 on 2026-09-18 (t_package_ip.sh, 44) and for stage 6 on 2026-09-18
+# (t_bitstream.sh, 20) - each DRIVING its stage under bare tclsh with recording
+# stubs for the Vivado commands. 4_synth and 5_impl remain undriven.
 #
-# TWO THINGS THAT SUITE MEASURED, WHICH CHANGE THIS ENTRY'S ADVICE.
-# First, the remedy below overstated the work: 1_flist.tcl was ALREADY drivable,
-# and only ~60 of its 643 lines needed factoring. Do not budget a refactor per
-# stage until you have looked; the other five may differ.
+# 3_bd IS NOT THE FOURTH, AND THE DIFFERENCE IS THE POINT OF THIS ENTRY.
+# t_bd.sh exists and is green, but its four assertions READ 3_bd.tcl as text -
+# that the file contains `generate_target`, that it names the same handoff
+# artefact as 4_synth.tcl. Nothing executes the stage. Text coverage and
+# execution coverage are indistinguishable in the suite summary and in
+# MUTATION_COVERAGE, and counting t_bd as a stage test would be precisely the
+# failure this ledger exists to prevent. Its four assertions are still worth
+# having: all four come from a measured synthesis failure, and reading is the
+# only technique that catches two files naming different artefacts.
+#
+# TWO THINGS THOSE SUITES MEASURED, WHICH CHANGE THIS ENTRY'S ADVICE.
+# First, the original remedy overstated the work: 1_flist.tcl was ALREADY
+# drivable, and only ~60 of its 643 lines needed factoring. 2 and 6 confirmed
+# the pattern rather than the fear. Do not budget a refactor per stage until
+# you have looked; 4_synth and 5_impl may still differ.
 # Second, and this is the boundary to keep stating: recording stubs prove the
 # stage ISSUED a call, in that order, with those arguments. They prove NOTHING
 # about whether Vivado would accept it. A read_verilog the tool rejects, an
 # include_dirs property it ignores, a fileset that does not exist - all pass
 # under stubs. That half still rests on one integration result.
 # WOULD SETTLE IT for the rest: the same technique, one stage at a time.
+
 ## `make help-hooks` and scripts/fpga-flow-hooks are named by no test
 # CORRECTING MY OWN ENTRY, 2026-09-11. This used to read "doctor reports what a
 # host has; hooks lists seams... which t_seams.sh already knows how to check".
@@ -156,27 +168,57 @@
 # WOULD SETTLE IT: start with `make help-hooks`, which answers from seams.txt
 # and the steps directory - t_seams.sh already knows how to check that shape.
 
-## mk/flow.mk: 1709 lines, and only its parse-time guards are tested
-# t_contract.sh covers the `$(error)` guards thoroughly - 13 planted faults
-# rejected - because a make conditional that stops matching FAILS OPEN and the
-# build just proceeds. Nothing covers the rest of the file: the stage graph, the
-# ~70-variable surface, the ordering of the `?=` chains, or any recipe.
-# That gap is why this file has NOT been split into per-area fragments, though
-# it is past the length a reader can hold. Everything in a makefile interacts by
-# expansion order, and three separate defects in this file during its first
-# fortnight were exactly that: a `:=` that snapshotted before the includes ran,
-# a rule whose target expanded at parse time and resolved to the filesystem
-# root, and an `$(if)` whose prose contained a comma. A split moves every line
-# in the file past those same hazards with 27 assertions standing behind it, for
-# no functional gain, on the one component with demonstrated bitstream parity.
-# WOULD SETTLE IT, in this order: a suite that drives `make -n` over the stage
+## mk/flow.mk: 1771 lines, and no recipe that launches a tool is tested
+# CORRECTED 2026-09-22. This entry used to read "1709 lines, and only its
+# parse-time guards are tested", and to say that nothing covered "the stage
+# graph, the ~70-variable surface, the ordering of the `?=` chains, or any
+# recipe". All four of those are now wrong, and the line count was wrong too.
+# test/shell/t_flow_mk.sh plants 69 faults across exactly that surface: it
+# reads the stage graph out of `make -n`, the resolved values out of
+# `make --eval`, the export set out of a throwaway target that reports $(VAR)
+# and $$VAR in one process, and the rule database out of `make -p`.
+#
+# WHAT IS STILL TRUE: the recipes it runs are the ones that run with no tool.
+# No assertion here has ever watched a stage recipe actually launch Vivado, so
+# what the rules DO once a tool is in the loop rests on the integration result
+# and nothing else.
+#
+# THE SPLIT IS NOW UNBLOCKED, AND STILL A JUDGEMENT CALL. The old entry made
+# the suite the precondition - "a suite that drives `make -n` over the stage
 # graph and asserts the prerequisite chain and the resolved variable surface;
-# THEN the split. Not the other way round.
+# THEN the split. Not the other way round." That precondition is met, and the
+# suite's own header says so: every line a split would move passes the same
+# three hazards that bit this file in its first fortnight (a `:=` snapshotted
+# before the includes ran, a target expanded at parse time to the filesystem
+# root, an `$(if)` whose prose contained a comma), and each of those is now
+# planted and rejected. What has not changed is the payoff: still no functional
+# gain, on the one component with demonstrated bitstream parity.
 
-## ci/deploy-gates.sh is named by no test
-# CLOSED for check-vendor-collateral.sh on 2026-09-17: test/shell/t_vendor_collateral.sh,
-# 24 planted faults. It found FOUR defects in the checker that guards this PUBLIC
-# repository against vendor IP, all carried as t_known_defect:
+## ci/deploy-gates.sh :: CLOSED, and --arm-only is the piece it does not reach
+# CORRECTED 2026-09-22. The header used to say "is named by no test"; it is
+# named by test/shell/t_deploy_gates.sh, 47 planted faults, which found eight
+# defects - all eight carried above under the deploy-gates DEFECT entry rather
+# than repeated here.
+#
+# WHAT THAT SUITE DOES NOT REACH: --arm-only. --selftest is covered thoroughly;
+# --arm-only is named by no assertion in the suite. Both are claims the file
+# makes about ITSELF, and --arm-only is the one that has already misled a
+# reader: it does not mean "Arm vendor only", it means ARM EVERY RULE, firing
+# each on its own specimen and scanning nothing. A self-test flag that is
+# itself untested is a claim with no evidence behind it.
+# WOULD SETTLE IT: the fixture already exists in t_deploy_gates.sh - plant a
+# rule that cannot fire and require --arm-only to notice.
+#
+# CLOSED for check-vendor-collateral.sh on 2026-09-17: t_vendor_collateral.sh,
+# 24 planted faults. It found FOUR defects in the checker that guards this
+# repository against vendor IP, all carried as t_known_defect.
+# CORRECTING MYSELF, 2026-09-22: this line used to say "this PUBLIC repository".
+# It is not public - SoC-Labs/nanoSoC-FPGA-Toolkit is visibility PRIVATE, and
+# nothing in the repo claims otherwise. The word was mine. It matters because a
+# guard justified by a status the repo does not have is a guard somebody will
+# eventually argue away. The real justification is weaker and sufficient: this
+# repo is groomed for release, vendor IP that lands in history does not leave it,
+# and the check is cheap. The four defects below are unaffected.
 #
 #   A SKIPPED SCAN EXITS 0, two independent ways. gawk is FATAL on an unreadable
 #   operand and the scan discards both its stderr and its exit status, so one
@@ -200,9 +242,3 @@
 #
 #   A tracked .envrc carrying a licence-server export is never opened, because
 #   the "extensionless" test is the glob `*.*`, which dotfiles match.
-#
-# deploy-gates.sh (746 lines) remains. Its fixture is the cost: a deploy manifest
-# covering six time-ordered moments. Note before starting it: --selftest and
-# --arm-only are claims each file makes about ITSELF. --arm-only turned out not
-# to mean "Arm vendor only" at all - it means ARM EVERY RULE, firing each on its
-# own specimen and scanning nothing. Read what a flag does before asserting it.
