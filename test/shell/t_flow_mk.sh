@@ -569,8 +569,11 @@ if t_plant "$M" mk/flow.mk "$T"'@test -s "$(REPORT_DIR)/synth_manifest.txt" || {
 else
     t_skip flow_mk.graph.artefacts.synth.mutation "could not plant the fault: synth's manifest test in mk/flow.mk has changed shape, and this proof is measuring nothing until it is re-aimed"
 fi
+# The .xsa test sits in the elif arm that runs unless the manifest DECLARES
+# BITSTREAM_WRITE_XSA=0, so replacing it with `true` is the whole fault: a run
+# that asked for a handoff passes without one.
 M="$(t_mutant "$SB" artefact-xsa)"
-if t_plant "$M" mk/flow.mk "$T"'@test -s "$(OUT_DIR)/$(BLOCK).xsa" || { \' "$T"'@true || { \\'; then
+if t_plant "$M" mk/flow.mk "$T"'elif test -s "$(OUT_DIR)/$(BLOCK).xsa"; then \' "$T"'elif true; then \\'; then
     PM="$(full_for "$M" artefact-xsa)"
     t_check_fail flow_mk.graph.artefacts.bitstream.mutation \
         "with the .xsa test replaced by true, bitstream passes without a handoff and the assertion goes red" \

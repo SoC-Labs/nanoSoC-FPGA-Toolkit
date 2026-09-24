@@ -398,6 +398,13 @@ dirs → flist → package-ip → bd → synth → impl → bitstream
 | `bitstream` | `$(OUT_DIR)/$(BLOCK).bit`, `.bin`, `.xsa`, `bitstream_manifest.txt` |
 | `all` | all of the above |
 
+Two of the bitstream artefacts can be **declared** absent, and only by a
+statement the stage records: no .bin when the board pack says `bin_style none`,
+and no .xsa when the project exports `BITSTREAM_WRITE_XSA=0` (no software build
+reads a handoff from the design). All three graders read the declaration from
+the stage's manifest, not from make, and treat a file that exists anyway as a
+hard failure.
+
 `all` is **recipe lines calling `$(MAKE)`, not prerequisites.** Prerequisites
 carry no ordering, so under `-j` make may start `impl` while `synth` is running.
 Scoped `.NOTPARALLEL:` is GNU Make 4.4; the sites here run 4.2.1, where bare

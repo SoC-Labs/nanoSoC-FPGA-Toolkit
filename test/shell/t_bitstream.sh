@@ -261,13 +261,14 @@ mk_paths() {
 bit_run() {
     local tk="$1" label="$2" style="${3:-zynqmp}"; shift 3 2>/dev/null || shift $#
     local root="$SB/r-$label" fpga kv key val paths part
-    local dcp_mode=normal hwh=1 impl_bytes="" ovr_opts=0 extra=()
+    local dcp_mode=normal hwh=1 impl_bytes="" ovr_opts=0 stale_xsa=0 extra=()
     for kv in "$@"; do
         case "$kv" in
             T_DCP_MODE=*)       dcp_mode="${kv#*=}" ;;
             T_HWH=*)            hwh="${kv#*=}" ;;
             T_IMPL_DCP_BYTES=*) impl_bytes="${kv#*=}" ;;
             T_OVERRIDE_OPTS=*)  ovr_opts="${kv#*=}" ;;
+            T_STALE_XSA=*)      stale_xsa="${kv#*=}" ;;
         esac
         extra+=("$kv")
     done
@@ -362,6 +363,9 @@ EOF
         *)      printf 'routed checkpoint stand-in, %s\n' "$label" > "$BR_OUTDIR/${BR_BLOCK}_routed.dcp" ;;
     esac
     [ "$hwh" = 1 ] && printf '<hwh design="%s"/>\n' "$BR_DESIGN" > "$BR_WORKDIR/${BR_DESIGN}.hwh"
+    # A handoff left in OUT_DIR by an EARLIER run in the same RUN_TAG - the shape
+    # a project arrives at by flipping BITSTREAM_WRITE_XSA off without a clean.
+    [ "$stale_xsa" = 1 ] && printf 'an .xsa from an earlier run of a different bitstream\n' > "$BR_OUTDIR/${BR_BLOCK}.xsa"
     if [ -n "$impl_bytes" ]; then
         printf '# impl manifest stand-in\nstage                        impl\ndcp_bytes                    %s\n' "$impl_bytes" \
             > "$BR_REPDIR/impl_manifest.txt"
@@ -935,6 +939,106 @@ if [ -n "$M" ] && t_replace_line "$M" "$OP_REL" \
         bit_proof bin_none "$M"
 else
     t_skip bit.bin.none.mutation "could not plant the fault: the -bin_file line has changed shape"
+fi
+
+## xsa_grade <toolkit> - run THAT toolkit's ci/assert-stage.sh over the last
+## bit_run. Leaves XG_RC, XG_OUT and XG_VD (where the verdict ledger is).
+##
+## THE GRADER COMES FROM THE TOOLKIT UNDER TEST here, where grader_green takes it
+## from $FLOW_DIR on purpose. grader_green's property is the manifest FORMAT - the
+## stage writes what the real consumer reads - so a mutant's own grader is not
+## the consumer. Here the property is the grader's own LOGIC, so a fault planted
+## in it has to be the one that runs.
+xsa_grade() {
+    local tk="$1"
+    XG_VD="$BR_RUNDIR/ci"; rm -rf "$XG_VD"; XG_RC=0
+    XG_OUT="$(cd "$BR_RUNDIR" && env FPGA_RUN_DIR="$BR_RUNDIR" FPGA_BLOCK="$BR_BLOCK" FPGA_DESIGN_NAME="$BR_DESIGN" \
+              FPGA_REPORT_DIR="$BR_REPDIR" FPGA_OUT_DIR="$BR_OUTDIR" FPGA_WORK_DIR="$BR_WORKDIR" FPGA_LOG_DIR="$BR_LOGDIR" \
+              FPGA_SEAMS_FILE="$tk/flow/common/seams.txt" CI_VERDICT_DIR="$XG_VD" \
+              bash "$tk/ci/assert-stage.sh" bitstream 2>&1)" || XG_RC=$?
+}
+## xg_verdict <gate id> - that gate's status in the last xsa_grade's ledger
+xg_verdict() { awk -F'\t' -v k="$1" '$3 == k { print $2; exit }' "$XG_VD/verdicts.tsv" 2>/dev/null; }
+
+## xsa_off <toolkit> - BITSTREAM_WRITE_XSA=0: no handoff, DECLARED, and graded
+##
+## The .xsa has three graders (the stage gate, mk/flow.mk, ci/assert-stage.sh)
+## and the declaration relaxes all three, so this is five claims, not one:
+##   1. the stage does not call write_hw_platform, leaves no .xsa, records the
+##      knob as 0 in the manifest - where the other two graders read it - and its
+##      gate counts no hard failure;
+##   2. the CI grader passes bitstream.xsa on that run;
+##   3. the same grader still FAILS bitstream.xsa on a run that asked for a
+##      handoff and got none. It must be that gate by name: the stage gate is red
+##      on that run too, so the grader's exit status would be red either way, and
+##      a grader that had stopped checking the .xsa would still look right;
+##   4. an .xsa left over from an earlier run is a hard failure under 0, in the
+##      stage gate;
+##   5. ...and in the CI grader.
+## Without 3 the relaxation is indistinguishable from deleting the check.
+xsa_off() {
+    local tk="$1" v
+    bit_run "$tk" xsa-off none BITSTREAM_WRITE_XSA=0 || return 1
+    [ "$BR_RC" -eq 0 ] || { printf 'BITSTREAM_WRITE_XSA=0 and the stage exited %s:\n' "$BR_RC"; show_run; return 1; }
+    [ -z "$(stub_line '^write_hw_platform')" ] || {
+        printf 'BITSTREAM_WRITE_XSA=0 and write_hw_platform was still called:\n'; grep -n '^write_hw_platform' "$BR_STUB"; return 1; }
+    [ ! -e "$BR_OUTDIR/$BR_BLOCK.xsa" ] || { printf 'BITSTREAM_WRITE_XSA=0 and an .xsa is on disk at %s\n' "$BR_OUTDIR/$BR_BLOCK.xsa"; return 1; }
+    v="$(bit_mf "$BR_MAN" knob.BITSTREAM_WRITE_XSA)"
+    [ "$v" = 0 ] || { printf "manifest knob.BITSTREAM_WRITE_XSA is '%s', not 0 - mk/flow.mk and the CI grader read it there\n" "$v"; return 1; }
+    grep -qE '^HARD FAILURES: (0|none)' "$BR_GATE" 2>/dev/null || {
+        printf 'BITSTREAM_WRITE_XSA=0 and the gate still counts a hard failure:\n'
+        sed -n '/^HARD FAILURES/,/^BUDGETS/p' "$BR_GATE" 2>/dev/null; return 1; }
+
+    xsa_grade "$tk"
+    v="$(xg_verdict bitstream.xsa)"
+    [ "$v" = PASS ] || { printf "the CI grader's bitstream.xsa is '%s' on a run that DECLARED no handoff:\n" "$v"
+        printf '%s\n' "$XG_OUT" | grep -E 'xsa' | head -4; return 1; }
+
+    bit_run "$tk" xsa-asked-absent none T_XSA_MODE=absent || return 1
+    xsa_grade "$tk"
+    v="$(xg_verdict bitstream.xsa)"
+    [ "$v" = FAIL ] || { printf "the CI grader's bitstream.xsa is '%s' on a run that ASKED for a handoff and got\n" "${v:-(no verdict)}"
+        printf 'none. The relaxation has become a deletion.\n'; return 1; }
+
+    bit_run "$tk" xsa-stale none BITSTREAM_WRITE_XSA=0 T_STALE_XSA=1 || return 1
+    [ "$BR_RC" -ne 0 ] || { printf 'a stale .xsa under BITSTREAM_WRITE_XSA=0 and the stage exited 0:\n'; show_run; return 1; }
+    grep -qE '^  - BITSTREAM_WRITE_XSA is 0 and yet an \.xsa exists at ' "$BR_GATE" 2>/dev/null || {
+        printf 'a stale .xsa under BITSTREAM_WRITE_XSA=0 is not a hard failure naming it:\n'
+        sed -n '/^HARD FAILURES/,/^BUDGETS/p' "$BR_GATE" 2>/dev/null; return 1; }
+    xsa_grade "$tk"
+    v="$(xg_verdict bitstream.xsa.unexpected)"
+    [ "$v" = FAIL ] || { printf "the CI grader's bitstream.xsa.unexpected is '%s' with a stale .xsa on disk\n" "${v:-(no verdict)}"; return 1; }
+    return 0
+}
+
+t_check bit.xsa.off "BITSTREAM_WRITE_XSA=0: no handoff and no write_hw_platform, the manifest declares it, stage and CI pass it - CI still fails a run that asked for one, and a stale .xsa is refused by both" xsa_off "$FLOW_DIR"
+
+# THE STALE-FILE REFUSAL, IN THE STAGE. Dead, an .xsa from an earlier run of a
+# different bitstream sits in OUT_DIR under a run that declares it wrote none -
+# exactly where a software build would look - and the gate is green.
+M="$(t_mutant "$SB" xsa-stale-not-refused)"
+if [ -n "$M" ] && t_replace_line "$M" "$ST_REL" \
+        'if {!$BITSTREAM_WRITE_XSA && [file exists $XSA]} {' \
+        'if {0} {'; then
+    t_check_fail bit.xsa.off.mutation.stale \
+        "with the stage's stale-.xsa refusal dead, a leftover handoff passes the gate and the assertion goes red" \
+        bit_proof xsa_off "$M"
+else
+    t_skip bit.xsa.off.mutation.stale "could not plant the fault: the stage's stale-.xsa test has changed shape"
+fi
+
+# THE RELAXATION BECOMES A DELETION, IN THE CI GRADER. With its knob test always
+# true, bitstream.xsa passes whatever the run declared - including a run that
+# asked for a handoff and got none - and half 3 goes red.
+M="$(t_mutant "$SB" xsa-grader-always-relaxed)"
+if [ -n "$M" ] && t_replace_line "$M" ci/assert-stage.sh \
+        '    if [ "$wx" = "0" ]; then' \
+        '    if true; then'; then
+    t_check_fail bit.xsa.off.mutation.grader \
+        "with the CI grader's knob test always true, a run that asked for a handoff and got none passes bitstream.xsa, and the assertion goes red" \
+        bit_proof xsa_off "$M"
+else
+    t_skip bit.xsa.off.mutation.grader "could not plant the fault: ci/assert-stage.sh's BITSTREAM_WRITE_XSA test has changed shape"
 fi
 
 # The style is ignored and the swap always happens: a zynqmp board gets a

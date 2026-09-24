@@ -54,7 +54,7 @@
 
 t_assert_stage   13
 t_bd              3
-t_bitstream      21
+t_bitstream      23
 t_contract       26
 t_deploy_gates   47
 t_doctor         32

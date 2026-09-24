@@ -1389,16 +1389,25 @@ bitstream: dirs check-quiet
 	    echo "      and is not."; \
 	    exit 1; \
 	fi
-	@test -s "$(OUT_DIR)/$(BLOCK).xsa" || { \
+	@wx=$$(awk '$$1=="knob.BITSTREAM_WRITE_XSA"{print $$2; exit}' "$(REPORT_DIR)/bitstream_manifest.txt" 2>/dev/null); \
+	if [ "$$wx" = "0" ]; then \
+	    echo "OK: no .xsa, and none is what this run declared (BITSTREAM_WRITE_XSA=0)"; \
+	elif test -s "$(OUT_DIR)/$(BLOCK).xsa"; then \
+	    : ; \
+	else \
 	    echo "FAIL: no hardware handoff at $(OUT_DIR)/$(BLOCK).xsa"; \
 	    echo "      It is what a software build reads to learn the address map,"; \
 	    echo "      so without it the firmware and the fabric agree only by"; \
 	    echo "      coincidence. write_hw_platform needs a block design:"; \
 	    echo "        BD_TCL      = $(if $(strip $(BD_TCL)),$(BD_TCL),(unset))"; \
 	    echo "      CONTRACT.md section 4 lists .xsa as asserted for every"; \
-	    echo "      bitstream. If this design genuinely cannot produce one, that"; \
-	    echo "      is a contract question - raise it, do not delete the test."; \
-	    exit 1; }
+	    echo "      bitstream that asks for one. If no software build reads a"; \
+	    echo "      handoff from this design, say so: an exported"; \
+	    echo "      BITSTREAM_WRITE_XSA=0 is a statement and is accepted here."; \
+	    echo "      It is read from the stage's manifest, not from make, so a"; \
+	    echo "      run that never recorded it still needs the file."; \
+	    exit 1; \
+	fi
 	@test -s "$(REPORT_DIR)/bitstream_manifest.txt" || { \
 	    echo "FAIL: no manifest at $(REPORT_DIR)/bitstream_manifest.txt"; \
 	    echo "      The stage did not reach its final section, so nothing"; \
@@ -1410,7 +1419,11 @@ bitstream: dirs check-quiet
 	else \
 	    echo "    .bin      (none - this family loads the .bit directly)"; \
 	fi
-	@echo "    handoff   $(OUT_DIR)/$(BLOCK).xsa"
+	@if [ -s "$(OUT_DIR)/$(BLOCK).xsa" ]; then \
+	    echo "    handoff   $(OUT_DIR)/$(BLOCK).xsa"; \
+	else \
+	    echo "    handoff   (none - BITSTREAM_WRITE_XSA=0)"; \
+	fi
 	@# DEPLOY LANDS HERE. Non-fatal to the build, fatal to the claim.
 	@$(call post_stage_targets,bitstream,$(BITSTREAM_POST_TARGETS))
 

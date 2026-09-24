@@ -567,8 +567,21 @@ bitstream)
         ci_assert_file bitstream.bin "$OUT/$BLOCK.bin" \
             "the .bin is what a running system loads"
     fi
-    ci_assert_file bitstream.xsa "$OUT/$BLOCK.xsa" \
-        "a software build reads this to learn the address map; without it the firmware and the fabric agree only by coincidence"
+    # THE .xsa, LIKE THE .bin, CAN BE DECLARED ABSENT: BITSTREAM_WRITE_XSA=0 says
+    # no software build reads a handoff from this design. Read from the MANIFEST's
+    # knob record, for the same reason as bin_style - and only the exact value 0
+    # relaxes it, so an absent or unreadable record still demands the file.
+    wx="$(ci_mf "$REP/bitstream_manifest.txt" knob.BITSTREAM_WRITE_XSA 2>/dev/null)"
+    if [ "$wx" = "0" ]; then
+        ci_pass bitstream.xsa "no .xsa: BITSTREAM_WRITE_XSA=0 is recorded in the manifest, declaring that nothing reads one"
+        if [ -e "$OUT/$BLOCK.xsa" ]; then
+            ci_fail bitstream.xsa.unexpected \
+                "BITSTREAM_WRITE_XSA is 0 and yet an .xsa exists at $OUT/$BLOCK.xsa - the stage did not write it, so it is left over from another run and describes a different bitstream"
+        fi
+    else
+        ci_assert_file bitstream.xsa "$OUT/$BLOCK.xsa" \
+            "a software build reads this to learn the address map; without it the firmware and the fabric agree only by coincidence"
+    fi
     assert_manifest bitstream "$REP/bitstream_manifest.txt" bin_style bit_bytes
 
     if ci_is_measured "$style"; then
